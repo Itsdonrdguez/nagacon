@@ -1,0 +1,31 @@
+Shared DIBBS Playwright session patch
+
+Files:
+- backend/app/services/dibbs/session.py
+- backend/app/services/dibbs_adapter.py
+
+What it does:
+- adds a shared Playwright browser/session helper for DIBBS
+- tries to pass the DoD warning / consent page
+- opens the RFQ list page through a browser session
+- parses the RFQ list from browser-rendered HTML
+
+Why this matters:
+- DIBBS often redirects requests-based clients to the DoD warning page
+- the same root issue affected list scraping and PDF/detail access
+- this gives you one shared session foundation for:
+  - list scraping
+  - detail parsing
+  - PDF link discovery
+  - PDF downloads
+
+Retest:
+1) restart backend
+   uvicorn app.main:app --reload
+
+2) run DIBBS scrape
+   Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/scrapers/dibbs/run" -ContentType "application/json" -Body '{"max_pages":1,"fsc":"6520","limit":10,"debug":true}' | ConvertTo-Json -Depth 10
+
+3) inspect diagnostics
+- parser should no longer be fallback_links
+- rows_parsed should be > 0

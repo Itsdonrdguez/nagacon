@@ -1,0 +1,2 @@
+Step 7A optional: add vendor_quotes export into export_workspace_zip_bytes() in backend/app/services/workspace_service.py.
+Query VendorQuote rows for opp.id and write quote_comparison.csv.

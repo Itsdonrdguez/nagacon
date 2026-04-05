@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16
+    container_name: nagacon_db
+    environment:
+      POSTGRES_USER: nagacon
+      POSTGRES_PASSWORD: nagacon
+      POSTGRES_DB: nagacon
+    ports:
+      - "5432:5432"
+    volumes:
+      - nagacon_pgdata:/var/lib/postgresql/data
+
+volumes:
+  nagacon_pgdata:

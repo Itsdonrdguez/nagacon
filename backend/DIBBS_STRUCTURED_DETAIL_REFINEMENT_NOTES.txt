@@ -1,0 +1,46 @@
+DIBBS structured detail parser refinement patch
+
+File:
+- backend/app/services/dibbs/structured_detail_parser.py
+
+What it adds:
+- full NSN extraction: 6520-01-151-8142
+- FSC derivation from NSN
+- nomenclature extraction
+- AMSC extraction
+- structured approved source parsing:
+  - cage
+  - part_number
+  - company_name
+- structured solicitation parsing:
+  - solicitation_number
+  - technical_documents
+  - pr_number
+  - qty
+  - issue_date
+  - return_by_date
+  - pdf_url
+- merged file_links including discovered PDF URLs
+
+How to use in your Playwright detail enricher:
+replace your current HTML parse call with:
+
+from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
+
+parsed = parse_dibbs_detail_structured(html, url)
+
+Then save parsed into raw_payload["dibbs_detail"] and backfill:
+- opportunity.fsc_code
+- opportunity.description
+
+Recommended description logic:
+- NSN
+- FSC
+- first approved source company
+- first approved source part number
+
+Suggested terminal retest after wiring:
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/dibbs/enrich-playwright" -ContentType "application/json" -Body '{"limit":5,"debug":true}' | ConvertTo-Json -Depth 10
+
+Then inspect:
+Invoke-RestMethod "http://127.0.0.1:8000/api/opportunities/49" | ConvertTo-Json -Depth 20

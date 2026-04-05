@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.alembic/
+*.db
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,37 @@
+DIBBS scraper parsing patch
+
+Changed file:
+- backend/app/services/scrapers/dibbs_scraper.py
+
+What changed:
+- The DIBBS scraper now uses the existing official FSC adapter path (`pull_dibbs_by_fsc`)
+  instead of the noisier generic HTML search parser.
+- It converts adapter items into `RawOpportunity` objects using the correct schema fields:
+  - `naics_code`
+  - `fsc_code`
+  - `description`
+  - `raw_payload`
+- It derives cleaner item signals for downstream research:
+  - `dibbs_value`
+  - `nsn`
+  - `title_keywords`
+  - `product_family`
+
+Why this matters:
+- Better ingestion compatibility with `ingest_raw_opportunities`
+- Cleaner rows for DIBBS opportunities
+- Stronger item signals for predecessor / vendor research
+- Avoids broad generic results when no FSC is supplied
+
+Retest:
+1) Restart backend
+   uvicorn app.main:app --reload
+
+2) Run DIBBS scraper
+   Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/scrapers/dibbs/run" -ContentType "application/json" -Body '{"max_pages":1,"fsc":"6520","limit":10}' | ConvertTo-Json -Depth 10
+
+3) Check latest opportunities
+   Invoke-RestMethod "http://127.0.0.1:8000/api/opportunities?limit=10&offset=0" | ConvertTo-Json -Depth 10
+
+4) Check one inserted opportunity detail
+   Invoke-RestMethod "http://127.0.0.1:8000/api/opportunities/49" | ConvertTo-Json -Depth 10

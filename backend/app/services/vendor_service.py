@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.models.opportunity import Opportunity
+from app.models.vendor import VendorLead, VendorQuote
+from app.services.rfq_parser import parse_dibbs_sources
+
+
+DEFAULT_STATUS = "NOT_REQUESTED"
+ALLOWED_STATUSES = {"NOT_REQUESTED", "REQUESTED", "RECEIVED", "NO_BID", "INVALID"}
+LEAD_ALLOWED_STATUSES = {"NEW", "REVIEW", "SHORTLISTED", "SEEDED_TO_QUOTES", "IGNORED"}
+
+
+def _clean(v: str | None) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
+    parsed = getattr(opp, "parsed_json", None) or {}
+    if not parsed and getattr(opp, "raw_text", None):
+        parsed = parse_dibbs_sources(opp.raw_text or "", opp.url)
+        opp.parsed_json = parsed
+        db.commit()
+
+    nsn = _clean(parsed.get("nsn"))
+    sources = parsed.get("approved_sources") or []
+    created = 0
+    updated = 0
+
+    for s in sources:
+        company_name = _clean(s.get("company_name"))
+        cage = _clean(s.get("cage"))
+        part_number = _clean(s.get("part_number"))
+        raw_text = _clean(s.get("raw_text"))
+        confidence = 90 if cage and company_name else 80 if cage or company_name else 60 if part_number else 40
+
+        q = db.query(VendorLead).filter(VendorLead.opportunity_id == opp.id)
+        if cage:
+            q = q.filter(VendorLead.cage == cage)
+        else:
+            q = q.filter(VendorLead.cage.is_(None))
+        if company_name:
+            q = q.filter(func.coalesce(VendorLead.company_name, "") == company_name)
+        else:
+            q = q.filter(VendorLead.company_name.is_(None))
+        if part_number:
+            q = q.filter(VendorLead.part_number == part_number)
+        else:
+            q = q.filter(VendorLead.part_number.is_(None))
+
+        rec = q.first()
+        if rec:
+            touched = False
+            if not rec.nsn and nsn:
+                rec.nsn = nsn
+                touched = True
+            if company_name and not rec.company_name:
+                rec.company_name = company_name
+                touched = True
+            if cage and not rec.cage:
+                rec.cage = cage
+                touched = True
+            if part_number and not rec.part_number:
+                rec.part_number = part_number
+                touched = True
+            if raw_text and not rec.raw_text:
+                rec.raw_text = raw_text
+                touched = True
+            if confidence > (rec.confidence or 0):
+                rec.confidence = confidence
+                touched = True
+            if touched:
+                rec.updated_at = datetime.utcnow()
+                updated += 1
+            continue
+
+        db.add(VendorLead(
+            opportunity_id=opp.id,
+            source_type="APPROVED_SOURCE",
+            company_name=company_name,
+            cage=cage,
+            part_number=part_number,
+            nsn=nsn,
+            status="NEW",
+            confidence=confidence,
+            is_approved_source=True,
+            raw_text=raw_text,
+        ))
+        created += 1
+
+    if created or updated:
+        db.commit()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "approved_source_count": len(sources),
+    }
+
+
+def list_vendor_leads(db: Session, opportunity_id: int) -> list[VendorLead]:
+    return (
+        db.query(VendorLead)
+        .filter(VendorLead.opportunity_id == opportunity_id)
+        .order_by(VendorLead.confidence.desc(), VendorLead.company_name.asc().nullslast(), VendorLead.cage.asc().nullslast(), VendorLead.part_number.asc().nullslast())
+        .all()
+    )
+
+
+def update_vendor_lead(db: Session, opportunity_id: int, lead_id: int, patch: dict[str, Any]) -> VendorLead:
+    rec = (
+        db.query(VendorLead)
+        .filter(VendorLead.opportunity_id == opportunity_id)
+        .filter(VendorLead.id == lead_id)
+        .first()
+    )
+    if not rec:
+        raise ValueError("vendor lead not found")
+
+    if "status" in patch and patch["status"]:
+        st = str(patch["status"]).strip().upper()
+        rec.status = st if st in LEAD_ALLOWED_STATUSES else rec.status
+    if "notes" in patch:
+        rec.notes = patch["notes"]
+
+    rec.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
+    lead_stats = sync_vendor_leads_from_parsed(db, opp)
+    leads = list_vendor_leads(db, opp.id)
+    created = 0
+    shortlisted = 0
+
+    for lead in leads:
+        cage = _clean(lead.cage)
+        if not cage:
+            continue
+        shortlisted += 1
+        part_number = _clean(lead.part_number)
+        company_name = _clean(lead.company_name)
+
+        q = (
+            db.query(VendorQuote)
+            .filter(VendorQuote.opportunity_id == opp.id)
+            .filter(VendorQuote.cage == cage)
+        )
+        if part_number is None:
+            q = q.filter(VendorQuote.part_number.is_(None))
+        else:
+            q = q.filter(VendorQuote.part_number == part_number)
+
+        existing = q.first()
+        if existing:
+            touched = False
+            if (not existing.company_name) and company_name:
+                existing.company_name = company_name
+                touched = True
+            if touched:
+                existing.updated_at = datetime.utcnow()
+            if lead.status != "SEEDED_TO_QUOTES":
+                lead.status = "SEEDED_TO_QUOTES"
+                lead.updated_at = datetime.utcnow()
+            continue
+
+        db.add(VendorQuote(
+            opportunity_id=opp.id,
+            cage=cage,
+            company_name=company_name,
+            part_number=part_number,
+            status=DEFAULT_STATUS,
+        ))
+        lead.status = "SEEDED_TO_QUOTES"
+        lead.updated_at = datetime.utcnow()
+        created += 1
+
+    if created or shortlisted or lead_stats.get("created") or lead_stats.get("updated"):
+        db.commit()
+
+    return {
+        "created": created,
+        "lead_created": lead_stats.get("created", 0),
+        "lead_updated": lead_stats.get("updated", 0),
+        "lead_count": len(leads),
+        "seedable_count": shortlisted,
+        "approved_source_count": lead_stats.get("approved_source_count", 0),
+    }
+
+
+def list_quotes(db: Session, opportunity_id: int) -> list[VendorQuote]:
+    return (
+        db.query(VendorQuote)
+        .filter(VendorQuote.opportunity_id == opportunity_id)
+        .order_by(VendorQuote.company_name.asc().nullslast(), VendorQuote.cage.asc(), VendorQuote.part_number.asc().nullslast())
+        .all()
+    )
+
+
+def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str | None, patch: dict[str, Any]) -> VendorQuote:
+    cage = cage.strip()
+    if not cage:
+        raise ValueError("cage required")
+
+    q = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.opportunity_id == opportunity_id)
+        .filter(VendorQuote.cage == cage)
+    )
+
+    if part_number is None or str(part_number).strip() == "":
+        part_db = None
+        q = q.filter(VendorQuote.part_number.is_(None))
+    else:
+        part_db = str(part_number).strip()
+        q = q.filter(VendorQuote.part_number == part_db)
+
+    rec = q.first()
+    if not rec:
+        rec = VendorQuote(opportunity_id=opportunity_id, cage=cage, part_number=part_db, status=DEFAULT_STATUS)
+        db.add(rec)
+        db.flush()
+
+    for k in ["company_name", "contact_name", "email", "phone", "notes"]:
+        if k in patch:
+            setattr(rec, k, patch[k])
+
+    if "unit_price" in patch:
+        rec.unit_price = patch["unit_price"]
+    if "lead_time_days" in patch:
+        rec.lead_time_days = patch["lead_time_days"]
+
+    if "status" in patch and patch["status"]:
+        st = str(patch["status"]).strip().upper()
+        rec.status = st if st in ALLOWED_STATUSES else DEFAULT_STATUS
+
+    rec.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rec)
+    return rec

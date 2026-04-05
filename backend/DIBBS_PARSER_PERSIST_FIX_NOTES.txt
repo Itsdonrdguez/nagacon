@@ -1,0 +1,20 @@
+DIBBS parser + persistence fix patch
+
+Files:
+- backend/app/services/dibbs/structured_detail_parser.py
+- backend/app/services/dibbs/detail_enrichment_playwright.py
+
+Fixes:
+- DENTSPLY NORTH AMERICA LLC stays together in approved_sources
+- nomenclature no longer ends with AMSC
+- top-level opportunity fields are force-synced on every enrichment run:
+  - source_opportunity_id
+  - fsc_code
+  - description
+
+Retest:
+uvicorn app.main:app --reload
+
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/dibbs/enrich-playwright" -ContentType "application/json" -Body '{"limit":5,"debug":true}' | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod "http://127.0.0.1:8000/api/opportunities/49" | ConvertTo-Json -Depth 20

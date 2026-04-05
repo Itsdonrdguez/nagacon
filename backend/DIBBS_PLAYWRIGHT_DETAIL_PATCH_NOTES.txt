@@ -1,0 +1,26 @@
+Playwright-backed DIBBS detail enrichment patch
+
+Files:
+- backend/app/services/dibbs/detail_enrichment_playwright.py
+- backend/app/api/dibbs_enrich_playwright.py
+
+What it does:
+- uses Playwright session to open each RFQ detail page
+- bypasses DoD warning / request rejected issue
+- extracts:
+  - NSN
+  - FSC
+  - PDF / file links
+- detects and rejects blocked pages
+
+How to wire:
+1) Put files in paths above
+2) In app/main.py:
+   from app.api.dibbs_enrich_playwright import router as dibbs_enrich_pw_router
+   app.include_router(dibbs_enrich_pw_router)
+
+3) Install Playwright browser:
+   python -m playwright install chromium
+
+Test:
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/dibbs/enrich-playwright" -ContentType "application/json" -Body '{"limit":5,"debug":true}' | ConvertTo-Json -Depth 10

@@ -1,0 +1,613 @@
+NagaCon Super Diagnostic Report
+================================================================================
+{
+  "base_url": "http://127.0.0.1:8000",
+  "streamlit_url": "http://127.0.0.1:8501",
+  "opportunity_id": 49,
+  "total_checks": 32,
+  "passed": 26,
+  "failed": 6,
+  "by_category": {
+    "network": {
+      "passed": 2,
+      "failed": 0
+    },
+    "environment": {
+      "passed": 3,
+      "failed": 1
+    },
+    "filesystem": {
+      "passed": 6,
+      "failed": 0
+    },
+    "ui": {
+      "passed": 1,
+      "failed": 0
+    },
+    "core": {
+      "passed": 1,
+      "failed": 1
+    },
+    "workspace": {
+      "passed": 2,
+      "failed": 1
+    },
+    "vendors": {
+      "passed": 2,
+      "failed": 1
+    },
+    "proposal": {
+      "passed": 0,
+      "failed": 2
+    },
+    "research": {
+      "passed": 1,
+      "failed": 0
+    },
+    "scrapers": {
+      "passed": 3,
+      "failed": 0
+    },
+    "optional": {
+      "passed": 4,
+      "failed": 0
+    },
+    "files": {
+      "passed": 1,
+      "failed": 0
+    }
+  }
+}
+
+Backend port 8000
+  METHOD: TCP
+  URL: 127.0.0.1:8000
+  STATUS: OPEN
+  OK: True
+  CATEGORY: network
+  SUMMARY: reachable
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Streamlit port 8501
+  METHOD: TCP
+  URL: 127.0.0.1:8501
+  STATUS: OPEN
+  OK: True
+  CATEGORY: network
+  SUMMARY: reachable
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Env hint: DATABASE_URL
+  METHOD: LOCAL
+  URL: -
+  STATUS: MISSING
+  OK: False
+  CATEGORY: environment
+  SUMMARY: not found
+  SAMPLE:
+    {
+      "os_environ": false,
+      "env_file_hint": false
+    }
+--------------------------------------------------------------------------------
+Env hint: SAM_API_KEY
+  METHOD: LOCAL
+  URL: -
+  STATUS: MISSING
+  OK: True
+  CATEGORY: environment
+  SUMMARY: not found
+  SAMPLE:
+    {
+      "os_environ": false,
+      "env_file_hint": false
+    }
+--------------------------------------------------------------------------------
+Env hint: OPENAI_API_KEY
+  METHOD: LOCAL
+  URL: -
+  STATUS: MISSING
+  OK: True
+  CATEGORY: environment
+  SUMMARY: not found
+  SAMPLE:
+    {
+      "os_environ": false,
+      "env_file_hint": false
+    }
+--------------------------------------------------------------------------------
+Env hint: NAGACON_BASE_URL
+  METHOD: LOCAL
+  URL: -
+  STATUS: PRESENT
+  OK: True
+  CATEGORY: environment
+  SUMMARY: found
+  SAMPLE:
+    {
+      "os_environ": true,
+      "env_file_hint": false
+    }
+--------------------------------------------------------------------------------
+Path exists: app/main.py
+  METHOD: LOCAL
+  URL: -
+  STATUS: NO
+  OK: True
+  CATEGORY: filesystem
+  SUMMARY: missing
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Path exists: backend/app/main.py
+  METHOD: LOCAL
+  URL: -
+  STATUS: NO
+  OK: True
+  CATEGORY: filesystem
+  SUMMARY: missing
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Path exists: streamlit_app
+  METHOD: LOCAL
+  URL: -
+  STATUS: NO
+  OK: True
+  CATEGORY: filesystem
+  SUMMARY: missing
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Path exists: alembic
+  METHOD: LOCAL
+  URL: -
+  STATUS: NO
+  OK: True
+  CATEGORY: filesystem
+  SUMMARY: missing
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Path exists: alembic.ini
+  METHOD: LOCAL
+  URL: -
+  STATUS: NO
+  OK: True
+  CATEGORY: filesystem
+  SUMMARY: missing
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Path exists: backend/alembic.ini
+  METHOD: LOCAL
+  URL: -
+  STATUS: NO
+  OK: True
+  CATEGORY: filesystem
+  SUMMARY: missing
+  SAMPLE:
+    ""
+--------------------------------------------------------------------------------
+Streamlit UI
+  METHOD: GET
+  URL: http://127.0.0.1:8501
+  STATUS: 200
+  OK: True
+  CATEGORY: ui
+  SUMMARY: reachable
+  SAMPLE:
+    "<!--\n Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)\n\n Licensed under the Apache License, Version 2.0 (the \"License\");\n you may not use this file except in compliance with the License.\n You may obtain a copy of the License at\n\n     http://www.apache.org/licenses/LICENSE-2.0\n\n Unless required by applicable law or agreed to in writing, software\n distributed under the License is distributed on an \"AS IS\" BASIS,\n WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n See the License for the specific language governing permissions and\n limitations under the License.\n-->\n\n<!DOCTYPE html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <meta\n      name=\"viewport\"\n      content=\"width=device-width, initial-scale=1, shrink-to-fit=no\"\n    />\n    <link rel=\"shortcut icon\" href=\"./favicon.png\" />\n    <link\n      rel=\"preload\"\n      href=\"./static/media/SourceSansVF-Upright.ttf.BsWL4Kly.woff2\"\n      as=\"font\"\n      type=\"font/woff2\"\n      crossorigin\n    />\n\n    <title>Streamlit</title>\n\n    <!-- initialize window.prerenderReady to false and then set to true in React app when app is ready for indexing -->\n    <script>\n      window.prerenderRead"
+--------------------------------------------------------------------------------
+Opportunities list
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/opportunities?limit=5&offset=0
+  STATUS: 200
+  OK: True
+  CATEGORY: core
+  SUMMARY: mounted and working
+  SAMPLE:
+    [
+      {
+        "source": "DIBBS",
+        "source_opportunity_id": "3610-01-725-1172",
+        "solicitation_number": "3610-01-725-1172",
+        "title": "3610-01-725-1172",
+        "agency": "DLA (DIBBS)",
+        "sub_agency": null,
+        "office": null,
+        "url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017251172&category=nsn&Scope=open",
+        "posted_at": null,
+        "due_at": null,
+        "set_aside_type": null,
+        "naics_code": null,
+        "fsc_code": "6515",
+        "place_of_performance": null,
+        "description": "NSN: 3610-01-7251172 | FSC: 6515 | Item: 3610-01-725-1172 | DIBBS value: 3610017251172",
+        "status": "new",
+        "raw_payload": {
+          "adapter_item": {
+            "url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017251172&category=nsn&Scope=open",
+            "title": "3610-01-725-1172",
+            "agency": "DLA (DIBBS)",
+            "due_at": null,
+            "office": null,
+            "source": "DIBBS",
+            "status": "new",
+            "fsc_code": "6515",
+            "posted_at": null,
+            "detail_url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017251172&category=nsn&Scope=open",
+            "sub_agency": null,
+            "description": "3610-01-725-1172",
+            "raw_payload": null,
+            "set_aside_type": null,
+            "solicitation_number": "3610-01-725-1172",
+            "place_of_performance": null,
+            "source_opportunity_id": null
+          },
+          "item_signals": {
+            "nsn": "3610-01-7251172",
+            "fsc_code": "6515",
+            "dibbs_value": "3610017251172",
+            "product_family": null,
+            "title_keywords": [
+              "3610",
+              "725",
+              "1172"
+            ]
+          },
+          "source_adapter": "pull_dibbs_by_fsc",
+          "adapter_diagnostics": {
+            "mode": "adapter",
+            "final_url": "https://www.dibbs.bsm.dla.mil/Rfq/RfqRecs.aspx",
+            "page_title": "DIBBS RFQ Search Results",
+            "request_fsc": "6515",
+            "rows_parsed": 3,
+            "pages_fetched": 1,
+            "request_limit": 3
+          }
+        },
+        "id": 3
+      },
+      {
+        "source": "DIBBS",
+        "source_opportunity_id": "3610-01-723-6246",
+        "solicitation_number": "3610-01-723-6246",
+        "title": "3610-01-723-6246",
+        "agency": "DLA (DIBBS)",
+        "sub_agency": null,
+        "office": null,
+        "url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017236246&category=nsn&Scope=open",
+        "posted_at": null,
+        "due_at": null,
+        "set_aside_type": null,
+        "naics_code": null,
+        "fsc_code": "6515",
+        "place_of_performance": null,
+        "description": "NSN: 3610-01-7236246 | FSC: 6515 | Item: 3610-01-723-6246 | DIBBS value: 3610017236246",
+        "status": "new",
+        "raw_payload": {
+          "adapter_item": {
+            "url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017236246&category=nsn&Scope=open",
+            "title": "3610-01-723-6246",
+            "agency": "DLA (DIBBS)",
+            "due_at": null,
+            "office": null,
+            "source": "DIBBS",
+            "status": "new",
+            "fsc_code": "6515",
+            "posted_at": null,
+            "detail_url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017236246&category=nsn&Scope=open",
+            "sub_agency": null,
+            "description": "3610-01-723-6246",
+            "raw_payload": null,
+            "set_aside_type": null,
+            "solicitation_number": "3610-01-723-6246",
+            "place_of_performance": null,
+            "source_opportunity_id": null
+          },
+          "item_signals": {
+            "nsn": "3610-01-7236246",
+            "fsc_code": "6515",
+            "dibbs_value": "3610017236246",
+            "product_family": null,
+            "title_keywords": [
+              "3610",
+              "723",
+              "6246"
+            ]
+          },
+          "source_adapter": "pull_dibbs_by_fsc",
+          "adapter_diagnostics": {
+            "mode": "adapter",
+            "final_url": "https://www.dibbs.bsm.dla.mil/Rfq/RfqRecs.aspx",
+            "page_title": "DIBBS RFQ Search Results",
+            "request_fsc": "6515",
+            "rows_parsed": 3,
+            "pages_fetched": 1,
+            "request_limit": 3
+          }
+        },
+        "id": 2
+      },
+      {
+        "source": "DIBBS",
+        "source_opportunity_id": "3610-01-721-4071",
+        "solicitation_number": "3610-01-721-4071",
+        "title": "3610-01-721-4071",
+        "agency": "DLA (DIBBS)",
+        "sub_agency": null,
+        "office": null,
+        "url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017214071&category=nsn&Scope=open",
+        "posted_at": null,
+        "due_at": null,
+        "set_aside_type": null,
+        "naics_code": null,
+        "fsc_code": "6515",
+        "place_of_performance": null,
+        "description": "NSN: 3610-01-7214071 | FSC: 6515 | Item: 3610-01-721-4071 | DIBBS value: 3610017214071",
+        "status": "new",
+        "raw_payload": {
+          "adapter_item": {
+            "url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017214071&category=nsn&Scope=open",
+            "title": "3610-01-721-4071",
+            "agency": "DLA (DIBBS)",
+            "due_at": null,
+            "office": null,
+            "source": "DIBBS",
+            "status": "new",
+            "fsc_code": "6515",
+            "posted_at": null,
+            "detail_url": "https://www.dibbs.bsm.dla.mil/RFQ/RFQNsn.aspx?value=3610017214071&category=nsn&Scope=open",
+            "sub_agency": null,
+            "description": "3610-01-721-4071",
+            "raw_payload": null,
+            "set_aside_type": null,
+            "solicitation_number": "3610-01-721-4071",
+            "place_of_performance": null,
+            "source_opportunity_id": null
+          },
+          "item_signals": {
+            "nsn": "3610-01-7214071",
+            "fsc_code": "6515",
+            "dibbs_value": "3610017214071",
+            "product_family": null,
+            "title_keywords": [
+              "3610",
+              "721",
+              "4071"
+            ]
+          },
+          "source_adapter": "pull_dibbs_by_fsc",
+          "adapter_diagnostics": {
+            "mode": "adapter",
+            "final_url": "https://www.dibbs.bsm.dla.mil/Rfq/RfqRecs.aspx",
+            "page_title": "DIBBS RFQ Search Results",
+            "request_fsc": "6515",
+            "rows_parsed": 3,
+            "pages_fetched": 1,
+            "request_limit": 3
+          }
+        },
+        "id": 1
+      }
+    ]
+--------------------------------------------------------------------------------
+Opportunity detail
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/opportunities/49
+  STATUS: 404
+  OK: False
+  CATEGORY: core
+  SUMMARY: not working
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+Workspace summary
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/workspace/summary?opp_id=49
+  STATUS: 404
+  OK: False
+  CATEGORY: workspace
+  SUMMARY: workspace issue
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+Vendor leads list
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/vendors/leads?opportunity_id=49
+  STATUS: 200
+  OK: True
+  CATEGORY: vendors
+  SUMMARY: mounted and working
+  SAMPLE:
+    []
+--------------------------------------------------------------------------------
+Vendor leads sync
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/vendors/leads/sync
+  STATUS: 404
+  OK: False
+  CATEGORY: vendors
+  SUMMARY: sync failed
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+Vendor discovery route
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/vendor-discovery/opportunities/49
+  STATUS: 404
+  OK: True
+  CATEGORY: vendors
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+Proposal assist draft
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/proposal-assist/opportunities/49/draft
+  STATUS: 404
+  OK: False
+  CATEGORY: proposal
+  SUMMARY: not working
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+Vendor email generic draft
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/vendor-email/opportunities/49/draft
+  STATUS: 404
+  OK: False
+  CATEGORY: proposal
+  SUMMARY: not working
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+USAspending research
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/research/usaspending/opportunities/49
+  STATUS: 404
+  OK: True
+  CATEGORY: research
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+SAM scraper
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/scrapers/sam/run
+  STATUS: 200
+  OK: True
+  CATEGORY: scrapers
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "inserted": 0,
+      "updated": 0,
+      "skipped": 0,
+      "errors": []
+    }
+--------------------------------------------------------------------------------
+DIBBS scraper
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/scrapers/dibbs/run
+  STATUS: 200
+  OK: True
+  CATEGORY: scrapers
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "inserted": 2,
+      "updated": 0,
+      "skipped": 1,
+      "errors": []
+    }
+--------------------------------------------------------------------------------
+State/local all
+  METHOD: POST
+  URL: http://127.0.0.1:8000/api/scrapers/state-local/all/run
+  STATUS: 500
+  OK: True
+  CATEGORY: scrapers
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "detail": "Internal server error",
+      "error": "RetryError[<Future at 0x1f2e2e0c5c0 state=finished raised HTTPError>]"
+    }
+--------------------------------------------------------------------------------
+Pipeline get
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/pipeline/1
+  STATUS: 404
+  OK: True
+  CATEGORY: optional
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "detail": "Pipeline item not found"
+    }
+--------------------------------------------------------------------------------
+Quotes list
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/quotes/opportunities/49
+  STATUS: 200
+  OK: True
+  CATEGORY: optional
+  SUMMARY: reachable
+  SAMPLE:
+    []
+--------------------------------------------------------------------------------
+Company profile
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/company/profile/1
+  STATUS: 404
+  OK: True
+  CATEGORY: optional
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "detail": "Company profile not found"
+    }
+--------------------------------------------------------------------------------
+Analytics summary
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/analytics/summary
+  STATUS: 200
+  OK: True
+  CATEGORY: optional
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "pipeline_count": 0,
+      "status": "ok"
+    }
+--------------------------------------------------------------------------------
+Files list legacy
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/files/list?opportunity_id=49
+  STATUS: 404
+  OK: True
+  CATEGORY: files
+  SUMMARY: reachable
+  SAMPLE:
+    {
+      "detail": "Opportunity not found"
+    }
+--------------------------------------------------------------------------------
+Workspace artifacts
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/workspace/artifacts?opp_id=49
+  STATUS: 200
+  OK: True
+  CATEGORY: workspace
+  SUMMARY: reachable
+  SAMPLE:
+    []
+--------------------------------------------------------------------------------
+Workspace tasks
+  METHOD: GET
+  URL: http://127.0.0.1:8000/api/workspace/tasks?opp_id=49
+  STATUS: 200
+  OK: True
+  CATEGORY: workspace
+  SUMMARY: reachable
+  SAMPLE:
+    []
+--------------------------------------------------------------------------------

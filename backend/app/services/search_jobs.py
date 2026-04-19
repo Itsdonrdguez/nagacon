@@ -11,6 +11,7 @@ from app.models.search_job import SearchJob
 from app.repositories.company import CompanyRepository
 from app.services.company_profile_ingest import run_company_profile_ingest
 from app.services.dibbs.pdf_bulk_export import export_dibbs_pdfs_for_fscs
+from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
 
 _jobs: dict[str, dict[str, Any]] = {}
@@ -50,6 +51,7 @@ def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
         "kind": job["kind"],
         "status": job["status"],
         "progress": dict(job.get("progress") or {}),
+        "payload": job.get("payload"),
         "result": job.get("result"),
         "error": job.get("error"),
         "started_at": job.get("started_at"),
@@ -64,6 +66,7 @@ def _db_snapshot(row: SearchJob) -> dict[str, Any]:
         "kind": row.kind,
         "status": row.status,
         "progress": dict(row.progress or {}),
+        "payload": row.payload,
         "result": row.result,
         "error": row.error,
         "started_at": row.started_at.isoformat() if row.started_at else None,
@@ -189,6 +192,19 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 organization_id=payload.get("organization_id"),
                 download_documents=bool(payload.get("download_documents", True)),
                 run_usaspending=bool(payload.get("run_usaspending", True)),
+                progress_callback=lambda event: _append_progress(job_id, event),
+            )
+        elif kind == "nsn_build":
+            nsn = str(payload.get("nsn") or "").strip()
+            if not nsn:
+                raise ValueError("nsn is required for nsn_build jobs")
+            result = build_nsn_intelligence(
+                db,
+                nsn,
+                seed_providers=bool(payload.get("seed_providers", True)),
+                run_usaspending=bool(payload.get("run_usaspending", True)),
+                limit=int(payload.get("limit") or 50),
+                organization_id=payload.get("organization_id"),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         else:

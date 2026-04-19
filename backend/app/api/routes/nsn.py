@@ -9,6 +9,7 @@ from app.services.nsn_catalog.catalog_service import get_nsn_catalog_summary
 from app.services.nsn_catalog.publog_decomp import import_publog_nsn
 from app.services.nsn_catalog.provider_seeding import seed_providers_from_nsn_catalog
 from app.services.nsn_catalog.refresh import refresh_nsn_intelligence
+from app.services.search_jobs import start_search_job
 
 
 router = APIRouter(prefix="/api/nsn", tags=["nsn-intelligence"])
@@ -99,3 +100,23 @@ def build_nsn(
     if result.get("status") == "invalid_nsn":
         raise HTTPException(status_code=422, detail=result["error"])
     return result
+
+
+@router.post("/{nsn}/build-job")
+def build_nsn_job(
+    nsn: str,
+    run_usaspending: bool = True,
+    seed_providers: bool = True,
+    limit: int = 50,
+    current_org=Depends(get_current_organization),
+):
+    return start_search_job(
+        "nsn_build",
+        {
+            "nsn": nsn,
+            "run_usaspending": run_usaspending,
+            "seed_providers": seed_providers,
+            "limit": max(min(limit, 100), 1),
+            "organization_id": getattr(current_org, "id", None),
+        },
+    )

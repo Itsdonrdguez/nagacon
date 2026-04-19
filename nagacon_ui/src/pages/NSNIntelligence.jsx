@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import {
@@ -54,6 +54,7 @@ export default function NSNIntelligence() {
   const queryClient = useQueryClient()
   const [input, setInput] = useState(DEFAULT_NSN)
   const [submittedNsn, setSubmittedNsn] = useState(DEFAULT_NSN)
+  const [buildJobId, setBuildJobId] = useState(null)
 
   const cleanNsn = normalizeSearch(submittedNsn)
   const nsnQuery = useQuery({
@@ -61,6 +62,18 @@ export default function NSNIntelligence() {
     enabled: cleanNsn.length === 13,
     queryFn: async () => {
       const res = await api.get(`/api/nsn/${cleanNsn}`)
+      return res.data
+    },
+  })
+  const buildJobQuery = useQuery({
+    queryKey: ['search-job', buildJobId],
+    enabled: Boolean(buildJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${buildJobId}`)
       return res.data
     },
   })
@@ -95,7 +108,7 @@ export default function NSNIntelligence() {
 
   const buildMutation = useMutation({
     mutationFn: async () => {
-      const res = await api.post(`/api/nsn/${cleanNsn}/build`, null, {
+      const res = await api.post(`/api/nsn/${cleanNsn}/build-job`, null, {
         params: {
           run_usaspending: true,
           seed_providers: true,
@@ -104,9 +117,8 @@ export default function NSNIntelligence() {
       })
       return res.data
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['nsn-intelligence', cleanNsn] })
-      queryClient.invalidateQueries({ queryKey: ['providers'] })
+    onSuccess: (job) => {
+      setBuildJobId(job.id)
     },
   })
 
@@ -133,7 +145,18 @@ export default function NSNIntelligence() {
   const pricing = data?.pricing || {}
   const snapshot = data?.snapshot || null
   const snapshotUsaspending = snapshot?.usaspending || null
+  const sourceFreshness = data?.source_freshness || {}
+  const cageProfiles = data?.cage_profiles || []
+  const buildJob = buildJobQuery.data
+  const buildJobDone = buildJob?.status === 'success'
+  const buildJobFailed = buildJob?.status === 'failed'
   const awardSignalCount = Number(awards.count || 0) + Number(nsnAwardEvidence.count || 0)
+
+  useEffect(() => {
+    if (!buildJobDone) return
+    queryClient.invalidateQueries({ queryKey: ['nsn-intelligence', cleanNsn] })
+    queryClient.invalidateQueries({ queryKey: ['providers'] })
+  }, [buildJobDone, cleanNsn, queryClient])
 
   const summaryStats = useMemo(() => ([
     { label: 'Vendor Candidates', value: numberLabel(recommendations.length), subtitle: data?.confidence?.has_vendor_recommendations ? 'Ranked by evidence' : 'Needs more evidence' },
@@ -171,8 +194,8 @@ export default function NSNIntelligence() {
             <Button type="submit" disabled={normalizeSearch(input).length !== 13}>Lookup</Button>
             <Button
               type="button"
-              loading={buildMutation.isPending}
-              disabled={cleanNsn.length !== 13 || buildMutation.isPending}
+              loading={buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
+              disabled={cleanNsn.length !== 13 || buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
               onClick={() => buildMutation.mutate()}
             >
               Build Intelligence
@@ -247,10 +270,19 @@ export default function NSNIntelligence() {
             ))}
           </div>
 
-          {(buildMutation.data || importPublogMutation.data || refreshMutation.data || seedMutation.data) ? (
+          {(buildJob || buildMutation.data || importPublogMutation.data || refreshMutation.data || seedMutation.data) ? (
             <Card title="Last Action">
               <div className="nsn-action-result">
-                {buildMutation.data ? (
+                {buildJob ? (
+                  <div>
+                    <div className="row-title">Intelligence build job</div>
+                    <div className="row-subtitle">
+                      {buildJob.status} | {numberLabel(buildJob.progress?.percent)}% | {buildJob.progress?.current_label || 'Queued'}
+                      {buildJob.error ? ` | ${buildJob.error}` : ''}
+                    </div>
+                  </div>
+                ) : null}
+                {buildMutation.data && !buildJob ? (
                   <div>
                     <div className="row-title">Intelligence build</div>
                     <div className="row-subtitle">
@@ -348,6 +380,42 @@ export default function NSNIntelligence() {
 
             <Card title="Next Actions">
               <SectionList items={data.next_actions || []} empty="No next actions." />
+            </Card>
+          </div>
+
+          <div className="nsn-two-column">
+            <Card title="Source Freshness">
+              <div className="simple-list">
+                <div className="simple-list-row">
+                  <div className="row-title">PUB LOG</div>
+                  <div className="row-subtitle">{sourceFreshness.publog_source_version || 'Not loaded'} | {sourceFreshness.catalog_updated_at || 'No catalog timestamp'}</div>
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">Latest Snapshot</div>
+                  <div className="row-subtitle">{sourceFreshness.latest_snapshot_generated_at || 'No snapshot yet'}</div>
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">Source Labels</div>
+                  <div className="row-subtitle">Catalog official | Awards API | Providers organization scoped</div>
+                </div>
+              </div>
+            </Card>
+
+            <Card title="CAGE Profiles">
+              {cageProfiles.length ? (
+                <div className="simple-list">
+                  {cageProfiles.slice(0, 8).map((profile) => (
+                    <div className="simple-list-row" key={profile.cage}>
+                      <div className="row-title">{profile.cage} | {profile.company_name || profile.official_profile?.company || 'Unknown company'}</div>
+                      <div className="row-subtitle">
+                        {(profile.part_numbers || []).slice(0, 3).join(', ') || 'No part numbers'} | {profile.official_profile?.city || 'No city'} {profile.official_profile?.state || ''}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="row-subtitle">Run Build Intelligence to enrich CAGE profile evidence.</div>
+              )}
             </Card>
           </div>
 

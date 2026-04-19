@@ -13,14 +13,19 @@ def create_search_job(payload: dict = Body(default={}), current_org=Depends(get_
     payload = dict(payload or {})
     payload.setdefault("organization_id", getattr(current_org, "id", None))
     kind = str(payload.get("kind") or "manual").strip().lower()
-    if kind not in {"profile", "manual", "dibbs_pdf_bulk_download", "workspace_intake"}:
-        raise HTTPException(status_code=400, detail="Search job kind must be profile, manual, dibbs_pdf_bulk_download, or workspace_intake")
+    allowed = {"profile", "manual", "dibbs_pdf_bulk_download", "workspace_intake", "nsn_build"}
+    if kind not in allowed:
+        raise HTTPException(status_code=400, detail=f"Search job kind must be one of: {', '.join(sorted(allowed))}")
     return start_search_job(kind, payload)
 
 
 @router.get("/{job_id}")
-def read_search_job(job_id: str):
+def read_search_job(job_id: str, current_org=Depends(get_current_organization)):
     job = get_search_job(job_id)
     if not job:
+        raise HTTPException(status_code=404, detail="Search job not found")
+    job_org = (job.get("result") or {}).get("organization_id") or (job.get("payload") or {}).get("organization_id")
+    current_org_id = getattr(current_org, "id", None)
+    if job_org is not None and current_org_id is not None and int(job_org) != int(current_org_id):
         raise HTTPException(status_code=404, detail="Search job not found")
     return job

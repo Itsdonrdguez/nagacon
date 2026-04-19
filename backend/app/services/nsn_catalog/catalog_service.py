@@ -118,9 +118,11 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
         ],
         "providers": providers,
         "vendor_recommendations": vendor_recommendations,
+        "cage_profiles": _cage_profiles(references, evidence),
         "award_history": awards,
         "nsn_award_evidence": nsn_awards,
         "pricing": pricing,
+        "source_freshness": _source_freshness(master, references, evidence, snapshot),
         "evidence": [
             _model_dict(row, [
                 "claim_type",
@@ -146,6 +148,90 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
         "snapshot": snapshot.summary_json if snapshot else None,
         "next_actions": _next_actions(master, references, providers, awards),
     }
+
+
+def _source_freshness(
+    master: NsnMaster | None,
+    references: list[NsnReference],
+    evidence: list[NsnEvidence],
+    snapshot: NsnIntelligenceSnapshot | None,
+) -> dict[str, Any]:
+    publog_versions = sorted(
+        {
+            value
+            for value in [getattr(master, "source_version", None), *[getattr(row, "source_version", None) for row in references]]
+            if value
+        }
+    )
+    latest_catalog_at = max(
+        [value for value in [getattr(master, "updated_at", None), *[getattr(row, "updated_at", None) for row in references]] if value],
+        default=None,
+    )
+    latest_evidence_at = max([getattr(row, "updated_at", None) for row in evidence if getattr(row, "updated_at", None)], default=None)
+    return {
+        "publog_source_version": publog_versions[-1] if publog_versions else None,
+        "catalog_updated_at": latest_catalog_at.isoformat() if latest_catalog_at else None,
+        "evidence_updated_at": latest_evidence_at.isoformat() if latest_evidence_at else None,
+        "latest_snapshot_generated_at": snapshot.generated_at.isoformat() if snapshot and snapshot.generated_at else None,
+        "source_labels": {
+            "catalog": "official_publog",
+            "awards": "usaspending_api",
+            "providers": "organization_scoped",
+        },
+    }
+
+
+def _cage_profiles(references: list[NsnReference], evidence: list[NsnEvidence]) -> list[dict[str, Any]]:
+    by_cage: dict[str, dict[str, Any]] = {}
+    for row in references:
+        cage = (row.cage or "").strip()
+        if not cage:
+            continue
+        profile = by_cage.setdefault(
+            cage,
+            {
+                "cage": cage,
+                "company_name": row.company_name,
+                "part_numbers": [],
+                "source": row.source_name,
+                "source_version": row.source_version,
+                "confidence": row.confidence,
+                "official_profile": None,
+            },
+        )
+        if row.company_name and not profile.get("company_name"):
+            profile["company_name"] = row.company_name
+        if row.part_number and row.part_number not in profile["part_numbers"]:
+            profile["part_numbers"].append(row.part_number)
+    for row in evidence:
+        if row.claim_type != "cage_profile" or not row.claim_value:
+            continue
+        profile = by_cage.setdefault(
+            row.claim_value,
+            {
+                "cage": row.claim_value,
+                "company_name": None,
+                "part_numbers": [],
+                "source": row.source_name,
+                "source_version": row.source_version,
+                "confidence": row.confidence,
+                "official_profile": None,
+            },
+        )
+        payload = row.raw_payload or {}
+        profile["official_profile"] = {
+            "company": payload.get("COMPANY"),
+            "status": payload.get("CAGE_STATUS"),
+            "type": payload.get("TYPE"),
+            "city": payload.get("CITY"),
+            "state": payload.get("STATE_PROVINCE"),
+            "country": payload.get("COUNTRY"),
+            "zip": payload.get("ZIP_POSTAL_ZONE"),
+            "cao": payload.get("CAO"),
+            "source": row.source_name,
+        }
+        profile["company_name"] = profile.get("company_name") or payload.get("COMPANY")
+    return sorted(by_cage.values(), key=lambda item: item.get("cage") or "")
 
 
 def _identity_payload(master: NsnMaster | None, target: NormalizedNsn) -> dict[str, Any]:

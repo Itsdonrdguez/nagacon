@@ -9,6 +9,7 @@ node_modules/
 dist/
 
 backend/exports/
+backend/audit_reports/
 backend/publog_work/
 backend/pytest-cache-files-*/
 backend/tests/_tmp/

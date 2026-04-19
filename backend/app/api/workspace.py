@@ -72,6 +72,22 @@ def _artifact_needs_document_refresh(compliance_json: dict, files: list[Opportun
     return False
 
 
+def _query_count(query) -> int:
+    if hasattr(query, "count"):
+        return int(query.count())
+    if hasattr(query, "all"):
+        return len(query.all() or [])
+    first = query.first() if hasattr(query, "first") else None
+    return 1 if first else 0
+
+
+def _safe_session_call(db: Session, method_name: str, *args):
+    method = getattr(db, method_name, None)
+    if callable(method):
+        return method(*args)
+    return None
+
+
 def _get_opp_or_404(db: Session, opp_id: int, organization_id: int | None = None) -> Opportunity:
     opp = db.query(Opportunity).filter(Opportunity.id == opp_id)
     if organization_id is not None:
@@ -139,7 +155,7 @@ def _create_agent_run_safe(db: Session, opp_id: int, agent_key: str, extra_input
         return repo, run
     except Exception:
         if hasattr(db, "rollback"):
-            db.rollback()
+            _safe_session_call(db, "rollback")
         return None, None
 
 
@@ -159,7 +175,7 @@ def _update_agent_run_safe(db: Session, repo: AgentRunRepository | None, run_id:
         )
     except Exception:
         if hasattr(db, "rollback"):
-            db.rollback()
+            _safe_session_call(db, "rollback")
 
 
 @router.get("/summary")
@@ -170,8 +186,8 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     intake_pipeline = None
     if str((getattr(opp, "raw_payload", None) or {}).get("_intake_pipeline_ran") or "").lower() != "true":
         try:
-            existing_artifacts = db.query(WorkspaceArtifact).filter(WorkspaceArtifact.opportunity_id == opp_id).count()
-            existing_leads = db.query(VendorLead).filter(VendorLead.opportunity_id == opp_id).count()
+            existing_artifacts = _query_count(db.query(WorkspaceArtifact).filter(WorkspaceArtifact.opportunity_id == opp_id))
+            existing_leads = _query_count(db.query(VendorLead).filter(VendorLead.opportunity_id == opp_id))
             if existing_artifacts == 0 and existing_leads == 0:
                 intake_pipeline = run_opportunity_intake_pipeline(
                     db,
@@ -180,19 +196,19 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
                     download_documents=False,
                     run_usaspending=False,
                 )
-                db.refresh(opp)
+                _safe_session_call(db, "refresh", opp)
         except Exception as exc:
-            db.rollback()
+            _safe_session_call(db, "rollback")
             intake_pipeline = {"status": "failed", "error": str(exc)}
         finally:
             try:
                 raw_payload = dict(getattr(opp, "raw_payload", None) or {})
                 raw_payload["_intake_pipeline_ran"] = True
                 opp.raw_payload = raw_payload
-                db.add(opp)
-                db.commit()
+                _safe_session_call(db, "add", opp)
+                _safe_session_call(db, "commit")
             except Exception:
-                db.rollback()
+                _safe_session_call(db, "rollback")
 
     try:
         analysis = db.query(OpportunityAnalysis).filter(OpportunityAnalysis.opportunity_id == opp_id).first()
@@ -307,7 +323,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             ):
                 needs_document_refresh = True
         except Exception:
-            db.rollback()
+            _safe_session_call(db, "rollback")
     if needs_document_refresh:
         try:
             from app.services.document_pipeline import refresh_workspace_document_outputs
@@ -317,7 +333,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             compliance_artifact = next((artifact for artifact in artifacts if artifact.artifact_type == "COMPLIANCE_BRIEF"), None)
             compliance_json = dict(getattr(compliance_artifact, "content_json", None) or {})
         except Exception:
-            db.rollback()
+            _safe_session_call(db, "rollback")
     tasks_query = db.query(WorkspaceTask).filter(WorkspaceTask.opportunity_id == opp_id)
     if org_id is not None:
         tasks_query = tasks_query.filter(WorkspaceTask.organization_id == org_id)
@@ -325,7 +341,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     try:
         agent_runs = AgentRunRepository(db).list_by_opportunity_id(opp_id)
     except Exception:
-        db.rollback()
+        _safe_session_call(db, "rollback")
         agent_runs = []
     submission = get_submission(db, opp_id)
 
@@ -334,7 +350,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
         try:
             parsed = ensure_parsed(db, opp)
         except Exception:
-            db.rollback()
+            _safe_session_call(db, "rollback")
             parsed = getattr(opp, "parsed_json", None) or {}
     parsed_summary = {
         "nsn": document_data.get("fields", {}).get("nsn") or parsed.get("nsn"),
@@ -350,13 +366,17 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     }
     normalized_facts = build_normalized_facts(opp, parsed, document_data, compliance_json)
     research_profile = build_research_profile(opp, parsed)
-    recommendation = build_workspace_recommendation(
-        db,
-        opp,
-        parsed=parsed,
-        files=files,
-        submission=submission,
-    )
+    try:
+        recommendation = build_workspace_recommendation(
+            db,
+            opp,
+            parsed=parsed,
+            files=files,
+            submission=submission,
+        )
+    except Exception:
+        _safe_session_call(db, "rollback")
+        recommendation = {}
     opportunity_payload["solicitation_number"] = document_data.get("fields", {}).get("solicitation_number") or opportunity_payload["solicitation_number"]
     opportunity_payload["due_at"] = document_data.get("fields", {}).get("return_by") or opportunity_payload["due_at"]
     opportunity_payload["summary"] = (

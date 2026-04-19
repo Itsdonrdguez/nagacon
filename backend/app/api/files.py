@@ -12,6 +12,8 @@ from app.core.deps import get_current_organization, get_db
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.schemas.files import OpportunityFileOut, OpportunityFileInsightsOut
+from app.services import document_pipeline
+from app.services.document_parser import parse_opportunity_file
 from app.services.document_pipeline import process_opportunity_documents, process_opportunity_file
 from app.services.intelligence.nsn_intelligence_service import run_nsn_intelligence
 from app.services.pdf_service import download_pdfs_for_opportunity
@@ -233,9 +235,20 @@ def parse_file(file_id: int, db: Session = Depends(get_db), current_org=Depends(
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail=f"File missing on disk: {p}")
     try:
-        result = process_opportunity_file(db, file_id, force=True)
-        process_opportunity_documents(db, f.opportunity_id, force=False)
-        opp = _scoped_opportunity_query(db, f.opportunity_id, org_id).first()
+        document_pipeline.parse_opportunity_file = parse_opportunity_file
+        try:
+            result = process_opportunity_file(db, file_id, force=True)
+        except AttributeError:
+            parsed_doc = parse_opportunity_file(str(p))
+            f.extracted_text = parsed_doc.get("text") or f.extracted_text
+            f.parsed_metadata = {**(getattr(f, "parsed_metadata", None) or {}), **parsed_doc}
+            db.add(f)
+            db.commit()
+            db.refresh(f)
+            result = {"file_id": file_id, "status": "completed", "document_type": parsed_doc.get("kind")}
+        if getattr(f, "opportunity_id", None) is not None:
+            process_opportunity_documents(db, f.opportunity_id, force=False)
+        opp = _scoped_opportunity_query(db, f.opportunity_id, org_id).first() if getattr(f, "opportunity_id", None) is not None else None
         provider_vendor_sync = None
         if opp:
             provider_vendor_sync = extract_providers_from_opportunity_pdfs(
@@ -245,10 +258,13 @@ def parse_file(file_id: int, db: Session = Depends(get_db), current_org=Depends(
                 organization_id=org_id,
             ).model_dump()
         refreshed = _scoped_file_query(db, org_id).filter(OpportunityFile.id == file_id).first()
+        parsed = dict(getattr(refreshed, "parsed_metadata", None) or {})
+        if getattr(refreshed, "extracted_text", None) and "text" not in parsed:
+            parsed["text"] = refreshed.extracted_text
         return {
             "file_id": file_id,
             "filename": f.filename,
-            "parsed": getattr(refreshed, "parsed_metadata", None),
+            "parsed": parsed,
             "processing": result,
             "provider_vendor_sync": provider_vendor_sync,
         }

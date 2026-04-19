@@ -154,6 +154,8 @@ class OpportunityRepository:
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
             elif due_window == "intelligence":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
+            elif due_window == "award_followup":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at <= now - timedelta(days=90))
 
         return query
 
@@ -194,6 +196,7 @@ class OpportunityRepository:
                 {"value": "7d", "label": "Closing Soon"},
                 {"value": "30d", "label": "Due in 30 Days"},
                 {"value": "closed", "label": "Closed / Intelligence"},
+                {"value": "award_followup", "label": "Award Follow-Up Due"},
                 {"value": "all", "label": "All Records"},
             ],
         }

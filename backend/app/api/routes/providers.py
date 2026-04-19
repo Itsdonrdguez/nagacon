@@ -22,6 +22,7 @@ from app.services.providers.pdf_cage_extractor import (
     extract_providers_from_opportunity_pdfs,
 )
 from app.services.providers.contact_discovery import discover_provider_contacts
+from app.services.providers.identity_resolver import resolve_provider_identities
 
 router = APIRouter(prefix="/api/providers", tags=["providers"])
 
@@ -145,6 +146,19 @@ def discover_contacts(
     current_org=Depends(get_current_organization),
 ):
     return discover_provider_contacts(
+        db,
+        organization_id=getattr(current_org, "id", None),
+        limit=limit,
+    )
+
+
+@router.post("/resolve-identities")
+def resolve_identities(
+    limit: int = 250,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    return resolve_provider_identities(
         db,
         organization_id=getattr(current_org, "id", None),
         limit=limit,

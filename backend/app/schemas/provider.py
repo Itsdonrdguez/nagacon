@@ -40,6 +40,10 @@ class ProviderBase(BaseModel):
     phone: Optional[str] = None
     notes: Optional[str] = None
     status: str = "active"
+    canonical_name: Optional[str] = None
+    identity_source: Optional[str] = None
+    identity_confidence: Optional[float] = None
+    aliases: list[str] = Field(default_factory=list)
 
 
 class ProviderCreate(ProviderBase):
@@ -63,7 +67,7 @@ class ProviderOut(ProviderBase):
     organization_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
-    items: list[ProviderItemOut] = []
+    items: list[ProviderItemOut] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -80,6 +84,10 @@ class ProviderRowOut(BaseModel):
     phone: Optional[str] = None
     provider_notes: Optional[str] = None
     status: str
+    canonical_name: Optional[str] = None
+    identity_source: Optional[str] = None
+    identity_confidence: Optional[float] = None
+    aliases: list[str] = Field(default_factory=list)
     nsn: Optional[str] = None
     fsc: Optional[str] = None
     nomenclature: Optional[str] = None
@@ -99,7 +107,7 @@ class ProviderImportResult(BaseModel):
     inserted: int = 0
     updated: int = 0
     skipped: int = 0
-    errors: list[str] = []
+    errors: list[str] = Field(default_factory=list)
 
 
 class ProviderPdfExtractResult(ProviderImportResult):

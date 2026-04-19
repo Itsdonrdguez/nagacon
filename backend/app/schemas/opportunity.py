@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field, computed_field
@@ -126,6 +126,35 @@ class OpportunityRead(OpportunityBase):
     @property
     def primary_action_label(self) -> str:
         return "Analyze Intelligence" if self.solicitation_status == "CLOSED" else "Work Opportunity"
+
+    @computed_field
+    @property
+    def days_since_close(self) -> int | None:
+        if not self.due_at or self.solicitation_status != "CLOSED":
+            return None
+        return max((datetime.utcnow() - self.due_at).days, 0)
+
+    @computed_field
+    @property
+    def award_expected_after(self) -> datetime | None:
+        if not self.due_at:
+            return None
+        return self.due_at + timedelta(days=90)
+
+    @computed_field
+    @property
+    def award_intelligence_status(self) -> str:
+        if self.solicitation_status != "CLOSED":
+            return "ACTIVE_RFQ"
+        days = self.days_since_close or 0
+        if days < 90:
+            return "AWAITING_USASPENDING"
+        return "READY_FOR_USASPENDING_CHECK"
+
+    @computed_field
+    @property
+    def award_follow_up_eligible(self) -> bool:
+        return self.award_intelligence_status == "READY_FOR_USASPENDING_CHECK"
 
     model_config = {"from_attributes": True}
 

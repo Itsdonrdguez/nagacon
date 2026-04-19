@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_organization, get_db
 from app.repositories.opportunities import OpportunityRepository
 from app.schemas.opportunity import IngestResult, OpportunityCreate, OpportunityRead, OpportunityUpdate, RawOpportunity
+from app.services.search_jobs import start_search_job
 from app.services.opportunities.ingest import ingest_raw_opportunities
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
@@ -77,6 +78,27 @@ def search_opportunities(
 @router.get("/filters")
 def opportunity_filter_options(db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     return _opportunity_repo(db, getattr(current_org, "id", None)).filter_options()
+
+
+@router.post("/{opportunity_id}/awardee-enrichment-job")
+def start_awardee_enrichment_job(
+    opportunity_id: int,
+    force: bool = False,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    org_id = getattr(current_org, "id", None)
+    opp = _opportunity_repo(db, org_id).get(opportunity_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    return start_search_job(
+        "awardee_enrichment",
+        {
+            "opportunity_id": opportunity_id,
+            "organization_id": org_id,
+            "force": force,
+        },
+    )
 
 
 @router.get("/{opportunity_id}", response_model=OpportunityRead)

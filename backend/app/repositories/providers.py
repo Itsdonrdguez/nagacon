@@ -13,6 +13,7 @@ from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
 from app.schemas.provider import ProviderCreate, ProviderImportResult, ProviderItemCreate, ProviderUpdate
 from app.services.org_service import ensure_default_organization
+from app.services.providers.identity_resolver import resolve_provider_identity
 
 
 def _clean(value: Any, max_len: int | None = None) -> str | None:
@@ -188,6 +189,9 @@ class ProviderRepository:
             self._add_item(provider, payload.item)
             self.db.commit()
         self.db.refresh(provider)
+        resolve_provider_identity(self.db, provider)
+        self.db.commit()
+        self.db.refresh(provider)
         return provider
 
     def update(self, provider_id: int, payload: ProviderUpdate) -> Provider | None:
@@ -255,6 +259,10 @@ class ProviderRepository:
             "provider_id": provider.id,
             "provider_item_id": item.id if item else None,
             "company_name": provider.company_name,
+            "canonical_name": provider.canonical_name,
+            "identity_source": provider.identity_source,
+            "identity_confidence": provider.identity_confidence,
+            "aliases": provider.aliases,
             "cage": provider.cage,
             "uei": provider.uei,
             "website": provider.website,

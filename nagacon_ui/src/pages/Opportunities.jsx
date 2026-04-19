@@ -37,6 +37,18 @@ const formatDueDate = (dueAt) => {
   return `${formatted} (${daysLeft}d)`
 }
 
+const formatAwardDate = (value) => {
+  if (!value) return null
+  return new Date(value).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+const awardStatusLabel = (status) => {
+  if (status === 'READY_FOR_USASPENDING_CHECK') return 'Award follow-up due'
+  if (status === 'AWAITING_USASPENDING') return 'Awaiting USAspending'
+  if (status === 'USASPENDING_CONFIRMED') return 'Award evidence found'
+  return 'Active RFQ'
+}
+
 export default function Opportunities() {
   const queryClient = useQueryClient()
   const [sortBy, setSortBy] = useState('due_at')
@@ -47,6 +59,7 @@ export default function Opportunities() {
   const [submittedNsn, setSubmittedNsn] = useState('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
+  const [awardJobId, setAwardJobId] = useState(null)
   const { filters, updateFilter } = useFilters(DEFAULT_FILTERS)
   const filterOptionsQuery = useQuery({
     queryKey: ['opportunity-filter-options'],
@@ -88,6 +101,32 @@ export default function Opportunities() {
     },
   })
 
+  const awardEnrichmentMutation = useMutation({
+    mutationFn: async ({ opportunityId, force = false }) => {
+      const res = await api.post(`/api/opportunities/${opportunityId}/awardee-enrichment-job`, null, {
+        params: { force },
+      })
+      return res.data
+    },
+    onSuccess: (job) => {
+      setAwardJobId(job.id)
+      queryClient.invalidateQueries({ queryKey: ['opportunities-search'] })
+    },
+  })
+
+  const awardJobQuery = useQuery({
+    queryKey: ['awardee-enrichment-job', awardJobId],
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${awardJobId}`)
+      return res.data
+    },
+    enabled: Boolean(awardJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+  })
+
   const data = opportunitiesQuery.data?.items || []
   const total = opportunitiesQuery.data?.total || 0
   const totalPages = Math.max(Math.ceil(total / pageSize), 1)
@@ -118,6 +157,16 @@ export default function Opportunities() {
   const sourceOptions = filterOptionsQuery.data?.sources?.length ? filterOptionsQuery.data.sources : ['SAM', 'DIBBS']
   const setAsideCategories = filterOptionsQuery.data?.set_aside_categories || []
   const exactSetAsideTypes = filterOptionsQuery.data?.set_asides || []
+  const statusOptions = filterOptionsQuery.data?.status_filters?.length
+    ? filterOptionsQuery.data.status_filters
+    : [
+        { value: 'open', label: 'Active' },
+        { value: '7d', label: 'Closing Soon' },
+        { value: '30d', label: 'Due in 30 Days' },
+        { value: 'closed', label: 'Closed / Intelligence' },
+        { value: 'award_followup', label: 'Award Follow-Up Due' },
+        { value: 'all', label: 'All Records' },
+      ]
 
   const toggleSort = (field) => {
     if (sortBy === field) {
@@ -151,7 +200,7 @@ export default function Opportunities() {
   const activeFilterSummary = [
     filters.source !== 'all' ? `Source: ${filters.source}` : null,
     filters.setAside !== 'all' ? `Set-Aside: ${filters.setAside === 'none' ? 'No Set-Aside' : filters.setAside}` : null,
-    filters.dueWindow !== 'all' ? `Status: ${filters.dueWindow === 'open' ? 'Active' : filters.dueWindow === 'closed' ? 'Closed / Intelligence' : `Within ${filters.dueWindow}`}` : null,
+    filters.dueWindow !== 'all' ? `Status: ${statusOptions.find((item) => item.value === filters.dueWindow)?.label || filters.dueWindow}` : null,
     submittedSearch ? `Search: "${submittedSearch}"` : null,
     submittedNsn ? `NSN: ${submittedNsn}` : null,
   ].filter(Boolean)
@@ -235,11 +284,9 @@ export default function Opportunities() {
             <div className="filter-select">
               <label className="input-label">Status</label>
               <select value={filters.dueWindow} onChange={(event) => updateFilter('dueWindow', event.target.value)}>
-                <option value="open">Active</option>
-                <option value="7d">Closing Soon</option>
-                <option value="30d">Due in 30 Days</option>
-                <option value="closed">Closed / Intelligence</option>
-                <option value="all">All Records</option>
+                {statusOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
               </select>
             </div>
             <div className="form-action">
@@ -263,8 +310,30 @@ export default function Opportunities() {
           </div>
         </div>
         <div className="panel-subtitle">
-          Dataset view: {filters.source === 'all' ? 'all sources' : filters.source} | {filters.dueWindow === 'all' ? 'all records' : filters.dueWindow === 'open' ? 'active bid records' : filters.dueWindow === 'closed' ? 'closed intelligence records' : `due in ${filters.dueWindow}`}
+          Dataset view: {filters.source === 'all' ? 'all sources' : filters.source} | {filters.dueWindow === 'all' ? 'all records' : statusOptions.find((item) => item.value === filters.dueWindow)?.label || filters.dueWindow}
         </div>
+        {awardJobId ? (
+          <div className="search-progress-box">
+            <div className="search-progress-header">
+              <div>
+                <div className="row-title">Awardee enrichment</div>
+                <div className="row-subtitle">
+                  {awardJobQuery.data?.progress?.current_label || awardJobQuery.data?.status || 'Queued'}
+                </div>
+              </div>
+              <strong>{awardJobQuery.data?.progress?.percent || 0}%</strong>
+            </div>
+            <div className="search-progress-track">
+              <div className="search-progress-fill" style={{ width: `${awardJobQuery.data?.progress?.percent || 0}%` }} />
+            </div>
+            {awardJobQuery.data?.status === 'failed' ? (
+              <div className="row-subtitle text-danger">{awardJobQuery.data?.error || 'Awardee enrichment failed.'}</div>
+            ) : null}
+            {awardJobQuery.data?.status === 'success' ? (
+              <div className="row-subtitle">Awardees promoted: {awardJobQuery.data?.result?.promoted_awardees?.promoted || 0}</div>
+            ) : null}
+          </div>
+        ) : null}
         <div className="results-toolbar">
           <div className="badge-stack">
             {activeFilterSummary.length === 0 ? (
@@ -308,6 +377,7 @@ export default function Opportunities() {
                     <div className="row-subtitle">
                       {opp.solicitation_number || 'Solicitation unavailable'}
                       {opp.workflow_label ? ` | ${opp.workflow_label}` : ''}
+                      {opp.award_intelligence_status ? ` | ${awardStatusLabel(opp.award_intelligence_status)}` : ''}
                     </div>
                   </TableCell>
                   <TableCell>
@@ -327,6 +397,12 @@ export default function Opportunities() {
                   <TableCell>{opp.naics_code || opp.fsc_code || '-'}</TableCell>
                   <TableCell className="due-date-cell">
                     <span className={opp.due_at ? 'due-date' : ''}>{formatDueDate(opp.due_at)}</span>
+                    {opp.solicitation_status === 'CLOSED' ? (
+                      <div className="row-subtitle">
+                        {opp.days_since_close ?? 0}d closed
+                        {opp.award_expected_after ? ` | Check after ${formatAwardDate(opp.award_expected_after)}` : ''}
+                      </div>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     <div className="table-action-stack">
@@ -340,6 +416,16 @@ export default function Opportunities() {
                       >
                         {opp.bid_eligible === false ? 'Research Only' : 'Create Workspace'}
                       </Button>
+                      {opp.solicitation_status === 'CLOSED' ? (
+                        <Button
+                          size="sm"
+                          variant={opp.award_follow_up_eligible ? 'primary' : 'secondary'}
+                          loading={awardEnrichmentMutation.isPending}
+                          onClick={() => awardEnrichmentMutation.mutate({ opportunityId: opp.id, force: opp.award_follow_up_eligible })}
+                        >
+                          {opp.award_follow_up_eligible ? 'Run Award Follow-Up' : 'Refresh Award Leads'}
+                        </Button>
+                      ) : null}
                     </div>
                     {opp.bid_eligible === false ? (
                       <div className="row-subtitle">Use for pricing, sourcing, and future RFQs.</div>

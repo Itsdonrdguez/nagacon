@@ -9,6 +9,7 @@ from app.api.scrapers import run_multi_source_search
 from app.core.db import SessionLocal
 from app.models.search_job import SearchJob
 from app.repositories.company import CompanyRepository
+from app.services.awardee_enrichment import enrich_awardees_for_opportunity
 from app.services.company_profile_ingest import run_company_profile_ingest
 from app.services.dibbs.pdf_bulk_export import export_dibbs_pdfs_for_fscs
 from app.services.nsn_catalog.build import build_nsn_intelligence
@@ -205,6 +206,17 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 run_usaspending=bool(payload.get("run_usaspending", True)),
                 limit=int(payload.get("limit") or 50),
                 organization_id=payload.get("organization_id"),
+                progress_callback=lambda event: _append_progress(job_id, event),
+            )
+        elif kind == "awardee_enrichment":
+            opportunity_id = int(payload.get("opportunity_id") or payload.get("opp_id") or 0)
+            if not opportunity_id:
+                raise ValueError("opportunity_id is required for awardee_enrichment jobs")
+            result = enrich_awardees_for_opportunity(
+                db,
+                opportunity_id,
+                organization_id=payload.get("organization_id"),
+                force=bool(payload.get("force", False)),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         else:

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+from app.repositories.providers import ProviderRepository
 from app.services.awardee_enrichment import award_followup_status
 from app.services.providers.identity_resolver import resolve_provider_identity
 
@@ -56,3 +57,27 @@ def test_resolve_provider_identity_uses_official_cage_profile():
     assert result["identity_confidence"] == 95.0
     assert provider.company_name == "Acme Defense Inc."
     assert "CAGE 1ABC2" in result["aliases"]
+
+
+def test_provider_row_dict_returns_empty_alias_list_for_existing_rows():
+    provider = SimpleNamespace(
+        id=7,
+        company_name="Acme Defense",
+        canonical_name=None,
+        identity_source=None,
+        identity_confidence=None,
+        aliases=None,
+        cage="1ABC2",
+        uei=None,
+        website=None,
+        contact_name=None,
+        email=None,
+        phone=None,
+        notes=None,
+        status="active",
+        updated_at=datetime(2026, 4, 19),
+    )
+
+    row = ProviderRepository(object())._row_dict(provider, None)
+
+    assert row["aliases"] == []

@@ -262,7 +262,7 @@ class ProviderRepository:
             "canonical_name": provider.canonical_name,
             "identity_source": provider.identity_source,
             "identity_confidence": provider.identity_confidence,
-            "aliases": provider.aliases,
+            "aliases": provider.aliases or [],
             "cage": provider.cage,
             "uei": provider.uei,
             "website": provider.website,

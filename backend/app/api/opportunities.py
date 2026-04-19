@@ -74,6 +74,11 @@ def search_opportunities(
     }
 
 
+@router.get("/filters")
+def opportunity_filter_options(db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+    return _opportunity_repo(db, getattr(current_org, "id", None)).filter_options()
+
+
 @router.get("/{opportunity_id}", response_model=OpportunityRead)
 def get_opportunity(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     opp = _opportunity_repo(db, getattr(current_org, "id", None)).get(opportunity_id)

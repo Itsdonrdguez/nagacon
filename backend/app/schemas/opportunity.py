@@ -103,6 +103,30 @@ class OpportunityRead(OpportunityBase):
     def solicitation_status(self) -> str:
         return derive_solicitation_status(self.due_at)
 
+    @computed_field
+    @property
+    def bid_eligible(self) -> bool:
+        return self.solicitation_status != "CLOSED"
+
+    @computed_field
+    @property
+    def intelligence_eligible(self) -> bool:
+        return True
+
+    @computed_field
+    @property
+    def workflow_label(self) -> str:
+        if self.solicitation_status == "CLOSED":
+            return "Closed / Intelligence"
+        if self.solicitation_status == "DUE_SOON":
+            return "Closing Soon"
+        return "Active"
+
+    @computed_field
+    @property
+    def primary_action_label(self) -> str:
+        return "Analyze Intelligence" if self.solicitation_status == "CLOSED" else "Work Opportunity"
+
     model_config = {"from_attributes": True}
 
 

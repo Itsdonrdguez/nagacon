@@ -22,7 +22,7 @@ import { setAsideBadgeVariant, setAsideBadgeLabel } from '../utils/badges'
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
 
-const DEFAULT_FILTERS = { source: 'all', setAside: 'all', dueWindow: 'all' }
+const DEFAULT_FILTERS = { source: 'all', setAside: 'all', dueWindow: 'open' }
 
 const formatDueDate = (dueAt) => {
   if (!dueAt) return '-'
@@ -48,6 +48,14 @@ export default function Opportunities() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
   const { filters, updateFilter } = useFilters(DEFAULT_FILTERS)
+  const filterOptionsQuery = useQuery({
+    queryKey: ['opportunity-filter-options'],
+    queryFn: async () => {
+      const res = await api.get('/api/opportunities/filters')
+      return res.data
+    },
+    staleTime: 5 * 60 * 1000,
+  })
 
   const opportunitiesQuery = useQuery({
     queryKey: ['opportunities-search', submittedSearch, submittedNsn, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, page, pageSize],
@@ -107,9 +115,9 @@ export default function Opportunities() {
     })
   }, [data, sortBy, sortOrder])
 
-  const setAsideTypes = useMemo(() => {
-    return Array.from(new Set(data.map((opp) => opp.set_aside_type).filter(Boolean))).sort()
-  }, [data])
+  const sourceOptions = filterOptionsQuery.data?.sources?.length ? filterOptionsQuery.data.sources : ['SAM', 'DIBBS']
+  const setAsideCategories = filterOptionsQuery.data?.set_aside_categories || []
+  const exactSetAsideTypes = filterOptionsQuery.data?.set_asides || []
 
   const toggleSort = (field) => {
     if (sortBy === field) {
@@ -143,7 +151,7 @@ export default function Opportunities() {
   const activeFilterSummary = [
     filters.source !== 'all' ? `Source: ${filters.source}` : null,
     filters.setAside !== 'all' ? `Set-Aside: ${filters.setAside === 'none' ? 'No Set-Aside' : filters.setAside}` : null,
-    filters.dueWindow !== 'all' ? `Due: ${filters.dueWindow === 'open' ? 'Still Open' : filters.dueWindow === 'closed' ? 'Closed' : `Within ${filters.dueWindow}`}` : null,
+    filters.dueWindow !== 'all' ? `Status: ${filters.dueWindow === 'open' ? 'Active' : filters.dueWindow === 'closed' ? 'Closed / Intelligence' : `Within ${filters.dueWindow}`}` : null,
     submittedSearch ? `Search: "${submittedSearch}"` : null,
     submittedNsn ? `NSN: ${submittedNsn}` : null,
   ].filter(Boolean)
@@ -179,7 +187,7 @@ export default function Opportunities() {
         <div>
           <div className="page-kicker">Market Feed</div>
           <h1 className="page-title">Opportunities</h1>
-          <div className="page-subtitle">Browse, filter, and open solicitation workspaces with a cleaner pipeline-first view.</div>
+          <div className="page-subtitle">Active solicitations stay bid-focused. Closed solicitations stay searchable for sourcing, pricing, and NSN intelligence.</div>
         </div>
       </div>
 
@@ -206,28 +214,32 @@ export default function Opportunities() {
               <label className="input-label">Source</label>
               <select value={filters.source} onChange={(event) => updateFilter('source', event.target.value)}>
                 <option value="all">All Sources</option>
-                <option value="SAM">SAM</option>
-                <option value="DIBBS">DIBBS</option>
+                {sourceOptions.map((source) => (
+                  <option key={source} value={source}>{source}</option>
+                ))}
               </select>
             </div>
             <div className="filter-select">
               <label className="input-label">Set-Aside</label>
               <select value={filters.setAside} onChange={(event) => updateFilter('setAside', event.target.value)}>
                 <option value="all">All Set-Asides</option>
-                <option value="none">No Set-Aside</option>
-                {setAsideTypes.map((type) => (
-                  <option key={type} value={type}>{type}</option>
+                {setAsideCategories.map((type) => (
+                  <option key={type.value} value={type.value}>{type.label}</option>
+                ))}
+                {exactSetAsideTypes.length ? <option disabled>Exact labels</option> : null}
+                {exactSetAsideTypes.map((type) => (
+                  <option key={`exact-${type}`} value={type}>{type}</option>
                 ))}
               </select>
             </div>
             <div className="filter-select">
-              <label className="input-label">Due Date</label>
+              <label className="input-label">Status</label>
               <select value={filters.dueWindow} onChange={(event) => updateFilter('dueWindow', event.target.value)}>
-                <option value="all">Any Due Date</option>
-                <option value="7d">Due in 7 Days</option>
+                <option value="open">Active</option>
+                <option value="7d">Closing Soon</option>
                 <option value="30d">Due in 30 Days</option>
-                <option value="open">Still Open</option>
-                <option value="closed">Closed</option>
+                <option value="closed">Closed / Intelligence</option>
+                <option value="all">All Records</option>
               </select>
             </div>
             <div className="form-action">
@@ -251,7 +263,7 @@ export default function Opportunities() {
           </div>
         </div>
         <div className="panel-subtitle">
-          Dataset view: {filters.source === 'all' ? 'all sources' : filters.source} | {filters.dueWindow === 'all' ? 'any due date' : filters.dueWindow === 'open' ? 'still open only' : filters.dueWindow === 'closed' ? 'closed only' : `due in ${filters.dueWindow}`}
+          Dataset view: {filters.source === 'all' ? 'all sources' : filters.source} | {filters.dueWindow === 'all' ? 'all records' : filters.dueWindow === 'open' ? 'active bid records' : filters.dueWindow === 'closed' ? 'closed intelligence records' : `due in ${filters.dueWindow}`}
         </div>
         <div className="results-toolbar">
           <div className="badge-stack">
@@ -293,7 +305,10 @@ export default function Opportunities() {
                 <TableRow key={opp.id}>
                   <TableCell>
                     <div className="row-title">{opp.display_title || opp.title}</div>
-                    <div className="row-subtitle">{opp.solicitation_number || 'Solicitation unavailable'}</div>
+                    <div className="row-subtitle">
+                      {opp.solicitation_number || 'Solicitation unavailable'}
+                      {opp.workflow_label ? ` | ${opp.workflow_label}` : ''}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <Badge label={opp.source} variant={opp.source === 'SAM' ? 'success' : 'info'} />
@@ -303,7 +318,7 @@ export default function Opportunities() {
                     {opp.set_aside_type ? (
                       <Badge label={setAsideBadgeLabel(opp.set_aside_type)} variant={setAsideBadgeVariant(opp.set_aside_type)} />
                     ) : (
-                      <span className="text-muted">Open</span>
+                      <span className="text-muted">Full/Open</span>
                     )}
                   </TableCell>
                   <TableCell>
@@ -320,12 +335,15 @@ export default function Opportunities() {
                         size="sm"
                         variant="secondary"
                         loading={createPipelineMutation.isPending}
-                        disabled={(opp.solicitation_status || '').toUpperCase() === 'CLOSED'}
+                        disabled={opp.bid_eligible === false}
                         onClick={() => createPipelineMutation.mutate(opp.id)}
                       >
-                        {(opp.solicitation_status || '').toUpperCase() === 'CLOSED' ? 'Research Only' : 'Create Workspace'}
+                        {opp.bid_eligible === false ? 'Research Only' : 'Create Workspace'}
                       </Button>
                     </div>
+                    {opp.bid_eligible === false ? (
+                      <div className="row-subtitle">Use for pricing, sourcing, and future RFQs.</div>
+                    ) : null}
                   </TableCell>
                 </TableRow>
               ))}

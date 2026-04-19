@@ -100,10 +100,15 @@ class OpportunityRepository:
         if source:
             query = query.filter(Opportunity.source == source)
 
-        if set_aside_type == "none":
+        set_aside_value = str(set_aside_type or "").strip()
+        if set_aside_value == "none":
             query = query.filter(or_(Opportunity.set_aside.is_(None), Opportunity.set_aside == ""))
-        elif set_aside_type:
-            query = query.filter(Opportunity.set_aside == set_aside_type)
+        elif set_aside_value:
+            tokens = self.SET_ASIDE_FILTERS.get(set_aside_value)
+            if tokens:
+                query = query.filter(or_(*[Opportunity.set_aside.ilike(f"%{token}%") for token in tokens]))
+            else:
+                query = query.filter(Opportunity.set_aside.ilike(f"%{set_aside_value}%"))
 
         if q:
             pattern = f"%{q.strip()}%"
@@ -147,8 +152,51 @@ class OpportunityRepository:
                 query = query.filter(or_(Opportunity.due_at.is_(None), Opportunity.due_at >= now))
             elif due_window == "closed":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
+            elif due_window == "intelligence":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
 
         return query
+
+    def filter_options(self) -> dict:
+        query = self._scoped_query()
+        set_asides = [
+            row[0]
+            for row in query.with_entities(Opportunity.set_aside)
+            .filter(Opportunity.set_aside.is_not(None), Opportunity.set_aside != "")
+            .distinct()
+            .order_by(Opportunity.set_aside.asc())
+            .limit(200)
+            .all()
+        ]
+        sources = [
+            row[0]
+            for row in self._scoped_query()
+            .with_entities(Opportunity.source)
+            .filter(Opportunity.source.is_not(None), Opportunity.source != "")
+            .distinct()
+            .order_by(Opportunity.source.asc())
+            .all()
+        ]
+        return {
+            "sources": sources,
+            "set_asides": set_asides,
+            "set_aside_categories": [
+                {"value": "small_business", "label": "Small Business"},
+                {"value": "8a", "label": "8(a)"},
+                {"value": "sdvosb", "label": "SDVOSB"},
+                {"value": "wosb", "label": "WOSB"},
+                {"value": "hubzone", "label": "HUBZone"},
+                {"value": "veteran", "label": "Veteran-Owned"},
+                {"value": "none", "label": "No Set-Aside"},
+            ],
+            "status_filters": [
+                {"value": "open", "label": "Active"},
+                {"value": "7d", "label": "Closing Soon"},
+                {"value": "30d", "label": "Due in 30 Days"},
+                {"value": "closed", "label": "Closed / Intelligence"},
+                {"value": "all", "label": "All Records"},
+            ],
+        }
 
     def list(
         self,
@@ -303,3 +351,11 @@ class OpportunityRepository:
             self.db.rollback()
             key = opp.source_opportunity_id or opp.solicitation_number or opp.title
             raise DuplicateRecordError(f"Duplicate opportunity detected for {opp.source}/{key}")
+    SET_ASIDE_FILTERS = {
+        "small_business": ["small business", "total small", "sbsa"],
+        "8a": ["8(a)", "8a"],
+        "sdvosb": ["sdvosb", "service-disabled"],
+        "wosb": ["wosb", "women-owned", "woman-owned"],
+        "hubzone": ["hubzone", "hub zone"],
+        "veteran": ["veteran-owned", "vosb"],
+    }

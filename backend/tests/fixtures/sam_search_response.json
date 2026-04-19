@@ -1,0 +1,32 @@
+{
+  "_embedded": {
+    "opportunityList": [
+      {
+        "noticeId": "12345",
+        "solicitationNumber": "W91ABC-26-Q-1001",
+        "title": "Precision Valve Assembly Support",
+        "organizationInfo": [
+          {
+            "name": "Army Contracting Command"
+          }
+        ],
+        "postedDate": "2026-04-01",
+        "responseDeadLine": "2026-04-15",
+        "classificationCode": "4820",
+        "uiLink": "https://sam.gov/opp/12345/view",
+        "description": [
+          {
+            "body": "Supply support for precision valve assembly."
+          }
+        ],
+        "naics": [
+          {
+            "code": [
+              "332911"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

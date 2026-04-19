@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.deps import get_db
 from app.models.opportunity import Opportunity
 from app.services.research.usaspending_research_service import search_usaspending_for_opportunity
+from app.services.provider_settings_service import get_effective_sam_api_key
 from app.research.predecessor_history import find_predecessor_opportunities
 
 router = APIRouter(prefix="/api/health", tags=["health"])
@@ -40,7 +41,7 @@ def health_check(db: Session = Depends(get_db)):
     except Exception as e:
         checks["sample_opportunity"] = f"ERROR: {e}"
 
-    checks["sam_api_key"] = "OK" if bool(getattr(settings, "SAM_API_KEY", None)) else "MISSING"
+    checks["sam_api_key"] = "OK" if bool(get_effective_sam_api_key(db) or getattr(settings, "SAM_API_KEY", None)) else "MISSING"
 
     if opp_id:
         try:

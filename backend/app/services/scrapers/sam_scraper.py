@@ -97,11 +97,17 @@ def _build_query_params(params: dict[str, Any], api_key: str) -> dict[str, Any]:
         "offset": int(params.get("offset") or 0),
     }
 
-    # Official API expects named filters like title / solnum / noticeid, not freeform q.
-    # Preserve q by mapping it to title when title is not already provided.
+    if params.get("ccode"):
+        query_params["ccode"] = params["ccode"]
+    if params.get("ncode"):
+        query_params["ncode"] = params["ncode"]
+    elif params.get("naics") or params.get("naics_code"):
+        query_params["ncode"] = params.get("naics") or params.get("naics_code")
+
+    # Official API expects named filters like title / solnum / noticeid.
     if params.get("title"):
         query_params["title"] = params["title"]
-    elif params.get("q"):
+    elif params.get("q") and not params.get("ccode"):
         query_params["title"] = params["q"]
 
     if params.get("noticeType"):
@@ -125,14 +131,21 @@ def _build_query_params(params: dict[str, Any], api_key: str) -> dict[str, Any]:
     return query_params
 
 
+def _redact_query_params(query_params: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(query_params)
+    if redacted.get("api_key"):
+        redacted["api_key"] = "***"
+    return redacted
+
+
 def fetch_sam_opportunities(params: Optional[Dict] = None) -> List[RawOpportunity]:
-    api_key = getattr(settings, "SAM_API_KEY", None)
+    params = params or {}
+    api_key = params.get("api_key") or getattr(settings, "SAM_API_KEY", None)
     if not api_key:
         logger.warning("SAM_API_KEY not configured; returning empty SAM result set")
         return []
 
     base_url = "https://api.sam.gov/prod/opportunities/v2/search"
-    params = params or {}
     query_params = _build_query_params(params, api_key)
 
     headers = {"Accept": "application/json"}
@@ -150,10 +163,13 @@ def fetch_sam_opportunities(params: Optional[Dict] = None) -> List[RawOpportunit
         except Exception:
             detail = None
         raise SamScraperError(
-            f"SAM request failed: {exc}. params={query_params}. response={detail}"
+            f"SAM request failed with HTTP {getattr(response, 'status_code', 'error')}. "
+            f"params={_redact_query_params(query_params)}. response={detail}"
         ) from exc
     except Exception as exc:
-        raise SamScraperError(f"SAM request failed: {exc}. params={query_params}") from exc
+        raise SamScraperError(
+            f"SAM request failed: {exc.__class__.__name__}. params={_redact_query_params(query_params)}"
+        ) from exc
 
     try:
         data = response.json()

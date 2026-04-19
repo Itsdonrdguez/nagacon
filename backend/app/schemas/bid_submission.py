@@ -12,6 +12,14 @@ class BidSubmissionOut(BaseModel):
     submitted_unit_price: float | None = None
     submitted_vendor_cage: str | None = None
     submitted_vendor_name: str | None = None
+    planned_vendor_quote_id: int | None = None
+    planned_vendor_cage: str | None = None
+    planned_vendor_name: str | None = None
+    awarded_at: datetime | None = None
+    award_amount: float | None = None
+    winning_vendor_cage: str | None = None
+    winning_vendor_name: str | None = None
+    outcome_summary: str | None = None
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -27,4 +35,12 @@ class BidSubmissionUpsert(BaseModel):
     submitted_unit_price: float | None = None
     submitted_vendor_cage: str | None = None
     submitted_vendor_name: str | None = None
+    planned_vendor_quote_id: int | None = None
+    planned_vendor_cage: str | None = None
+    planned_vendor_name: str | None = None
+    awarded_at: datetime | None = None
+    award_amount: float | None = None
+    winning_vendor_cage: str | None = None
+    winning_vendor_name: str | None = None
+    outcome_summary: str | None = None
     notes: str | None = None

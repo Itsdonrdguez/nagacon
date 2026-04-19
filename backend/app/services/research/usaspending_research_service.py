@@ -9,9 +9,14 @@ from typing import Any
 import requests
 from sqlalchemy.orm import Session
 
+from app.models.nsn_catalog import NsnMaster, NsnReference
 from app.models.opportunity import Opportunity
+from app.models.price_history import PriceHistory
 from app.models.vendor import VendorLead
-from app.services.workspace_service import ensure_parsed
+from app.repositories.providers import ProviderRepository
+from app.schemas.provider import ProviderCreate, ProviderItemCreate
+from app.services.workspace_service import build_research_profile, ensure_parsed
+from app.services.nsn_catalog.normalizer import normalize_nsn
 
 USASPENDING_SEARCH_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
 HTTP_TIMEOUT = 60
@@ -109,6 +114,18 @@ def _extract_nsn(text: str) -> str:
     return ""
 
 
+def _normalize_fsc(value: str | None) -> str:
+    text = _safe(value)
+    if not text:
+        return ""
+    digits = re.sub(r"\D+", "", text)
+    return digits[:4] if len(digits) >= 4 else ""
+
+
+def _fsc_from_nsn(nsn: str | None) -> str:
+    return _normalize_fsc(nsn)
+
+
 def _tokenize_keywords(text: str, limit: int = 12) -> list[str]:
     stop = {
         "the", "and", "for", "with", "this", "that", "from", "into", "shall", "will",
@@ -160,6 +177,8 @@ def _build_exact_item_terms(parsed: dict[str, Any], title: str, fsc: str) -> lis
     terms: list[str] = []
     nomenclature = _preferred_nomenclature(parsed, title)
     terms.extend(_phrase_to_keywords(nomenclature, max_terms=8))
+    if fsc:
+        terms.append(fsc)
 
     for p in parsed.get("part_numbers") or []:
         p = _safe(p)
@@ -209,6 +228,102 @@ def _keyword_variants(title: str, raw_text: str, fsc: str, parsed: dict[str, Any
     return [v for v in variants if v]
 
 
+def _catalog_context_for_nsn(db: Session | None, nsn: str | None) -> dict[str, Any]:
+    target = normalize_nsn(nsn)
+    if db is None or not target:
+        return {
+            "catalog_item_name": "",
+            "catalog_part_numbers": [],
+            "catalog_manufacturers": [],
+            "catalog_cages": [],
+            "catalog_reference_count": 0,
+        }
+    try:
+        master = db.query(NsnMaster).filter(NsnMaster.compact_nsn == target.compact).first()
+        references = (
+            db.query(NsnReference)
+            .filter(NsnReference.compact_nsn == target.compact)
+            .order_by(NsnReference.confidence.desc().nullslast())
+            .limit(100)
+            .all()
+        )
+    except Exception:
+        return {
+            "catalog_item_name": "",
+            "catalog_part_numbers": [],
+            "catalog_manufacturers": [],
+            "catalog_cages": [],
+            "catalog_reference_count": 0,
+        }
+
+    return {
+        "catalog_item_name": _safe(getattr(master, "item_name", "")) if master else "",
+        "catalog_part_numbers": _dedupe_keep_order([_safe(getattr(row, "part_number", "")) for row in references]),
+        "catalog_manufacturers": _dedupe_keep_order([_safe(getattr(row, "company_name", "")) for row in references]),
+        "catalog_cages": _dedupe_keep_order([_safe(getattr(row, "cage", "")) for row in references]),
+        "catalog_reference_count": len(references),
+    }
+
+
+def _expand_context_with_catalog(ctx: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
+    item_name = _safe(catalog.get("catalog_item_name"))
+    part_numbers = _dedupe_keep_order((ctx.get("part_numbers") or []) + (catalog.get("catalog_part_numbers") or []))
+    manufacturers = _dedupe_keep_order((ctx.get("manufacturers") or []) + (catalog.get("catalog_manufacturers") or []))
+    approved_names = _dedupe_keep_order((ctx.get("approved_source_names") or []) + (catalog.get("catalog_manufacturers") or []))
+    approved_cages = _dedupe_keep_order((ctx.get("approved_source_cages") or []) + (catalog.get("catalog_cages") or []))
+
+    if item_name:
+        keywords = _dedupe_keep_order(_phrase_to_keywords(item_name, max_terms=8) + (ctx.get("keywords") or []))
+        variants = [[item_name], _phrase_to_keywords(item_name, max_terms=6)] + (ctx.get("keyword_variants") or [])
+        ctx["nomenclature"] = ctx.get("nomenclature") or item_name
+    else:
+        keywords = ctx.get("keywords") or []
+        variants = ctx.get("keyword_variants") or []
+
+    for part in part_numbers[:12]:
+        if part:
+            variants.insert(0, [part])
+    for manufacturer in manufacturers[:8]:
+        terms = _phrase_to_keywords(manufacturer, max_terms=4)
+        if terms:
+            variants.append(terms)
+
+    nsn_target = normalize_nsn(ctx.get("nsn"))
+    ctx.update(
+        {
+            "keywords": _dedupe_keep_order(keywords)[:30],
+            "keyword_variants": _dedupe_keyword_lists(variants),
+            "part_numbers": part_numbers,
+            "manufacturers": manufacturers,
+            "approved_source_names": approved_names,
+            "approved_source_cages": approved_cages,
+            "catalog_item_name": item_name,
+            "catalog_part_numbers": catalog.get("catalog_part_numbers") or [],
+            "catalog_manufacturers": catalog.get("catalog_manufacturers") or [],
+            "catalog_cages": catalog.get("catalog_cages") or [],
+            "catalog_reference_count": catalog.get("catalog_reference_count") or 0,
+            "nsn_compact": nsn_target.compact if nsn_target else "",
+            "niin": nsn_target.niin if nsn_target else "",
+        }
+    )
+    return ctx
+
+
+def _dedupe_keyword_lists(values: list[list[str]]) -> list[list[str]]:
+    seen: set[str] = set()
+    out: list[list[str]] = []
+    for row in values:
+        clean = _dedupe_keep_order([_safe(x) for x in row if _safe(x)])
+        if not clean:
+            continue
+        key = "|".join(x.lower() for x in clean)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    return out
+
+
 def _opp_context(opp: Opportunity, db: Session | None = None) -> dict[str, Any]:
     title = _safe(getattr(opp, "title", ""))
     agency = _safe(getattr(opp, "agency", ""))
@@ -230,6 +345,7 @@ def _opp_context(opp: Opportunity, db: Session | None = None) -> dict[str, Any]:
         parsed = {}
 
     nsn = _safe(parsed.get("nsn")) or _extract_nsn(raw_text) or _extract_nsn(title) or ""
+    fsc = _normalize_fsc(fsc) or _fsc_from_nsn(nsn)
     nomenclature = _preferred_nomenclature(parsed, title)
     keywords = _build_exact_item_terms(parsed, nomenclature or title, fsc)
     if not keywords:
@@ -238,8 +354,9 @@ def _opp_context(opp: Opportunity, db: Session | None = None) -> dict[str, Any]:
     manufacturers = _dedupe_keep_order([_safe(x) for x in (parsed.get("manufacturers") or [])])
     part_numbers = _dedupe_keep_order([_safe(x) for x in (parsed.get("part_numbers") or []) if _safe(x)])
     approved_sources = parsed.get("approved_sources") or []
+    solicitation_rows = parsed.get("solicitations") or []
 
-    return {
+    ctx = {
         "title": title,
         "agency": agency,
         "agency_variants": _agency_variants(agency),
@@ -253,9 +370,11 @@ def _opp_context(opp: Opportunity, db: Session | None = None) -> dict[str, Any]:
         "manufacturers": manufacturers,
         "part_numbers": part_numbers,
         "approved_sources": approved_sources,
+        "solicitation_rows": solicitation_rows,
         "approved_source_names": _dedupe_keep_order([_safe(x.get("company_name")) for x in approved_sources if _safe(x.get("company_name"))]),
         "approved_source_cages": _dedupe_keep_order([_safe(x.get("cage")) for x in approved_sources if _safe(x.get("cage"))]),
     }
+    return _expand_context_with_catalog(ctx, _catalog_context_for_nsn(db, nsn))
 
 
 def _base_filters(lookback_years: int = 8) -> dict[str, Any]:
@@ -279,10 +398,58 @@ def _query_plan(ctx: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
     base = _base_filters()
     plans: list[dict[str, Any]] = []
 
+    def add_plan(label: str, filters: dict[str, Any]):
+        plans.append({"label": label, "payload": _make_payload(filters, limit)})
+
     if ctx["nsn"]:
         filters = dict(base)
         filters["keywords"] = [ctx["nsn"]]
-        plans.append({"label": f"nsn_only:{ctx['nsn']}", "payload": _make_payload(filters, limit)})
+        add_plan(f"nsn_only:{ctx['nsn']}", filters)
+
+    if ctx.get("nsn_compact"):
+        filters = dict(base)
+        filters["keywords"] = [ctx["nsn_compact"]]
+        add_plan(f"compact_nsn_only:{ctx['nsn_compact']}", filters)
+
+    if ctx.get("niin"):
+        filters = dict(base)
+        filters["keywords"] = [ctx["niin"]]
+        if ctx["fsc_code"]:
+            filters["psc_codes"] = [ctx["fsc_code"]]
+        add_plan(f"niin+psc:{ctx['niin']}" if ctx["fsc_code"] else f"niin_only:{ctx['niin']}", filters)
+
+    for part_number in ctx.get("part_numbers", [])[:8]:
+        filters = dict(base)
+        filters["keywords"] = [part_number]
+        if ctx["fsc_code"]:
+            filters["psc_codes"] = [ctx["fsc_code"]]
+        add_plan(f"part_number+psc:{part_number}" if ctx["fsc_code"] else f"part_number_only:{part_number}", filters)
+
+    if ctx["fsc_code"]:
+        filters = dict(base)
+        filters["psc_codes"] = [ctx["fsc_code"]]
+        if ctx["keywords"]:
+            filters["keywords"] = ctx["keywords"][:4]
+        add_plan(f"psc+keywords:{ctx['fsc_code']}", filters)
+
+        filters = dict(base)
+        filters["psc_codes"] = [ctx["fsc_code"]]
+        filters["award_type_codes"] = ["B", "A"]
+        if ctx["keywords"]:
+            filters["keywords"] = ctx["keywords"][:4]
+        add_plan(f"psc+po_priority:{ctx['fsc_code']}", filters)
+
+    if ctx["naics_code"]:
+        filters = dict(base)
+        filters["naics_codes"] = [ctx["naics_code"]]
+        if ctx["keywords"]:
+            filters["keywords"] = ctx["keywords"][:4]
+        add_plan(f"naics+keywords:{ctx['naics_code']}", filters)
+
+    if ctx["keywords"]:
+        filters = dict(base)
+        filters["keywords"] = ctx["keywords"][:4]
+        add_plan(f"keywords_first:{','.join(ctx['keywords'][:4])}", filters)
 
     for manufacturer in ctx.get("manufacturers", [])[:4]:
         kw = _phrase_to_keywords(manufacturer, max_terms=4)
@@ -290,30 +457,40 @@ def _query_plan(ctx: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
             continue
         filters = dict(base)
         filters["keywords"] = kw + ctx["keywords"][:2]
-        plans.append({"label": f"manufacturer+keywords:{manufacturer}", "payload": _make_payload(filters, limit)})
-
-    for agency_name in ctx["agency_variants"][:3]:
-        for kw in ctx["keyword_variants"][:3]:
-            filters = dict(base)
-            if ctx["naics_code"]:
-                filters["naics_codes"] = [ctx["naics_code"]]
-            filters["agencies"] = [{"type": "awarding", "tier": "toptier", "name": agency_name}]
-            filters["keywords"] = kw
-            plans.append({"label": f"agency+naics+keywords:{agency_name}:{','.join(kw)}", "payload": _make_payload(filters, limit)})
-
-    for agency_name in ctx["agency_variants"][:3]:
-        for kw in ctx["keyword_variants"][:4]:
-            filters = dict(base)
-            filters["agencies"] = [{"type": "awarding", "tier": "toptier", "name": agency_name}]
-            filters["keywords"] = kw
-            plans.append({"label": f"agency+keywords:{agency_name}:{','.join(kw)}", "payload": _make_payload(filters, limit)})
+        if ctx["fsc_code"]:
+            filters["psc_codes"] = [ctx["fsc_code"]]
+        if ctx["naics_code"]:
+            filters["naics_codes"] = [ctx["naics_code"]]
+        add_plan(f"manufacturer+psc+keywords:{manufacturer}" if ctx["fsc_code"] else f"manufacturer+keywords:{manufacturer}", filters)
 
     for kw in ctx["keyword_variants"][:5]:
         filters = dict(base)
         filters["keywords"] = kw
+        if ctx["fsc_code"]:
+            filters["psc_codes"] = [ctx["fsc_code"]]
         if ctx["naics_code"]:
             filters["naics_codes"] = [ctx["naics_code"]]
-        plans.append({"label": f"keywords_only:{','.join(kw)}", "payload": _make_payload(filters, limit)})
+        add_plan(f"psc+keywords_only:{ctx['fsc_code']}:{','.join(kw)}" if ctx["fsc_code"] else f"keywords_only:{','.join(kw)}", filters)
+
+    for agency_name in ctx["agency_variants"][:2]:
+        for kw in ctx["keyword_variants"][:3]:
+            filters = dict(base)
+            if ctx["fsc_code"]:
+                filters["psc_codes"] = [ctx["fsc_code"]]
+            if ctx["naics_code"]:
+                filters["naics_codes"] = [ctx["naics_code"]]
+            filters["agencies"] = [{"type": "awarding", "tier": "toptier", "name": agency_name}]
+            filters["keywords"] = kw
+            add_plan(f"agency+psc+keywords:{agency_name}:{','.join(kw)}" if ctx["fsc_code"] else f"agency+naics+keywords:{agency_name}:{','.join(kw)}", filters)
+
+    for agency_name in ctx["agency_variants"][:2]:
+        for kw in ctx["keyword_variants"][:3]:
+            filters = dict(base)
+            if ctx["fsc_code"]:
+                filters["psc_codes"] = [ctx["fsc_code"]]
+            filters["agencies"] = [{"type": "awarding", "tier": "toptier", "name": agency_name}]
+            filters["keywords"] = kw
+            add_plan(f"agency+psc_fallback:{agency_name}:{','.join(kw)}" if ctx["fsc_code"] else f"agency+keywords:{agency_name}:{','.join(kw)}", filters)
 
     deduped: list[dict[str, Any]] = []
     seen = set()
@@ -327,7 +504,9 @@ def _query_plan(ctx: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
 
 
 def _call_usaspending(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    response = requests.post(USASPENDING_SEARCH_URL, json=payload, timeout=HTTP_TIMEOUT)
+    session = requests.Session()
+    session.trust_env = False
+    response = session.post(USASPENDING_SEARCH_URL, json=payload, timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     data = response.json()
     return data.get("results", []) or []
@@ -375,6 +554,7 @@ def _has_any(text: str, terms: set[str]) -> list[str]:
 def _classification_boosts(row: dict[str, Any], ctx: dict[str, Any]) -> tuple[float, list[str], list[str], bool, bool, bool]:
     description = (row.get("description") or "").lower()
     recipient = (row.get("recipient_name") or "").lower()
+    matched_by = (row.get("matched_by") or "").lower()
     reasons: list[str] = []
     noise: list[str] = []
     score = 0.0
@@ -410,12 +590,36 @@ def _classification_boosts(row: dict[str, Any], ctx: dict[str, Any]) -> tuple[fl
         score += 6.0
         reasons.append("nsn_match")
         nsn_hit = True
+    if ctx.get("nsn_compact") and ctx["nsn_compact"].lower() in description:
+        score += 6.0
+        reasons.append("compact_nsn_match")
+        nsn_hit = True
+    if ctx.get("niin") and ctx["niin"].lower() in description:
+        score += 3.5
+        reasons.append("niin_match")
+        nsn_hit = True
+    if matched_by.startswith("nsn_only:"):
+        score += 4.0
+        reasons.append("exact_nsn_query_match")
+        nsn_hit = True
+    if matched_by.startswith("compact_nsn_only:"):
+        score += 4.0
+        reasons.append("compact_nsn_query_match")
+        nsn_hit = True
+    if matched_by.startswith("niin"):
+        score += 2.5
+        reasons.append("niin_query_match")
+        nsn_hit = True
 
     part_number_hit = False
     for pn in ctx.get("part_numbers", [])[:8]:
         if pn and pn.lower() in description:
             score += 4.0
             reasons.append(f"part_number_match:{pn}")
+            part_number_hit = True
+        if pn and matched_by.endswith(pn.lower()):
+            score += 3.0
+            reasons.append(f"part_number_query_match:{pn}")
             part_number_hit = True
 
     manufacturer_hit = False
@@ -428,6 +632,13 @@ def _classification_boosts(row: dict[str, Any], ctx: dict[str, Any]) -> tuple[fl
             reasons.append(f"manufacturer_match:{m}")
             manufacturer_hit = True
 
+    for m in ctx.get("catalog_manufacturers", [])[:8]:
+        ml = m.lower()
+        if ml and (ml in recipient or ml in description):
+            score += 4.5
+            reasons.append(f"catalog_manufacturer_match:{m}")
+            manufacturer_hit = True
+
     for m in ctx.get("approved_source_names", [])[:10]:
         ml = m.lower()
         if ml and (ml in recipient or ml in description):
@@ -435,6 +646,13 @@ def _classification_boosts(row: dict[str, Any], ctx: dict[str, Any]) -> tuple[fl
             reasons.append(f"approved_source_match:{m}")
             manufacturer_hit = True
             approved_source_hit = True
+
+    if ctx.get("catalog_reference_count"):
+        for pn in ctx.get("catalog_part_numbers", [])[:8]:
+            if pn and (pn.lower() in description or matched_by.endswith(pn.lower())):
+                score += 2.5
+                reasons.append(f"catalog_part_number_evidence:{pn}")
+                part_number_hit = True
 
     if ctx.get("fsc_code") == "6520":
         if "dental" in description or "oral" in description:
@@ -536,6 +754,7 @@ def _rank_vendors(awards: list[dict[str, Any]], ctx: dict[str, Any], strict: boo
             "max_relevance_score": 0.0,
             "seedable_vendor": False,
             "strict_seedable_vendor": False,
+            "evidence": [],
         }
     )
 
@@ -569,7 +788,11 @@ def _rank_vendors(awards: list[dict[str, Any]], ctx: dict[str, Any], strict: boo
                 "match_category": row.get("match_category", ""),
                 "seedable_product_evidence": row.get("seedable_product_evidence", False),
                 "strict_seedable_product_evidence": row.get("strict_seedable_product_evidence", False),
+                "relevance_reasons": row.get("relevance_reasons", []),
             })
+        for reason in row.get("relevance_reasons", [])[:6]:
+            if reason not in g["evidence"]:
+                g["evidence"].append(reason)
 
     ranked: list[dict[str, Any]] = []
     approved_name_set = {x.lower() for x in ctx.get("approved_source_names", [])}
@@ -578,13 +801,14 @@ def _rank_vendors(awards: list[dict[str, Any]], ctx: dict[str, Any], strict: boo
     for _, g in grouped.items():
         score = 0.0
         reasons: list[str] = []
+        agency_list = sorted(g["agencies"])
 
         score += min(4.0, g["award_count"] * 0.75)
         if g["award_count"]:
             reasons.append(f"award_count={g['award_count']}")
 
         if ctx["agency_variants"]:
-            agency_lowers = {a.lower() for a in g["agencies"]}
+            agency_lowers = {a.lower() for a in agency_list}
             if any(av.lower() in agency_lowers for av in ctx["agency_variants"]):
                 score += 2.0
                 reasons.append("same_agency_or_alias")
@@ -616,15 +840,97 @@ def _rank_vendors(awards: list[dict[str, Any]], ctx: dict[str, Any], strict: boo
 
         g["score"] = round(score, 2)
         g["match_reasons"] = reasons
-        g["agencies"] = sorted(g["agencies"])
+        g["why_matched"] = _dedupe_keep_order(
+            reasons + g["evidence"][:6] + [
+                f"sample_awards={len(g['sample_awards'])}",
+                f"agencies={', '.join(agency_list[:2])}" if agency_list else "",
+            ]
+        )[:8]
+        g["agencies"] = agency_list
         ranked.append(g)
 
     ranked.sort(key=lambda x: (-x["score"], -x["max_relevance_score"], -x["award_count"], -x["total_award_amount"], x["vendor"]))
     return ranked[:25]
 
 
-def search_usaspending_for_opportunity(opp: Opportunity, db: Session | None = None, limit: int = 50) -> dict[str, Any]:
-    ctx = _opp_context(opp, db=db)
+def _approved_source_vendor_candidates(ctx: dict[str, Any]) -> list[dict[str, Any]]:
+    vendors: list[dict[str, Any]] = []
+    source_rows = (ctx.get("approved_sources") or [])[:10]
+    solicitation_rows = (ctx.get("solicitation_rows") or [])[:3]
+    for source in source_rows:
+        company_name = _safe(source.get("company_name"))
+        cage = _safe(source.get("cage"))
+        if not company_name:
+            continue
+        why = _dedupe_keep_order(
+            [
+                "approved_source_seed",
+                f"cage={cage}" if cage else "",
+                f"nsn={ctx.get('nsn')}" if ctx.get("nsn") else "",
+                f"fsc_context={ctx.get('fsc_code')}" if ctx.get("fsc_code") else "",
+                f"solicitation={ctx.get('solicitation_number')}" if ctx.get("solicitation_number") else "",
+            ]
+        )
+        sample_awards = []
+        for row in solicitation_rows:
+            sample_awards.append(
+                {
+                    "award_id": row.get("solicitation_number") or row.get("pr_number") or "",
+                    "start_date": row.get("issue_date") or "",
+                    "award_amount": None,
+                    "awarding_agency": ctx.get("agency") or "",
+                    "description": f"Approved source context for {ctx.get('nomenclature') or ctx.get('title') or 'item'}",
+                    "matched_by": "approved_source",
+                    "relevance_score": 10.0,
+                    "match_category": "approved_source",
+                    "seedable_product_evidence": True,
+                    "strict_seedable_product_evidence": True,
+                    "relevance_reasons": ["approved_source_seed"],
+                }
+            )
+        vendors.append(
+            {
+                "vendor": company_name,
+                "cage": cage,
+                "award_count": 0,
+                "total_award_amount": 0.0,
+                "last_award_date": "",
+                "agencies": [ctx.get("agency")] if ctx.get("agency") else [],
+                "sample_awards": sample_awards,
+                "score": 12.0,
+                "match_reasons": ["approved_source_seed", "approved_source_vendor_gate_passed"],
+                "max_relevance_score": 10.0,
+                "seedable_vendor": True,
+                "strict_seedable_vendor": True,
+                "evidence": ["approved_source_seed"],
+                "why_matched": why,
+                "source_type": "DIBBS_APPROVED_SOURCE",
+            }
+        )
+    return vendors
+
+
+def _merge_vendor_lists(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int = 25) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in primary + secondary:
+        vendor_name = _safe(item.get("vendor")).lower()
+        if not vendor_name or vendor_name in seen:
+            continue
+        seen.add(vendor_name)
+        merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _search_usaspending_with_context(
+    ctx: dict[str, Any],
+    *,
+    opportunity_id: int | None,
+    research_profile: dict[str, Any],
+    limit: int = 50,
+) -> dict[str, Any]:
     plans = _query_plan(ctx, limit=limit)
 
     query_runs: list[dict[str, Any]] = []
@@ -632,7 +938,12 @@ def search_usaspending_for_opportunity(opp: Opportunity, db: Session | None = No
 
     for idx, plan in enumerate(plans):
         rows = _call_usaspending(plan["payload"])
-        query_runs.append({"label": plan["label"], "rows": rows, "count": len(rows)})
+        query_runs.append({
+            "label": plan["label"],
+            "rows": rows,
+            "count": len(rows),
+            "payload": plan["payload"],
+        })
         if rows and first_hit_index is None:
             first_hit_index = idx
         if sum(len(run["rows"]) for run in query_runs) >= limit:
@@ -646,10 +957,28 @@ def search_usaspending_for_opportunity(opp: Opportunity, db: Session | None = No
     ranked_seedable = _rank_vendors(buckets["seedable_product_like"], ctx, strict=False)
     ranked_strict = _rank_vendors(buckets["strict_seedable_product_like"], ctx, strict=True)
     ranked_service = _rank_vendors(buckets["service_like"], ctx, strict=False)
+    approved_source_vendors = _approved_source_vendor_candidates(ctx)
+    likely_vendors = _merge_vendor_lists(approved_source_vendors, ranked_strict)
+    seedable_vendors = _merge_vendor_lists(approved_source_vendors, ranked_seedable)
+    product_like_vendors = _merge_vendor_lists(approved_source_vendors, ranked_product)
+    first_nonzero_run = next((run for run in query_runs if run["count"] > 0), None)
+    nsn_direct_hit = any(run["label"].startswith("nsn_only:") and run["count"] > 0 for run in query_runs)
+    history_match_source = "nsn_direct" if nsn_direct_hit else ("fallback" if first_nonzero_run else "none")
+    history_match_label = (
+        "NSN direct match"
+        if history_match_source == "nsn_direct"
+        else "Keyword / fallback match"
+        if history_match_source == "fallback"
+        else "No USAspending history match"
+    )
 
     return {
-        "opportunity_id": opp.id,
+        "opportunity_id": opportunity_id,
+        "research_profile": research_profile,
         "context": ctx,
+        "history_match_source": history_match_source,
+        "history_match_label": history_match_label,
+        "history_match_query_label": first_nonzero_run["label"] if first_nonzero_run else None,
         "awards_found": len(combined),
         "awards": combined[:20],
         "product_like_awards": buckets["product_like"][:20],
@@ -657,13 +986,84 @@ def search_usaspending_for_opportunity(opp: Opportunity, db: Session | None = No
         "strict_seedable_product_like_awards": buckets["strict_seedable_product_like"][:20],
         "service_like_awards": buckets["service_like"][:20],
         "excluded_noise": buckets["excluded_noise"][:20],
-        "likely_vendors": ranked_strict,
-        "product_like_vendors": ranked_product,
-        "seedable_product_like_vendors": ranked_seedable,
+        "approved_source_vendors": approved_source_vendors,
+        "likely_vendors": likely_vendors,
+        "product_like_vendors": product_like_vendors,
+        "seedable_product_like_vendors": seedable_vendors,
         "strict_seedable_product_like_vendors": ranked_strict,
         "service_like_vendors": ranked_service,
-        "query_debug": [{"label": run["label"], "count": run["count"]} for run in query_runs],
+        "query_debug": [
+            {
+                "label": run["label"],
+                "count": run["count"],
+                "filters": run["payload"].get("filters", {}),
+                "limit": run["payload"].get("limit"),
+            }
+            for run in query_runs
+        ],
     }
+
+
+def search_usaspending_for_opportunity(opp: Opportunity, db: Session | None = None, limit: int = 50) -> dict[str, Any]:
+    ctx = _opp_context(opp, db=db)
+    research_profile = build_research_profile(opp, getattr(opp, "parsed_json", None) if isinstance(getattr(opp, "parsed_json", None), dict) else None)
+    return _search_usaspending_with_context(ctx, opportunity_id=opp.id, research_profile=research_profile, limit=limit)
+
+
+def search_usaspending_for_nsn(db: Session, nsn: str, limit: int = 50) -> dict[str, Any]:
+    target = normalize_nsn(nsn)
+    if not target:
+        return {
+            "opportunity_id": None,
+            "research_profile": {},
+            "context": {"nsn": nsn},
+            "history_match_source": "none",
+            "history_match_label": "Invalid NSN",
+            "history_match_query_label": None,
+            "awards_found": 0,
+            "awards": [],
+            "product_like_awards": [],
+            "seedable_product_like_awards": [],
+            "strict_seedable_product_like_awards": [],
+            "service_like_awards": [],
+            "excluded_noise": [],
+            "approved_source_vendors": [],
+            "likely_vendors": [],
+            "product_like_vendors": [],
+            "seedable_product_like_vendors": [],
+            "strict_seedable_product_like_vendors": [],
+            "service_like_vendors": [],
+            "query_debug": [],
+            "error": "NSN must contain exactly 13 digits.",
+        }
+    ctx = {
+        "title": "",
+        "agency": "DLA",
+        "agency_variants": _agency_variants("DLA"),
+        "naics_code": "",
+        "fsc_code": target.fsc,
+        "solicitation_number": "",
+        "nsn": target.nsn,
+        "keywords": [target.fsc],
+        "keyword_variants": [[target.nsn], [target.compact], [target.niin]],
+        "nomenclature": "",
+        "manufacturers": [],
+        "part_numbers": [],
+        "approved_sources": [],
+        "solicitation_rows": [],
+        "approved_source_names": [],
+        "approved_source_cages": [],
+    }
+    ctx = _expand_context_with_catalog(ctx, _catalog_context_for_nsn(db, target.nsn))
+    research_profile = {
+        "source": "nsn_catalog",
+        "nsn": target.nsn,
+        "fsc": target.fsc,
+        "niin": target.niin,
+        "nomenclature": ctx.get("nomenclature") or ctx.get("catalog_item_name") or "",
+        "keywords": ctx.get("keywords") or [],
+    }
+    return _search_usaspending_with_context(ctx, opportunity_id=None, research_profile=research_profile, limit=limit)
 
 
 def seed_usaspending_vendors_into_leads(
@@ -677,6 +1077,10 @@ def seed_usaspending_vendors_into_leads(
     updated = 0
     seeded: list[dict[str, Any]] = []
     ctx = research_result.get("context", {})
+    provider_repo = ProviderRepository(db, organization_id=getattr(opp, "organization_id", None))
+    nsn = ctx.get("nsn") or None
+    fsc = ctx.get("fsc_code") or None
+    nomenclature = ctx.get("nomenclature") or ctx.get("title") or None
 
     if seed_mode == "strict":
         candidates = research_result.get("strict_seedable_product_like_vendors", [])
@@ -707,7 +1111,8 @@ def seed_usaspending_vendors_into_leads(
             f"Award count: {item.get('award_count', 0)}. "
             f"Total award amount: {item.get('total_award_amount', 0)}. "
             f"Last award: {_safe(item.get('last_award_date'))}. "
-            f"Reasons: {', '.join(item.get('match_reasons', []))}"
+            f"Reasons: {', '.join(item.get('match_reasons', []))}. "
+            f"Sample awards: {' | '.join(f'{award.get('award_id')}: {award.get('description')}' for award in (item.get('sample_awards') or [])[:3])}"
         )
         raw_text = (
             f"Derived from USAspending research for solicitation {_safe(ctx.get('solicitation_number'))}; "
@@ -715,11 +1120,14 @@ def seed_usaspending_vendors_into_leads(
             f"agency={_safe(ctx.get('agency'))}; keywords={', '.join(ctx.get('keywords', []))}; "
             f"fsc={_safe(ctx.get('fsc_code'))}; nsn={_safe(ctx.get('nsn'))}; "
             f"manufacturers={', '.join(ctx.get('manufacturers', []))}; "
-            f"part_numbers={', '.join(ctx.get('part_numbers', []))}; seed_mode={seed_mode}"
+            f"part_numbers={', '.join(ctx.get('part_numbers', []))}; seed_mode={seed_mode}; "
+            f"query_debug={json.dumps(research_result.get('query_debug', [])[:3])}"
         )
         confidence = min(95, 55 + int(float(item.get("score", 0)) * 5))
 
         if existing:
+            if existing.organization_id is None and getattr(opp, "organization_id", None) is not None:
+                existing.organization_id = getattr(opp, "organization_id", None)
             existing.notes = notes
             existing.raw_text = raw_text
             existing.confidence = confidence
@@ -728,6 +1136,7 @@ def seed_usaspending_vendors_into_leads(
             updated += 1
         else:
             rec = VendorLead(
+                organization_id=getattr(opp, "organization_id", None),
                 opportunity_id=opp.id,
                 source_type="USASPENDING_AWARD_HISTORY",
                 company_name=company_name,
@@ -743,11 +1152,74 @@ def seed_usaspending_vendors_into_leads(
             db.add(rec)
             created += 1
 
+        sample_awards = item.get("sample_awards") or []
+        sample_award = sample_awards[0] if sample_awards else {}
+        provider_notes = (
+            f"USAspending awardee. Award count: {item.get('award_count', 0)}. "
+            f"Total award amount: {item.get('total_award_amount', 0)}. "
+            f"Last award: {_safe(item.get('last_award_date'))}. "
+            f"Sample award: {_safe(sample_award.get('award_id'))}."
+        )
+        try:
+            provider_repo.create(
+                ProviderCreate(
+                    company_name=company_name,
+                    notes=provider_notes,
+                    item=ProviderItemCreate(
+                        nsn=nsn,
+                        fsc=fsc,
+                        nomenclature=nomenclature,
+                        relationship_type="Awardee",
+                        source="USAspending",
+                        source_url=_safe(sample_award.get("award_id")),
+                        confidence=90,
+                        notes=provider_notes,
+                    ),
+                )
+            )
+        except Exception:
+            db.rollback()
+
+        try:
+            amount = float(item.get("total_award_amount") or 0) or None
+        except Exception:
+            amount = None
+        if amount:
+            sample_awards = item.get("sample_awards") or []
+            sample_award = sample_awards[0] if sample_awards else {}
+            existing_price = (
+                db.query(PriceHistory)
+                .filter(
+                    PriceHistory.opportunity_id == opp.id,
+                    PriceHistory.award_id == _safe(sample_award.get("award_id")),
+                    PriceHistory.supplier_name == company_name,
+                    PriceHistory.source_label == "USAspending",
+                )
+                .first()
+            )
+            if not existing_price:
+                db.add(
+                    PriceHistory(
+                        organization_id=getattr(opp, "organization_id", None),
+                        opportunity_id=opp.id,
+                        nsn=ctx.get("nsn") or None,
+                        award_id=_safe(sample_award.get("award_id")),
+                        award_date=_safe(sample_award.get("start_date")) or _safe(item.get("last_award_date")),
+                        supplier_name=company_name,
+                        cage=item.get("cage"),
+                        total_price=amount,
+                        source_label="USAspending",
+                        confidence=80,
+                        raw_text=_safe(sample_award.get("description")),
+                    )
+                )
+
         seeded.append({
             "company_name": company_name,
             "award_count": item.get("award_count", 0),
             "score": item.get("score", 0),
             "last_award_date": item.get("last_award_date", ""),
+            "sample_awards": item.get("sample_awards", [])[:3],
         })
 
     db.commit()

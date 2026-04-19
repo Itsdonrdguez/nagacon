@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.orm import Session
 
@@ -9,6 +11,18 @@ from app.services.dibbs.detail_enrichment_playwright import enrich_dibbs_batch
 from app.services.dibbs.approved_source_leads import seed_vendor_leads_from_dibbs_approved_sources
 
 router = APIRouter(prefix="/api/dibbs", tags=["dibbs"])
+
+
+def _parse_dibbs_date(value: str | None):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%m-%d-%Y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 @router.post("/enrich")
@@ -88,3 +102,68 @@ def cleanup_junk(payload: dict = Body(default={}), db: Session = Depends(get_db)
     db.commit()
 
     return {"ok": True, "preview": False, "deleted": deleted, "junk_ids": junk_ids}
+
+
+@router.post("/backfill-dates")
+def backfill_dibbs_dates(payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    limit = int(payload.get("limit", 1000))
+    preview = bool(payload.get("preview", False))
+
+    rows = (
+        db.query(Opportunity)
+        .filter(Opportunity.source == "DIBBS")
+        .order_by(Opportunity.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    scanned = 0
+    updated_due = 0
+    updated_posted = 0
+    touched_ids: list[int] = []
+
+    for opp in rows:
+        scanned += 1
+        raw_payload = getattr(opp, "raw_payload", None) or {}
+        if not isinstance(raw_payload, dict):
+            continue
+        dibbs_detail = raw_payload.get("dibbs_detail") or {}
+        if not isinstance(dibbs_detail, dict):
+            continue
+        structured = dibbs_detail.get("structured") if isinstance(dibbs_detail.get("structured"), dict) else dibbs_detail
+        solicitations = structured.get("solicitations") or []
+        first = solicitations[0] if solicitations else {}
+        if not isinstance(first, dict):
+            continue
+
+        due_at = _parse_dibbs_date(first.get("return_by_date"))
+        posted_at = _parse_dibbs_date(first.get("issue_date"))
+        changed = False
+
+        if due_at is not None and getattr(opp, "due_at", None) is None:
+            updated_due += 1
+            changed = True
+            if not preview:
+                opp.due_at = due_at
+
+        if posted_at is not None and getattr(opp, "posted_at", None) is None:
+            updated_posted += 1
+            changed = True
+            if not preview:
+                opp.posted_at = posted_at
+
+        if changed:
+            touched_ids.append(opp.id)
+
+    if not preview and touched_ids:
+        db.commit()
+
+    return {
+        "ok": True,
+        "preview": preview,
+        "scanned": scanned,
+        "updated_due_at": updated_due,
+        "updated_posted_at": updated_posted,
+        "touched_ids": touched_ids[:100],
+        "touched_count": len(touched_ids),
+    }

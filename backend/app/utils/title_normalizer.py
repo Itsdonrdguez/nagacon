@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import re
 from typing import Any
 
@@ -26,8 +27,45 @@ def _normalize_nsn(value: str | None) -> str | None:
         return None
     digits = re.sub(r"\D", "", value)
     if len(digits) == 13:
-        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:13]}"
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:9]}-{digits[9:13]}"
     return value
+
+
+def _humanize_phrase(value: str | None) -> str | None:
+    value = _clean(value)
+    if not value:
+        return None
+    value = re.sub(r"\s*,\s*", ", ", value)
+    if re.fullmatch(r"[A-Z0-9 ,./()&-]+", value) and re.search(r"[A-Z]", value):
+        value = value.title()
+    return value
+
+
+def _humanize_quantity(value: str | None) -> str | None:
+    value = _clean(value)
+    if not value:
+        return None
+    try:
+        numeric = float(value)
+        if numeric.is_integer():
+            return str(int(numeric))
+    except Exception:
+        pass
+    return value
+
+
+def _humanize_date(value: str | None) -> str | None:
+    value = _clean(value)
+    if not value:
+        return None
+    normalized = re.sub(r"\s+", " ", value).strip()
+    for pattern in ("%Y %b %d", "%Y %B %d", "%m-%d-%Y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(normalized.title(), pattern)
+            return parsed.strftime("%b %d, %Y")
+        except Exception:
+            continue
+    return normalized.title()
 
 
 def _dibbs_title(
@@ -167,22 +205,31 @@ def build_summary_text(
 ) -> str | None:
     parsed_json = parsed_json or {}
     raw_payload = raw_payload or {}
-
-    bits: list[str] = []
     nsn = _normalize_nsn(parsed_json.get("nsn"))
-    nomenclature = _clean(parsed_json.get("nomenclature"))
-    if nomenclature:
-        bits.append(nomenclature)
-    if nsn:
-        bits.append(f"NSN {nsn}")
+    nomenclature = _humanize_phrase(parsed_json.get("nomenclature") or parsed_json.get("item_description"))
+    solicitation_rows = parsed_json.get("solicitations") or []
+    primary_row = solicitation_rows[0] if solicitation_rows else {}
+    quantity = _humanize_quantity(primary_row.get("qty"))
+    due = _humanize_date(primary_row.get("return_by_date"))
+
+    if nomenclature or nsn or quantity or due:
+        if quantity and nomenclature:
+            first_sentence = f"This opportunity appears to request quotes for {quantity} units of {nomenclature}"
+        elif nomenclature:
+            first_sentence = f"This opportunity appears to request quotes for {nomenclature}"
+        else:
+            first_sentence = "This opportunity appears to request quotes for the referenced item"
+        if nsn:
+            first_sentence += f" (NSN {nsn})"
+        first_sentence += "."
+
+        if due:
+            return f"{first_sentence} Responses are due by {due}."
+        return first_sentence
 
     if raw_text:
         txt = _clean(raw_text)
-        if txt and not bits:
+        if txt:
             return txt[:500]
-        if txt and txt not in " | ".join(bits):
-            bits.append(txt[:300])
 
-    if bits:
-        return " | ".join(bits)
     return None

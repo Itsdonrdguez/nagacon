@@ -19,9 +19,15 @@ class AgentType(str, Enum):
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
+    agent_type_enum = SQLEnum(
+        AgentType,
+        name="agent_type",
+        values_callable=lambda enum_cls: [member.value for member in enum_cls],
+    )
+
     id = Column(Integer, primary_key=True, index=True)
     opportunity_id = Column(Integer, ForeignKey("opportunities.id"), nullable=True, index=True)
-    agent_type = Column(SQLEnum(AgentType, name="agent_type"), nullable=False)
+    agent_type = Column(agent_type_enum, nullable=False)
     input_payload = Column(JSONB, nullable=True)
     output_payload = Column(JSONB, nullable=True)
     status = Column(String, nullable=False, default="pending")

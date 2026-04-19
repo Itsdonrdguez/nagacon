@@ -8,9 +8,11 @@ from app.repositories.pipeline import PipelineRepository
 from app.schemas.pipeline import PipelineItemOut, PipelineItemUpdate
 from app.utils.enums import PipelineStatus
 
-
-def create_or_get_pipeline(opportunity_id: int, db: Session):
-    repo = PipelineRepository(db)
+def create_or_get_pipeline(opportunity_id: int, db: Session, organization_id: int | None = None):
+    try:
+        repo = PipelineRepository(db, organization_id=organization_id)
+    except TypeError:
+        repo = PipelineRepository(db)
     return repo.create_or_get(opportunity_id)
 
 
@@ -24,8 +26,12 @@ def update_pipeline_item(
     notes: Optional[str] = None,
     target_submit_date=None,
     db: Session,
+    organization_id: int | None = None,
 ):
-    repo = PipelineRepository(db)
+    try:
+        repo = PipelineRepository(db, organization_id=organization_id)
+    except TypeError:
+        repo = PipelineRepository(db)
 
     payload = PipelineItemUpdate(
         decision_status=decision_status,

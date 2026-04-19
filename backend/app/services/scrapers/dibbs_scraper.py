@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from app.schemas.opportunity import RawOpportunity
+from app.services.dibbs.custom_query_search import search_dibbs_custom_query_by_fsc
 from app.services.dibbs_adapter import pull_dibbs_by_fsc
 
 
@@ -50,6 +51,13 @@ def _normalize_fsc(value: str | None) -> str | None:
         return None
     m = re.search(r"\b(\d{4})\b", value)
     return m.group(1) if m else value
+
+
+def _normalize_sol(value: str | None) -> str | None:
+    value = _safe(value)
+    if not value:
+        return None
+    return value.replace("-", "").upper()
 
 
 def _extract_nsn_from_url_or_text(url: str | None, title: str | None = None) -> str | None:
@@ -100,6 +108,69 @@ def fetch_dibbs_opportunities(params: Optional[Dict] = None, max_pages: int = 1)
     fsc_value = _safe(params.get("fsc") or params.get("fsc_code"))
     limit = int(params.get("limit") or params.get("page_size") or 25)
     debug = bool(params.get("debug", False))
+    use_legacy = bool(params.get("legacy", False))
+    include_past_due = bool(params.get("include_past_due", False))
+    all_results = bool(params.get("all_results", False))
+
+    if not use_legacy:
+        rows, diagnostics = search_dibbs_custom_query_by_fsc(
+            fsc=fsc_value or "",
+            limit=limit,
+            max_pages=max_pages,
+            include_past_due=include_past_due,
+            all_results=all_results,
+            headless=not debug,
+        )
+        raw_records: List[RawOpportunity] = []
+        for row in rows:
+            nsn = _normalize_nsn(row.get("nsn"))
+            rfq_number = _normalize_sol(row.get("solicitation_number"))
+            display_identifier = nsn or rfq_number or row.get("nomenclature") or "DIBBS-RFQ"
+            source_identifier = rfq_number or nsn or row.get("nomenclature") or "DIBBS-RFQ"
+            title = _clean_spaces(row.get("nomenclature")) or nsn or rfq_number or display_identifier
+            description_bits = []
+            if title:
+                description_bits.append(f"Item: {title}")
+            if nsn:
+                description_bits.append(f"NSN: {nsn}")
+            if fsc_value:
+                description_bits.append(f"FSC: {fsc_value}")
+            if row.get("quantity"):
+                description_bits.append(f"QTY: {row.get('quantity')}")
+            if row.get("pr_number"):
+                description_bits.append(f"PR: {row.get('pr_number')}")
+
+            raw_records.append(
+                RawOpportunity(
+                    source="DIBBS",
+                    source_opportunity_id=source_identifier,
+                    solicitation_number=display_identifier,
+                    title=title,
+                    agency="DLA (DIBBS)",
+                    sub_agency=None,
+                    office=None,
+                    url=row.get("package_url") or row.get("pdf_url") or row.get("detail_url") or "",
+                    posted_at=row.get("issue_date"),
+                    due_at=row.get("return_by_date"),
+                    set_aside_type=None,
+                    naics_code=None,
+                    fsc_code=_normalize_fsc(fsc_value or nsn),
+                    place_of_performance=None,
+                    description=" | ".join(description_bits) if description_bits else title,
+                    raw_payload={
+                        "source_adapter": "dibbs_custom_query_fsc",
+                        "dibbs_search_row": {
+                            **{key: value for key, value in row.items() if key != "return_by_parsed"},
+                        },
+                        "dibbs_diagnostics": diagnostics,
+                        "item_signals": {
+                            **_derive_item_signals(title, row.get("detail_url"), fsc_value),
+                            "rfq_number": rfq_number,
+                        },
+                    },
+                )
+            )
+        return raw_records
 
     items, diagnostics = pull_dibbs_by_fsc(fsc=fsc_value, limit=limit, debug=debug)
     raw_records: List[RawOpportunity] = []

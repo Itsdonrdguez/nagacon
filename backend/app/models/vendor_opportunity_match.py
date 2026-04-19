@@ -14,6 +14,7 @@ class VendorOpportunityMatch(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
     vendor_id = Column(Integer, ForeignKey("vendor_leads.id"), nullable=False, index=True)
     opportunity_id = Column(Integer, ForeignKey("opportunities.id"), nullable=False, index=True)
     match_reason = Column(String, nullable=True)

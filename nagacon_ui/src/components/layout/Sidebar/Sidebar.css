@@ -1,0 +1,46 @@
+/* components/layout/Sidebar/Sidebar.css */
+.sidebar {
+  width: 260px;
+  background: linear-gradient(180deg, #07152f, #0b254f);
+  color: white;
+  padding: 1.5rem 1rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  margin-bottom: 2rem;
+}
+
+.brand-title {
+  font-size: 2rem;
+  font-weight: 800;
+  margin-bottom: 0.25rem;
+}
+
+.brand-subtitle {
+  opacity: 0.8;
+  font-size: 0.875rem;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+}
+
+.nav-link {
+  padding: 0.75rem 0.875rem;
+  border-radius: 0.75rem;
+  color: #dbeafe;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background-color 150ms ease-in-out;
+}
+
+.nav-link:hover,
+.nav-link.active {
+  background: #1d4ed8;
+  color: white;
+}

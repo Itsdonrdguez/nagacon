@@ -17,6 +17,12 @@ class VendorLeadOut(BaseModel):
     is_approved_source: bool
     raw_text: str | None = None
     notes: str | None = None
+    source_label: str | None = None
+    provider_website: str | None = None
+    provider_email: str | None = None
+    provider_phone: str | None = None
+    provider_relationship_type: str | None = None
+    provider_item: str | None = None
     created_at: datetime
     updated_at: datetime
 

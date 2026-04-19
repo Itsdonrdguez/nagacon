@@ -34,6 +34,7 @@ def safe_parse_datetime(value: str | datetime | None) -> datetime | None:
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
         "%m/%d/%Y",
+        "%m-%d-%Y",
         "%Y-%m-%d",
     ]
     for fmt in formats:

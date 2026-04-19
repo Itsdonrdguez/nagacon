@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.opportunity import Opportunity
 from app.models.vendor import VendorLead, VendorQuote
 
@@ -21,9 +25,89 @@ def _get_opp(db: Session, opportunity_id: int) -> Opportunity:
 
 def _email_subject(opp: Opportunity, company_name: str | None) -> str:
     sol = _safe(getattr(opp, "solicitation_number", ""))
+    nsn = _safe((getattr(opp, "raw_payload", None) or {}).get("dibbs_detail", {}).get("nsn"))
     title = _safe(getattr(opp, "title", ""))
-    suffix = f" - {company_name}" if company_name else ""
-    return f"Quote Request: {sol} {title}{suffix}".strip()
+    core = sol or title or "Government Opportunity"
+    qualifier = f" | NSN {nsn}" if nsn else ""
+    suffix = f" | {company_name}" if company_name else ""
+    return f"Quote Request | {core}{qualifier}{suffix}".strip()
+
+
+def _format_display_date(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%b %d, %Y")
+    text = str(value).strip()
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m-%d-%Y", "%Y %b %d", "%Y %b %d %H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt).strftime("%b %d, %Y")
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%b %d, %Y")
+    except Exception:
+        return text
+
+
+def _build_quote_request_body(
+    *,
+    recipient_name: str | None,
+    solicitation: str,
+    title: str,
+    agency: str,
+    due_at: str,
+    nsn: str,
+    quantity: str,
+    item_name: str,
+    part_number: str,
+    cage: str,
+    pr_number: str = "",
+) -> str:
+    requested_details = [
+        ("Solicitation", solicitation or "Please confirm"),
+        ("Agency", agency or "Agency unavailable"),
+        ("Item", item_name or title or "Please confirm"),
+        ("NSN", nsn or "Please confirm"),
+        ("Quantity", quantity or "Please confirm"),
+        ("Response Due", _format_display_date(due_at) or due_at or "Please confirm current deadline"),
+    ]
+    if pr_number:
+        requested_details.append(("PR Number", pr_number))
+
+    if part_number:
+        requested_details.append(("Known Part Number", part_number))
+    if cage:
+        requested_details.append(("Known CAGE", cage))
+
+    detail_lines = "".join(f"- {label}: {value}\n" for label, value in requested_details if value)
+
+    requested_quote_items = [
+        "- Unit price",
+        "- Available quantity and lead time",
+        "- Manufacturer name and quoted part number",
+        "- CAGE code",
+        "- Shipping / FOB terms",
+        "- Any minimum order quantity, quote validity period, or supply constraints",
+    ]
+
+    return (
+        f"Hello {recipient_name or 'Team'},\n\n"
+        "We are requesting a quotation in support of the government opportunity below.\n\n"
+        "Opportunity Details\n"
+        f"{detail_lines}\n"
+        "Please include the following in your quote:\n"
+        + "\n".join(requested_quote_items)
+        + "\n\n"
+        "If you can support this requirement, please reply with your pricing and availability at your earliest convenience.\n\n"
+        "Thank you,\n"
+        "[Your Name]\n"
+        "[Your Company]\n"
+        "[Phone]\n"
+        "[Email]\n"
+    )
 
 
 def generate_quote_request_email(opportunity_id: int, db: Session, vendor_quote_id: int | None = None, vendor_lead_id: int | None = None) -> dict:
@@ -65,39 +149,22 @@ def generate_quote_request_email(opportunity_id: int, db: Session, vendor_quote_
     agency = _safe(getattr(opp, "agency", None))
     solicitation = _safe(getattr(opp, "solicitation_number", None))
     title = _safe(getattr(opp, "title", None))
+    pr_number = _safe(selected_sol.get("pr_number"))
 
     subject = _email_subject(opp, company_name)
-
-    body = f"""Hello {contact_name or company_name or "Team"},
-
-We are requesting a quote in support of the following opportunity:
-
-Solicitation: {solicitation}
-Title: {title}
-Agency: {agency}
-Due Date: {due_at or "Please confirm current deadline"}
-Opportunity URL: {_safe(getattr(opp, "url", ""))}
-Official PDF: {pdf_url or "Available on request"}
-
-Requested item details:
-- NSN: {nsn or "Please confirm"}
-- Part Number: {part_number or "Please confirm"}
-- CAGE: {cage or "Please confirm"}
-- Quantity: {qty or "Please confirm"}
-
-Please provide:
-1. Unit price
-2. Lead time / availability
-3. Shipping terms
-4. Any minimum order requirements
-5. Quote validity period
-
-Thank you,
-[Your Name]
-[Your Company]
-[Phone]
-[Email]
-"""
+    body = _build_quote_request_body(
+        recipient_name=contact_name or company_name or "Team",
+        solicitation=solicitation,
+        title=title,
+        agency=agency,
+        due_at=due_at,
+        nsn=nsn,
+        quantity=qty,
+        item_name=title,
+        part_number=part_number,
+        cage=cage,
+        pr_number=pr_number,
+    )
 
     return {
         "opportunity_id": opportunity_id,
@@ -112,4 +179,36 @@ Thank you,
         "nsn": nsn,
         "qty": qty,
         "solicitation_number": solicitation,
+    }
+
+
+def send_email_message(to_email: str, subject: str, body: str) -> dict:
+    host = getattr(settings, "SMTP_HOST", None)
+    port = getattr(settings, "SMTP_PORT", None)
+    username = getattr(settings, "SMTP_USERNAME", None)
+    password = getattr(settings, "SMTP_PASSWORD", None)
+    from_email = getattr(settings, "SMTP_FROM_EMAIL", None) or username
+    use_tls = bool(getattr(settings, "SMTP_USE_TLS", True))
+
+    if not host or not port or not from_email:
+        raise ValueError("SMTP is not configured. Set SMTP_HOST, SMTP_PORT, and SMTP_FROM_EMAIL.")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    with smtplib.SMTP(host, port, timeout=30) as server:
+        if use_tls:
+            server.starttls()
+        if username and password:
+            server.login(username, password)
+        server.send_message(msg)
+
+    return {
+        "status": "sent",
+        "to": to_email,
+        "from": from_email,
+        "subject": subject,
     }

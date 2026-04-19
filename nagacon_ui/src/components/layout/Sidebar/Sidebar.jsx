@@ -2,9 +2,14 @@ import { NavLink } from 'react-router-dom'
 
 const items = [
   ['/', 'Dashboard'],
+  ['/company', 'Company Profile'],
+  ['/ingestion', 'Search'],
   ['/opportunities', 'Opportunities'],
-  ['/vendors', 'Vendors'],
-  ['/workspace/25', 'Workspace'],
+  ['/pipeline', 'Pipeline'],
+  ['/vendors', 'Vendor Intelligence'],
+  ['/providers', 'Providers'],
+  ['/nsn-intelligence', 'NSN Intelligence'],
+  ['/settings', 'Settings'],
 ]
 
 export default function Sidebar() {
@@ -12,7 +17,7 @@ export default function Sidebar() {
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-title">NagaCon</div>
-        <div className="brand-subtitle">Gov Opportunity Tracker</div>
+        <div className="brand-subtitle">GovCon Intelligence Platform</div>
       </div>
       <nav className="nav">
         {items.map(([to, label]) => (

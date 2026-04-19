@@ -26,7 +26,21 @@ def upsert_submission(db: Session, opportunity_id: int, patch: dict) -> BidSubmi
             st = "DRAFT"
         sub.status = st
 
-    for k in ["submitted_at", "submitted_unit_price", "submitted_vendor_cage", "submitted_vendor_name", "notes"]:
+    for k in [
+        "submitted_at",
+        "submitted_unit_price",
+        "submitted_vendor_cage",
+        "submitted_vendor_name",
+        "planned_vendor_quote_id",
+        "planned_vendor_cage",
+        "planned_vendor_name",
+        "awarded_at",
+        "award_amount",
+        "winning_vendor_cage",
+        "winning_vendor_name",
+        "outcome_summary",
+        "notes",
+    ]:
         if k in patch:
             setattr(sub, k, patch[k])
 

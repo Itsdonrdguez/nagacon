@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field, computed_field
 
 from app.utils.enums import OpportunityStatus
+from app.utils.solicitation_status import derive_solicitation_status
 from app.utils.title_normalizer import normalize_source_title
 
 
@@ -78,7 +79,7 @@ class OpportunityRead(OpportunityBase):
     @computed_field
     @property
     def workspace_url(self) -> str:
-        return f"/workspace?opp_id={self.id}"
+        return f"/workspace/{self.id}"
 
     @computed_field
     @property
@@ -96,6 +97,11 @@ class OpportunityRead(OpportunityBase):
     @property
     def source_uniform_title(self) -> str:
         return self.display_title
+
+    @computed_field
+    @property
+    def solicitation_status(self) -> str:
+        return derive_solicitation_status(self.due_at)
 
     model_config = {"from_attributes": True}
 

@@ -8,12 +8,19 @@ from app.models.vendor_opportunity_match import VendorOpportunityMatch
 
 
 class VendorMatchRepository:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, organization_id: int | None = None):
         self.db = db
+        self.organization_id = organization_id
+
+    def _scoped_query(self):
+        query = self.db.query(VendorOpportunityMatch)
+        if self.organization_id is not None:
+            query = query.filter(VendorOpportunityMatch.organization_id == self.organization_id)
+        return query
 
     def list_by_opportunity(self, opportunity_id: int) -> List[VendorOpportunityMatch]:
         return (
-            self.db.query(VendorOpportunityMatch)
+            self._scoped_query()
             .filter(VendorOpportunityMatch.opportunity_id == opportunity_id)
             .all()
         )
@@ -24,7 +31,7 @@ class VendorMatchRepository:
 
     def get(self, match_id: int) -> Optional[VendorOpportunityMatch]:
         return (
-            self.db.query(VendorOpportunityMatch)
+            self._scoped_query()
             .filter(VendorOpportunityMatch.id == match_id)
             .first()
         )
@@ -53,6 +60,7 @@ class VendorMatchRepository:
                 setattr(rec,k,v)
         else:
             rec = VendorOpportunityMatch(
+                organization_id=self.organization_id,
                 vendor_id=vendor_id,
                 opportunity_id=opportunity_id,
                 **kwargs

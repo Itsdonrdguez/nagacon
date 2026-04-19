@@ -13,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # adds backend/ to 
 
 from app.core.db import Base
 import app.models.opportunity  # ensures models are registered
+import app.models  # ensures all models are registered
 # -----------------------
 
 
@@ -31,6 +32,7 @@ if config.config_file_name is not None:
 # target_metadata = mymodel.Base.metadata
 from app.core.db import Base
 from app.models import opportunity  # registers models
+import app.models  # registers all models
 
 target_metadata = Base.metadata
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -15,6 +15,7 @@ from app.schemas.company import (
     PastPerformanceOut,
     PastPerformanceUpdate,
 )
+from app.services.company_profile_ingest import build_company_ingest_plan, run_company_profile_ingest
 
 router = APIRouter(prefix="/api/company", tags=["company"])
 
@@ -43,6 +44,23 @@ def update_profile(profile_id: int, item: CompanyProfileUpdate, db: Session = De
     if not rec:
         raise HTTPException(status_code=404, detail="Company profile not found")
     return rec
+
+
+@router.get("/ingest-plan")
+def get_profile_ingest_plan(db: Session = Depends(get_db)):
+    profile = CompanyRepository(db).get_first_profile()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Company profile not found")
+    return build_company_ingest_plan(profile)
+
+
+@router.post("/ingest-run")
+def run_profile_ingest(payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    profile = CompanyRepository(db).get_first_profile()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Company profile not found")
+    quick = bool((payload or {}).get("quick", False))
+    return run_company_profile_ingest(db, profile, quick=quick, update_last_run=not quick)
 
 
 @router.post("/past-performance", response_model=PastPerformanceOut)

@@ -9,6 +9,13 @@ from __future__ import annotations
 import os
 
 try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
+try:
     from app.core.settings import settings  # type: ignore
 except Exception:
     try:
@@ -20,6 +27,13 @@ except Exception:
             OPENAI_PROPOSAL_MODEL = os.getenv("OPENAI_PROPOSAL_MODEL", "gpt-4o-mini")
             SAM_API_KEY = os.getenv("SAM_API_KEY")
             SAM_BEARER_TOKEN = os.getenv("SAM_BEARER_TOKEN")
+            SMTP_HOST = os.getenv("SMTP_HOST")
+            SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+            SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+            SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+            SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
+            SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes", "on"}
+            EXTERNAL_API_KEYS = os.getenv("EXTERNAL_API_KEYS", "")
             APP_ENV = os.getenv("APP_ENV", "dev")
             DEBUG = os.getenv("DEBUG", "true").lower() in {"1", "true", "yes", "on"}
 

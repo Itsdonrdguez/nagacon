@@ -28,6 +28,14 @@ class BidSubmission(Base):
     submitted_unit_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     submitted_vendor_cage: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
     submitted_vendor_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    planned_vendor_quote_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    planned_vendor_cage: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    planned_vendor_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    awarded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    award_amount: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    winning_vendor_cage: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    winning_vendor_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    outcome_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 

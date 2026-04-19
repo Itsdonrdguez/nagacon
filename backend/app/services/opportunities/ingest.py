@@ -30,8 +30,10 @@ def ingest_raw_opportunities(db: Session, raw_records: List[RawOpportunity]) -> 
                     result.updated += 1
                 else:
                     result.inserted += 1
-            else:
+            elif action == "updated":
                 result.updated += 1
+            else:
+                result.skipped += 1
 
         except (NormalizationError, DuplicateRecordError) as e:
             result.skipped += 1

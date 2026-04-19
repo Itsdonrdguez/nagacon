@@ -42,7 +42,9 @@ def _fields() -> list[str]:
 
 def _base_filters(naics_code: str | None = None) -> dict[str, Any]:
     filters: dict[str, Any] = {
-        "award_type_codes": ["02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13"],
+        # USAspending's spending_by_award endpoint only accepts the currently
+        # supported contract award codes. 12/13 are rejected by the API.
+        "award_type_codes": ["02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "A", "B", "C", "D"],
     }
     code = _safe(naics_code)
     if code:

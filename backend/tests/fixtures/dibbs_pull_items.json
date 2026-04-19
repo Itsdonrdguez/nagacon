@@ -1,0 +1,27 @@
+{
+  "items": [
+    {
+      "title": "RETAINER,PLATE",
+      "detail_url": "https://dibbs.bsm.dla.mil/rfq/rfqrec.aspx?value=8470016987150",
+      "source_opportunity_id": "8470016987150",
+      "solicitation_number": "8470016987150",
+      "agency": "DLA Aviation",
+      "posted_at": "2026-03-20",
+      "due_at": "2026-03-27",
+      "fsc_code": "1560",
+      "raw_payload": {
+        "dibbs_detail": {
+          "nomenclature": "RETAINER,PLATE",
+          "nsn": "8470016987150",
+          "approved_sources": [
+            {
+              "cage": "1ABC1",
+              "part_number": "RP-100",
+              "company_name": "Acme Aviation"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

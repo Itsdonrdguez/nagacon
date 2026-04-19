@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+
+from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -9,44 +12,222 @@ from app.utils.exceptions import DuplicateRecordError
 
 
 class OpportunityRepository:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, organization_id: int | None = None):
         self.db = db
+        self.organization_id = organization_id
+
+    def _scoped_query(self):
+        query = self.db.query(Opportunity)
+        if self.organization_id is not None:
+            query = query.filter(Opportunity.organization_id == self.organization_id)
+        return query
+
+    def _parse_legacy_dibbs_date(self, value: str | None):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for fmt in ("%m-%d-%Y", "%m/%d/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _backfill_dibbs_dates(self, items: list[Opportunity]) -> list[Opportunity]:
+        changed = False
+        for opp in items:
+            if opp.source != "DIBBS" or opp.due_at is not None:
+                continue
+            raw_payload = opp.raw_payload or {}
+            if not isinstance(raw_payload, dict):
+                continue
+            dibbs_detail = raw_payload.get("dibbs_detail") or {}
+            if not isinstance(dibbs_detail, dict):
+                continue
+            structured = dibbs_detail.get("structured") if isinstance(dibbs_detail.get("structured"), dict) else dibbs_detail
+            solicitations = structured.get("solicitations") or []
+            first = solicitations[0] if solicitations else {}
+            parsed_due = self._parse_legacy_dibbs_date(first.get("return_by_date"))
+            parsed_posted = self._parse_legacy_dibbs_date(first.get("issue_date"))
+            if parsed_due is not None:
+                opp.due_at = parsed_due
+                changed = True
+            if parsed_posted is not None and opp.posted_at is None:
+                opp.posted_at = parsed_posted
+                changed = True
+        if changed:
+            self.db.commit()
+            for opp in items:
+                self.db.refresh(opp)
+        return items
 
     def get(self, opportunity_id: int) -> Opportunity | None:
-        return self.db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
+        opp = self._scoped_query().filter(Opportunity.id == opportunity_id).first()
+        if not opp:
+            return None
+        return self._backfill_dibbs_dates([opp])[0]
 
     def get_by_source_id(self, source: str, source_id: str) -> Opportunity | None:
         return (
-            self.db.query(Opportunity)
+            self._scoped_query()
             .filter(Opportunity.source == source, Opportunity.source_opportunity_id == source_id)
             .first()
         )
 
     def get_by_source_and_solicitation(self, source: str, solicitation_number: str) -> Opportunity | None:
         return (
-            self.db.query(Opportunity)
+            self._scoped_query()
             .filter(Opportunity.source == source, Opportunity.solicitation_number == solicitation_number)
             .first()
         )
 
     def find_dedupe_candidates(self, source: str, agency: str | None = None, limit: int = 100) -> list[Opportunity]:
-        q = self.db.query(Opportunity).filter(Opportunity.source == source)
+        q = self._scoped_query().filter(Opportunity.source == source)
         if agency:
             q = q.filter(Opportunity.agency == agency)
         return q.order_by(Opportunity.id.desc()).limit(limit).all()
 
-    def list(self, limit: int = 100, offset: int = 0) -> list[Opportunity]:
-        return (
-            self.db.query(Opportunity)
-            .order_by(Opportunity.id.desc())
-            .offset(offset)
-            .limit(limit)
+    def _apply_filters(
+        self,
+        query,
+        *,
+        q: str | None = None,
+        source: str | None = None,
+        set_aside_type: str | None = None,
+        due_window: str | None = None,
+        nsn: str | None = None,
+    ):
+        if source:
+            query = query.filter(Opportunity.source == source)
+
+        if set_aside_type == "none":
+            query = query.filter(or_(Opportunity.set_aside.is_(None), Opportunity.set_aside == ""))
+        elif set_aside_type:
+            query = query.filter(Opportunity.set_aside == set_aside_type)
+
+        if q:
+            pattern = f"%{q.strip()}%"
+            query = query.filter(
+                or_(
+                    Opportunity.title.ilike(pattern),
+                    Opportunity.agency.ilike(pattern),
+                    Opportunity.solicitation_number.ilike(pattern),
+                    Opportunity.naics.ilike(pattern),
+                    Opportunity.fsc.ilike(pattern),
+                )
+            )
+
+        if nsn:
+            normalized = "".join(ch for ch in str(nsn) if ch.isdigit())
+            if normalized:
+                compact_db_nsn = (
+                    func.replace(
+                        func.replace(
+                            func.replace(Opportunity.solicitation_number, "-", ""),
+                            " ",
+                            "",
+                        ),
+                        ".",
+                        "",
+                    )
+                )
+                query = query.filter(compact_db_nsn.ilike(f"%{normalized}%"))
+            else:
+                query = query.filter(Opportunity.solicitation_number.ilike(f"%{nsn.strip()}%"))
+
+        if due_window:
+            from datetime import datetime, timedelta
+
+            now = datetime.utcnow()
+            if due_window == "7d":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at >= now, Opportunity.due_at <= now + timedelta(days=7))
+            elif due_window == "30d":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at >= now, Opportunity.due_at <= now + timedelta(days=30))
+            elif due_window == "open":
+                query = query.filter(or_(Opportunity.due_at.is_(None), Opportunity.due_at >= now))
+            elif due_window == "closed":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
+
+        return query
+
+    def list(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        q: str | None = None,
+        source: str | None = None,
+        set_aside_type: str | None = None,
+        due_window: str | None = None,
+        nsn: str | None = None,
+    ) -> list[Opportunity]:
+        query = self._apply_filters(
+            self._scoped_query(),
+            q=q,
+            source=source,
+            set_aside_type=set_aside_type,
+            due_window=due_window,
+            nsn=nsn,
+        )
+        items = query.order_by(Opportunity.id.desc()).offset(offset).limit(limit).all()
+        return self._backfill_dibbs_dates(items)
+
+    def search(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 25,
+        q: str | None = None,
+        source: str | None = None,
+        set_aside_type: str | None = None,
+        due_window: str | None = None,
+        nsn: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str = "asc",
+    ) -> tuple[list[Opportunity], int]:
+        base_query = self._apply_filters(
+            self._scoped_query(),
+            q=q,
+            source=source,
+            set_aside_type=set_aside_type,
+            due_window=due_window,
+            nsn=nsn,
+        )
+        total = base_query.count()
+        open_first = case(
+            (Opportunity.due_at.is_(None), 1),
+            (Opportunity.due_at < datetime.utcnow(), 2),
+            else_=0,
+        )
+        sort_map = {
+            "due_at": Opportunity.due_at,
+            "nsn": Opportunity.solicitation_number,
+            "solicitation_number": Opportunity.solicitation_number,
+            "title": Opportunity.title,
+            "agency": Opportunity.agency,
+            "source": Opportunity.source,
+            "fsc": Opportunity.fsc,
+            "naics": Opportunity.naics,
+        }
+        sort_column = sort_map.get(str(sort_by or "").strip())
+        sort_direction = str(sort_order or "asc").lower()
+        if sort_column is not None:
+            ordering = sort_column.desc() if sort_direction == "desc" else sort_column.asc()
+            order_by = [ordering, Opportunity.id.desc()]
+        else:
+            order_by = [open_first.asc(), Opportunity.due_at.asc(), Opportunity.id.desc()]
+        items = (
+            base_query
+            .order_by(*order_by)
+            .offset(max(page - 1, 0) * page_size)
+            .limit(page_size)
             .all()
         )
+        return self._backfill_dibbs_dates(items), total
 
     def create(self, opp: OpportunityCreate) -> Opportunity:
         payload = opp.model_dump()
         db_opp = Opportunity(
+            organization_id=self.organization_id,
             source=payload["source"],
             source_opportunity_id=payload.get("source_opportunity_id"),
             solicitation_number=payload.get("solicitation_number") or "",

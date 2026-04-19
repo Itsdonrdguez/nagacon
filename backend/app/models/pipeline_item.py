@@ -11,6 +11,7 @@ class PipelineItem(Base):
     __tablename__ = "pipeline_items"
 
     id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
     opportunity_id = Column(Integer, ForeignKey("opportunities.id"), nullable=False, unique=True, index=True)
     decision_status = Column(
         SQLEnum(PipelineStatus, name="pipeline_status"),

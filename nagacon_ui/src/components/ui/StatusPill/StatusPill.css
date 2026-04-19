@@ -1,0 +1,43 @@
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 1.8rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.status-pill-default {
+  background: #f1f5f9;
+  border-color: #dbe4f0;
+  color: #475569;
+}
+
+.status-pill-success {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.status-pill-warning {
+  background: #fef3c7;
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
+.status-pill-error {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+
+.status-pill-info {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+}

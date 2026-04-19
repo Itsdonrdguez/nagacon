@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
 from playwright.sync_api import Page
 
+from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
 from app.services.dibbs.session import dibbs_page, open_dibbs_rfq_list
 
 DIBBS_BASE_URL = "https://www.dibbs.bsm.dla.mil"
@@ -143,10 +144,16 @@ def _fetch_detail_fields(page: Page, detail_url: str) -> dict[str, Any]:
 
     detail: dict[str, Any] = {}
     detail["nsn"] = _extract_nsn_from_url(detail_url)
+    structured = parse_dibbs_detail_structured(html, detail_url)
+    if structured:
+        detail["structured"] = structured
 
     nomenclature = _extract_nomenclature(html)
     if nomenclature:
         detail["nomenclature"] = nomenclature
+
+    if structured.get("nomenclature") and not detail.get("nomenclature"):
+        detail["nomenclature"] = structured.get("nomenclature")
 
     pdfs = re.findall(
         r"https://dibbs2\.bsm\.dla\.mil/Downloads/RFQ/[^\s\"']+\.PDF",
@@ -218,6 +225,11 @@ def pull_dibbs_by_fsc(
             detail = _fetch_detail_fields(page, full_url)
             nsn = detail.get("nsn") or _extract_nsn_from_url(full_url) or text
             nomenclature = detail.get("nomenclature")
+            structured = detail.get("structured") if isinstance(detail.get("structured"), dict) else detail if isinstance(detail, dict) else {}
+            solicitations = structured.get("solicitations") or []
+            first_solicitation = solicitations[0] if solicitations else {}
+            return_by_date = _safe(first_solicitation.get("return_by_date"))
+            issue_date = _safe(first_solicitation.get("issue_date"))
             title = nomenclature or text or "DIBBS RFQ"
             description = title if nomenclature else (text or "DIBBS RFQ result")
 
@@ -232,8 +244,8 @@ def pull_dibbs_by_fsc(
                     "office": None,
                     "url": full_url,
                     "detail_url": full_url,
-                    "posted_at": None,
-                    "due_at": None,
+                    "posted_at": issue_date,
+                    "due_at": return_by_date,
                     "set_aside_type": None,
                     "fsc_code": fsc_value,
                     "place_of_performance": None,

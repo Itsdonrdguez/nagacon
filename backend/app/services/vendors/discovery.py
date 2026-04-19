@@ -122,14 +122,19 @@ def discover_vendors_for_opportunity(opportunity_id: int, db: Session) -> dict:
             continue
 
         source = "approved_source" if vendor.is_approved_source else "rule_based"
+        payload = VendorMatchCreate(
+            vendor_id=vendor.id,
+            opportunity_id=opportunity_id,
+            match_reason="; ".join(reasons),
+            confidence_score=score,
+            source=source,
+        )
         match_repo.create_or_update(
-            VendorMatchCreate(
-                vendor_id=vendor.id,
-                opportunity_id=opportunity_id,
-                match_reason="; ".join(reasons),
-                confidence_score=score,
-                source=source,
-            )
+            vendor_id=payload.vendor_id,
+            opportunity_id=payload.opportunity_id,
+            match_reason=payload.match_reason,
+            confidence_score=payload.confidence_score,
+            source=payload.source,
         )
         created_or_updated += 1
 

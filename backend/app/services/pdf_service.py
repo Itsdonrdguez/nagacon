@@ -1,27 +1,35 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import requests
+import urllib3
 from sqlalchemy.orm import Session
-from playwright.sync_api import Response, sync_playwright
+from playwright.sync_api import sync_playwright
 
+from app.core.config import settings
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
+from app.services.document_pipeline import process_opportunity_documents
+from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def _safe_dirname(s: str) -> str:
-    s = (s or "").strip().split("»")[0].strip()
+    s = (s or "").strip().split("Â»")[0].strip()
     s = re.sub(r"[^A-Za-z0-9._ -]+", "_", s)
     return s or "opportunity"
 
 
 def _safe_filename(s: str) -> str:
-    s = (s or "").strip().split("»")[0].strip()
+    s = (s or "").strip().split("Â»")[0].strip()
     s = re.sub(r"[^A-Za-z0-9._ -]+", "_", s)
     s = s.replace(" ", "_")
     return s or "file"
@@ -42,7 +50,7 @@ def _already_downloaded(db: Session, opportunity_id: int, filename: str) -> bool
 def _compact_solicitation(s: str | None) -> str | None:
     if not s:
         return None
-    s = s.split("»")[0].strip()
+    s = s.split("Â»")[0].strip()
     return re.sub(r"[^A-Za-z0-9]+", "", s)
 
 
@@ -117,21 +125,55 @@ def _sniff_pdf_bytes(data: bytes) -> bool:
     return bool(data and data[:4] == b"%PDF")
 
 
-def _save_official_pdf(db: Session, opp: Opportunity, out_dir: Path, filename: str, source_url: str, data: bytes) -> tuple[int, str]:
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
+def _content_disposition_filename(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', value, flags=re.I)
+    if not match:
+        return None
+    return _safe_filename(unquote(match.group(1)))
+
+
+def _filename_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    path = urlparse(url).path or ""
+    filename = Path(path).name
+    return _safe_filename(filename) if filename else None
+
+
+def _extension_from_content_type(content_type: str | None) -> str:
+    if not content_type:
+        return ""
+    guessed = mimetypes.guess_extension((content_type or "").split(";")[0].strip())
+    return guessed or ""
+
+
+def _save_downloaded_file(
+    db: Session,
+    opp: Opportunity,
+    out_dir: Path,
+    filename: str,
+    source_url: str,
+    data: bytes,
+    file_type: str,
+) -> tuple[int, str]:
+    filename = _safe_filename(filename)
     if _already_downloaded(db, opp.id, filename):
         return 0, filename
     fp = out_dir / filename
     fp.write_bytes(data)
-    db.add(OpportunityFile(
-        opportunity_id=opp.id,
-        file_type="PDF_OFFICIAL",
-        filename=filename,
-        source_url=source_url,
-        file_path=str(fp.resolve()),
-        created_at=datetime.utcnow(),
-    ))
+    db.add(
+        OpportunityFile(
+            organization_id=getattr(opp, "organization_id", None),
+            opportunity_id=opp.id,
+            file_type=file_type,
+            filename=filename,
+            source_url=source_url,
+            file_path=str(fp.resolve()),
+            created_at=datetime.utcnow(),
+        )
+    )
     db.commit()
     return 1, filename
 
@@ -163,217 +205,276 @@ def _create_snapshot_pdf(db: Session, opp: Opportunity, page, out_dir: Path) -> 
             margin={"top": "0.45in", "bottom": "0.45in", "left": "0.45in", "right": "0.45in"},
         )
         fp.write_bytes(pdf_bytes)
-        db.add(OpportunityFile(
-            opportunity_id=opp.id,
-            file_type="PDF_FALLBACK_SNAPSHOT",
-            filename=fname,
-            source_url=page.url,
-            file_path=str(fp.resolve()),
-            created_at=datetime.utcnow(),
-        ))
+        db.add(
+            OpportunityFile(
+                organization_id=getattr(opp, "organization_id", None),
+                opportunity_id=opp.id,
+                file_type="PDF_FALLBACK_SNAPSHOT",
+                filename=fname,
+                source_url=page.url,
+                file_path=str(fp.resolve()),
+                created_at=datetime.utcnow(),
+            )
+        )
         db.commit()
         return 1, 0, None
-    except Exception as e:
-        return 0, 0, str(e)
-
-
-class NetworkCapture:
-    def __init__(self, sol_compact: str):
-        self.sol_compact = (sol_compact or "").lower()
-        self.events: list[dict[str, Any]] = []
-
-    def handler(self, response: Response):
-        try:
-            url = response.url or ""
-            ul = url.lower()
-            if self.sol_compact in ul or ".pdf" in ul or "downloads/rfq/" in ul:
-                headers = {}
-                try:
-                    headers = dict(response.headers)
-                except Exception:
-                    headers = {}
-                body = b""
-                try:
-                    body = response.body()
-                except Exception:
-                    body = b""
-                self.events.append({
-                    "url": url,
-                    "status": getattr(response, "status", None),
-                    "headers": headers,
-                    "body_prefix": body[:200].decode("latin-1", errors="replace"),
-                    "is_pdf": _sniff_pdf_bytes(body),
-                    "body_len": len(body),
-                })
-        except Exception:
-            pass
-
-
-def _candidate_locators(page, sol_compact: str) -> list[dict[str, Any]]:
-    selectors = [
-        f"a[href*='{sol_compact}.PDF']",
-        f"a[href*='{sol_compact.lower()}.pdf']",
-        f"a:has-text('{sol_compact}')",
-        "a[href*='Downloads/RFQ']",
-        "a[href*='.PDF']",
-        "a[href*='.pdf']",
-    ]
-    out = []
-    seen = set()
-    target = (sol_compact or "").lower()
-
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            count = min(loc.count(), 5)
-            for i in range(count):
-                el = loc.nth(i)
-                href = el.get_attribute("href")
-                try:
-                    text = (el.inner_text(timeout=1500) or "").strip()
-                except Exception:
-                    text = None
-
-                href_l = (href or "").lower()
-                text_l = (text or "").lower()
-                if target and target not in href_l and target not in text_l:
-                    continue
-
-                key = (sel, href, text, i)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append({"selector": sel, "href": href, "text": text, "index": i})
-        except Exception:
-            continue
-    return out
+    except Exception as exc:
+        return 0, 0, str(exc)
 
 
 def _cookie_dict_from_playwright(cookies: list[dict[str, Any]]) -> dict[str, str]:
     return {c["name"]: c["value"] for c in cookies if c.get("name") and c.get("value")}
 
 
-def _download_via_requests(pdf_url: str, referer: str, cookies: list[dict[str, Any]], timeout_s: int = 15) -> dict[str, Any]:
-    cookie_dict = _cookie_dict_from_playwright(cookies)
+def _download_binary_via_requests(
+    url: str,
+    referer: str | None = None,
+    cookies: list[dict[str, Any]] | None = None,
+    timeout_s: int = 20,
+) -> dict[str, Any]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-        "Referer": referer,
-        "Accept": "application/pdf,application/octet-stream,text/html;q=0.9,*/*;q=0.8",
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+    if referer:
+        headers["Referer"] = referer
     try:
-        r = requests.get(pdf_url, headers=headers, cookies=cookie_dict, timeout=timeout_s, allow_redirects=True)
-        body = r.content or b""
-        meta = {
-            "final_url": r.url,
-            "status_code": r.status_code,
-            "headers": dict(r.headers),
-            "body_prefix": body[:200].decode("latin-1", errors="replace"),
-            "is_pdf": _sniff_pdf_bytes(body),
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                cookies=_cookie_dict_from_playwright(cookies or []),
+                timeout=timeout_s,
+                allow_redirects=True,
+            )
+        except requests.exceptions.SSLError:
+            response = requests.get(
+                url,
+                headers=headers,
+                cookies=_cookie_dict_from_playwright(cookies or []),
+                timeout=timeout_s,
+                allow_redirects=True,
+                verify=False,
+            )
+        body = response.content or b""
+        return {
+            "ok": response.ok and bool(body),
+            "bytes": body,
+            "final_url": response.url,
+            "content_type": response.headers.get("content-type"),
+            "content_disposition": response.headers.get("content-disposition"),
+            "details": {
+                "status_code": response.status_code,
+                "headers": dict(response.headers),
+                "body_len": len(body),
+                "is_pdf": _sniff_pdf_bytes(body),
+            },
         }
-        if r.ok and _sniff_pdf_bytes(body):
-            return {"ok": True, "pdf_bytes": body, "filename": Path(pdf_url.split("?")[0]).name or "official.pdf", "source_url": pdf_url, "details": meta}
-        return {"ok": False, "reason": "cookie_request_not_pdf", "details": meta}
-    except Exception as e:
-        return {"ok": False, "reason": str(e), "details": {}}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc), "details": {}}
 
 
-def _run_strategy(page, candidate: dict[str, Any], strategy_name: str, timeout_ms: int = 5000) -> dict[str, Any]:
-    href = candidate.get("href")
-    text = candidate.get("text")
-    sel = candidate.get("selector")
-    idx = candidate.get("index", 0)
-    details = {"strategy": strategy_name, "selector": sel, "href": href, "text": text, "index": idx}
+def _dedupe_candidates(candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for candidate in candidates:
+        url = (candidate.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        unique.append(candidate)
+    return unique
 
+
+def _extract_urlish_candidates(value: Any, default_label: str | None = None) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    if isinstance(value, str):
+        if value.startswith("http://") or value.startswith("https://"):
+            candidates.append({"url": value, "label": default_label or _filename_from_url(value) or value})
+        return candidates
+    if isinstance(value, dict):
+        url = value.get("url") or value.get("href") or value.get("link") or value.get("resourceLink")
+        if isinstance(url, str) and (url.startswith("http://") or url.startswith("https://")):
+            label = value.get("name") or value.get("title") or value.get("label") or value.get("fileName") or default_label
+            candidates.append({"url": url, "label": str(label or _filename_from_url(url) or url)})
+        return candidates
+    if isinstance(value, list):
+        for item in value:
+            candidates.extend(_extract_urlish_candidates(item, default_label=default_label))
+    return candidates
+
+
+def _collect_dibbs_file_candidates(opp: Opportunity, page=None) -> list[dict[str, str]]:
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
+    candidates: list[dict[str, str]] = []
+
+    detail = raw_payload.get("dibbs_detail")
+    if isinstance(detail, dict):
+        structured = detail.get("structured") if isinstance(detail.get("structured"), dict) else detail
+        file_links = structured.get("file_links") if isinstance(structured, dict) else []
+        if isinstance(file_links, list):
+            for item in file_links:
+                if isinstance(item, dict) and item.get("url"):
+                    candidates.append(
+                        {
+                            "url": str(item.get("url")),
+                            "label": str(item.get("text") or item.get("url")),
+                        }
+                    )
+
+        for pdf_url in detail.get("pdf_links") or []:
+            if pdf_url:
+                candidates.append({"url": str(pdf_url), "label": Path(str(pdf_url)).name})
+
+    selected = raw_payload.get("dibbs_selected_solicitation") or {}
+    if isinstance(selected, dict) and selected.get("pdf_url"):
+        candidates.append(
+            {
+                "url": str(selected.get("pdf_url")),
+                "label": str(selected.get("solicitation_number") or Path(str(selected.get("pdf_url"))).name),
+            }
+        )
+
+    if page is not None:
+        try:
+            parsed = parse_dibbs_detail_structured(page.content(), page.url)
+            for item in parsed.get("file_links") or []:
+                if isinstance(item, dict) and item.get("url"):
+                    candidates.append(
+                        {
+                            "url": str(item.get("url")),
+                            "label": str(item.get("text") or item.get("url")),
+                        }
+                    )
+        except Exception:
+            pass
+
+    return _dedupe_candidates(candidates)
+
+
+def _preferred_dibbs_detail_pdf_url(opp: Opportunity) -> str | None:
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
+
+    selected = raw_payload.get("dibbs_selected_solicitation") or {}
+    if isinstance(selected, dict):
+        pdf_url = selected.get("pdf_url")
+        if isinstance(pdf_url, str) and pdf_url.startswith("http"):
+            return pdf_url
+
+    detail = raw_payload.get("dibbs_detail") or {}
+    if isinstance(detail, dict):
+        structured = detail.get("structured") if isinstance(detail.get("structured"), dict) else detail
+        if isinstance(structured, dict):
+            for row in structured.get("solicitations") or []:
+                if not isinstance(row, dict):
+                    continue
+                pdf_url = row.get("pdf_url")
+                if isinstance(pdf_url, str) and pdf_url.startswith("http"):
+                    return pdf_url
+        for pdf_url in detail.get("pdf_links") or []:
+            if isinstance(pdf_url, str) and pdf_url.startswith("http"):
+                return pdf_url
+
+    sol_compact = _compact_solicitation(opp.solicitation_number) or ""
+    if sol_compact and sol_compact.upper().startswith("SPE"):
+        return f"https://dibbs2.bsm.dla.mil/Downloads/RFQ/{sol_compact[-1]}/{sol_compact}.PDF"
+    return None
+
+
+def _sam_headers(api_key: str | None) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    bearer = getattr(settings, "SAM_BEARER_TOKEN", None)
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    if api_key:
+        headers["x-api-key"] = api_key
+    return headers
+
+
+def _fetch_sam_notice_detail(opp: Opportunity) -> dict[str, Any]:
+    api_key = getattr(settings, "SAM_API_KEY", None)
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
+    notice_id = raw_payload.get("noticeId") or raw_payload.get("id") or raw_payload.get("opportunityId")
+    if not notice_id or not api_key:
+        return {}
     try:
-        el = page.locator(sel).nth(idx)
-    except Exception as e:
-        return {"ok": False, "reason": str(e), "details": details}
+        response = requests.get(
+            "https://api.sam.gov/prod/opportunities/v1/noticedesc",
+            params={"noticeid": notice_id, "api_key": api_key},
+            headers=_sam_headers(api_key),
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
-    if strategy_name == "expect_download_click":
-        try:
-            with page.expect_download(timeout=timeout_ms) as info:
-                el.click(timeout=3000)
-            dl = info.value
-            filename = dl.suggested_filename or Path((href or "official.pdf")).name or "official.pdf"
-            p = dl.path()
-            if not p:
-                return {"ok": False, "reason": "download_no_path", "details": details}
-            data = Path(p).read_bytes()
-            if not _sniff_pdf_bytes(data):
-                return {"ok": False, "reason": "download_not_pdf", "details": details}
-            return {"ok": True, "pdf_bytes": data, "filename": filename, "source_url": href or page.url, "details": details}
-        except Exception as e:
-            return {"ok": False, "reason": str(e), "details": details}
 
-    if strategy_name == "expect_response_click":
-        try:
-            with page.expect_response(
-                lambda r: (".pdf" in (r.url or "").lower()) or ("downloads/rfq/" in (r.url or "").lower()),
-                timeout=timeout_ms,
-            ) as info:
-                el.click(timeout=3000)
-            r = info.value
-            data = r.body()
-            details["response_url"] = r.url
-            details["status"] = getattr(r, "status", None)
-            if not _sniff_pdf_bytes(data):
-                return {"ok": False, "reason": "response_not_pdf", "details": details}
-            filename = Path((r.url or href or "official.pdf").split("?")[0]).name or "official.pdf"
-            return {"ok": True, "pdf_bytes": data, "filename": filename, "source_url": r.url or href or page.url, "details": details}
-        except Exception as e:
-            return {"ok": False, "reason": str(e), "details": details}
+def _collect_sam_file_candidates(opp: Opportunity) -> list[dict[str, str]]:
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
+    detail_payload = _fetch_sam_notice_detail(opp)
+    candidates: list[dict[str, str]] = []
 
-    if strategy_name == "js_dispatch_click_with_response":
-        try:
-            with page.expect_response(
-                lambda r: (".pdf" in (r.url or "").lower()) or ("downloads/rfq/" in (r.url or "").lower()),
-                timeout=timeout_ms,
-            ) as info:
-                page.evaluate(
-                    """({selector, index}) => {
-                        const nodes = Array.from(document.querySelectorAll(selector));
-                        const el = nodes[index];
-                        if (!el) throw new Error('js_target_not_found');
-                        el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                    }""",
-                    {"selector": sel, "index": idx},
-                )
-            r = info.value
-            data = r.body()
-            details["response_url"] = r.url
-            details["status"] = getattr(r, "status", None)
-            if not _sniff_pdf_bytes(data):
-                return {"ok": False, "reason": "response_not_pdf", "details": details}
-            filename = Path((r.url or href or "official.pdf").split("?")[0]).name or "official.pdf"
-            return {"ok": True, "pdf_bytes": data, "filename": filename, "source_url": r.url or href or page.url, "details": details}
-        except Exception as e:
-            return {"ok": False, "reason": str(e), "details": details}
+    for payload in [raw_payload, detail_payload]:
+        for key in ("resourceLinks", "attachments", "attachmentLinks", "fileLinks"):
+            candidates.extend(_extract_urlish_candidates(payload.get(key), default_label=key))
 
-    if strategy_name == "expect_popup_then_page_pdf":
-        popup = None
+    return _dedupe_candidates(candidates)
+
+
+def _collect_sam_file_candidates_from_page(opp: Opportunity) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
         try:
-            with page.expect_popup(timeout=timeout_ms) as info:
-                el.click(timeout=3000)
-            popup = info.value
-            try:
-                popup.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-            except Exception:
-                pass
-            details["popup_url"] = popup.url
-            return {"ok": False, "reason": "popup_opened_no_bytes", "details": details}
-        except Exception as e:
-            return {"ok": False, "reason": str(e), "details": details}
+            page.goto(opp.url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
+            rows = page.eval_on_selector_all(
+                "app-attachments a[href], #attachments a[href], #links-attachments a[href], #files a[href]",
+                "els => els.map(el => ({ href: el.href, text: (el.innerText || '').trim() }))",
+            )
+            for row in rows:
+                href = row.get("href")
+                text = row.get("text")
+                if href:
+                    candidates.append({"url": str(href), "label": str(text or href)})
         finally:
-            if popup:
-                try:
-                    popup.close()
-                except Exception:
-                    pass
+            browser.close()
+    return _dedupe_candidates(candidates)
 
-    return {"ok": False, "reason": "unknown_strategy", "details": details}
+
+def _looks_like_downloadable_file(url: str, content_type: str | None) -> bool:
+    path = (urlparse(url).path or "").lower()
+    if any(
+        path.endswith(ext)
+        for ext in (
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".xls",
+            ".xlsx",
+            ".ppt",
+            ".pptx",
+            ".zip",
+            ".txt",
+            ".csv",
+            ".xml",
+            ".json",
+            ".rtf",
+        )
+    ):
+        return True
+    content_type = (content_type or "").lower()
+    if not content_type:
+        return False
+    if content_type.startswith("text/html"):
+        return False
+    return True
 
 
 def download_pdfs_for_opportunity(
@@ -392,7 +493,7 @@ def download_pdfs_for_opportunity(
     folder = _safe_dirname(sol)
     if base_dir is None:
         base_dir = str(Path.cwd() / "exports")
-    out_dir = _ensure_dir(Path(base_dir) / folder / "pdfs")
+    out_dir = _ensure_dir(Path(base_dir) / folder / "documents")
 
     created = 0
     skipped = 0
@@ -401,116 +502,147 @@ def download_pdfs_for_opportunity(
     official_pdf_filename = None
     official_pdf_error = None
     debug_log_path = None
-    detail_url = f"https://dibbs2.bsm.dla.mil/Downloads/RFQ/5/{sol_compact}.PDF" if sol_compact else None
+    downloaded_files: list[dict[str, str]] = []
+    detail_url = None
+    snapshot = None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
+    if (opp.source or "").upper() == "SAM":
+        sam_candidates = _dedupe_candidates(
+            _collect_sam_file_candidates(opp) + _collect_sam_file_candidates_from_page(opp)
+        )
+        if not sam_candidates:
+            official_pdf_error = "no_sam_attachments_found"
+            errors.append("SAM opportunity did not expose any attachment/resource links.")
+        for candidate in sam_candidates:
+            result = _download_binary_via_requests(candidate["url"], referer=opp.url)
+            if not result.get("ok"):
+                errors.append(f"{candidate['url']} -> {result.get('reason', 'download_failed')}")
+                continue
+            final_url = result.get("final_url") or candidate["url"]
+            if not _looks_like_downloadable_file(final_url, result.get("content_type")):
+                errors.append(f"{candidate['url']} -> not_a_downloadable_file")
+                continue
 
-        page.goto(opp.url, wait_until="domcontentloaded", timeout=60000)
-        _stabilize_dibbs_page(page, opp)
+            filename = (
+                _content_disposition_filename(result.get("content_disposition"))
+                or candidate.get("label")
+                or _filename_from_url(final_url)
+                or "sam_attachment"
+            )
+            if "." not in filename:
+                ext = _extension_from_content_type(result.get("content_type"))
+                if ext:
+                    filename = f"{filename}{ext}"
 
-        net = NetworkCapture(sol_compact)
-        page.on("response", net.handler)
+            created_now, saved_name = _save_downloaded_file(
+                db,
+                opp,
+                out_dir,
+                filename,
+                final_url,
+                result["bytes"],
+                "SAM_ATTACHMENT",
+            )
+            created += created_now
+            if created_now == 0:
+                skipped += 1
+            downloaded_files.append(
+                {
+                    "filename": saved_name,
+                    "source_url": final_url,
+                    "file_type": "SAM_ATTACHMENT",
+                }
+            )
+    else:
+        detail_url = _preferred_dibbs_detail_pdf_url(opp) if prefer_dibbs_solicitation_detail else None
 
-        debug_payload: dict[str, Any] = {
-            "start_url": opp.url,
-            "page_url_before_attempt": page.url,
-            "solicitation_number": opp.solicitation_number,
-            "detail_url": detail_url,
-            "strategies": [],
-            "network_events": [],
-        }
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(accept_downloads=True)
+            page = context.new_page()
 
-        try:
-            cookies = context.cookies(["https://www.dibbs.bsm.dla.mil", "https://dibbs2.bsm.dla.mil"])
-        except Exception:
-            cookies = []
-        debug_payload["cookies"] = cookies
+            page.goto(opp.url, wait_until="domcontentloaded", timeout=60000)
+            _stabilize_dibbs_page(page, opp)
 
-        candidates = _candidate_locators(page, sol_compact)[:2]
-        debug_payload["candidates"] = candidates
+            try:
+                cookies = context.cookies(["https://www.dibbs.bsm.dla.mil", "https://dibbs2.bsm.dla.mil"])
+            except Exception:
+                cookies = []
 
-        if detail_url:
-            cookie_result = _download_via_requests(detail_url, page.url, cookies)
-            debug_payload["strategies"].append({
-                "candidate": {"selector": "direct_cookie_request", "href": detail_url, "text": None, "index": 0},
-                "strategy": "direct_cookie_request",
-                "ok": cookie_result.get("ok", False),
-                "reason": cookie_result.get("reason"),
-                "details": cookie_result.get("details"),
-            })
-            if cookie_result.get("ok"):
-                data = cookie_result["pdf_bytes"]
-                filename = cookie_result.get("filename") or f"{sol_compact}.PDF"
-                source_url = cookie_result.get("source_url") or detail_url
-                created_now, saved_name = _save_official_pdf(db, opp, out_dir, filename, source_url, data)
+            dibbs_candidates = _collect_dibbs_file_candidates(opp, page=page)
+            if detail_url:
+                dibbs_candidates = _dedupe_candidates(
+                    [{"url": detail_url, "label": Path(detail_url).name}] + dibbs_candidates
+                )
+
+            debug_payload: dict[str, Any] = {
+                "start_url": opp.url,
+                "page_url": page.url,
+                "solicitation_number": opp.solicitation_number,
+                "detail_url": detail_url,
+                "dibbs_candidates": dibbs_candidates,
+            }
+
+            for candidate in dibbs_candidates:
+                result = _download_binary_via_requests(candidate["url"], referer=page.url, cookies=cookies)
+                if not result.get("ok"):
+                    errors.append(f"{candidate['url']} -> {result.get('reason', 'download_failed')}")
+                    continue
+                if not _sniff_pdf_bytes(result["bytes"]):
+                    errors.append(f"{candidate['url']} -> not_a_pdf")
+                    continue
+
+                filename = (
+                    _content_disposition_filename(result.get("content_disposition"))
+                    or candidate.get("label")
+                    or _filename_from_url(result.get("final_url") or candidate["url"])
+                    or f"{sol_compact or opp.id}.pdf"
+                )
+                if not filename.lower().endswith(".pdf"):
+                    filename = f"{filename}.pdf"
+
+                created_now, saved_name = _save_downloaded_file(
+                    db,
+                    opp,
+                    out_dir,
+                    filename,
+                    result.get("final_url") or candidate["url"],
+                    result["bytes"],
+                    "DIBBS_ATTACHMENT",
+                )
                 created += created_now
                 if created_now == 0:
                     skipped += 1
-                official_pdf_saved = True
-                official_pdf_filename = saved_name
+                else:
+                    official_pdf_saved = True
+                    official_pdf_filename = saved_name
 
-        strategy_order = [
-            "expect_download_click",
-            "expect_response_click",
-            "js_dispatch_click_with_response",
-            "expect_popup_then_page_pdf",
-        ]
+                downloaded_files.append(
+                    {
+                        "filename": saved_name,
+                        "source_url": result.get("final_url") or candidate["url"],
+                        "file_type": "DIBBS_ATTACHMENT",
+                    }
+                )
 
-        if not official_pdf_saved:
-            for cand in candidates:
-                for strat in strategy_order:
-                    result = _run_strategy(page, cand, strat, timeout_ms=5000)
-                    debug_payload["strategies"].append({
-                        "candidate": cand,
-                        "strategy": strat,
-                        "ok": result.get("ok", False),
-                        "reason": result.get("reason"),
-                        "details": result.get("details"),
-                    })
-                    if result.get("ok"):
-                        data = result["pdf_bytes"]
-                        filename = result.get("filename") or f"{sol_compact}.PDF"
-                        source_url = result.get("source_url") or detail_url or page.url
-                        created_now, saved_name = _save_official_pdf(db, opp, out_dir, filename, source_url, data)
-                        created += created_now
-                        if created_now == 0:
-                            skipped += 1
-                        official_pdf_saved = True
-                        official_pdf_filename = saved_name
-                        break
-                if official_pdf_saved:
-                    break
+            if not downloaded_files:
+                official_pdf_error = "no_dibbs_pdfs_downloaded"
 
-        if not official_pdf_saved:
-            debug_payload["network_events"] = net.events[:20]
-            official_pdf_error = "all_strategies_failed"
-            errors.append(f"{detail_url} -> {official_pdf_error}")
+            try:
+                debug_log_path = _write_debug_log(out_dir, opp, debug_payload)
+            except Exception as exc:
+                errors.append(f"debug_log_write_failed -> {exc}")
 
-        debug_payload["page_url_after_attempt"] = page.url
-        debug_payload["official_pdf_saved"] = official_pdf_saved
-        debug_payload["official_pdf_filename"] = official_pdf_filename
-        debug_payload["official_pdf_error"] = official_pdf_error
+            if always_snapshot:
+                c, s, e = _create_snapshot_pdf(db, opp, page, out_dir)
+                created += c
+                skipped += s
+                snapshot = {"created": c, "skipped": s, "error": e, "url": page.url}
 
-        try:
-            debug_log_path = _write_debug_log(out_dir, opp, debug_payload)
-        except Exception as e:
-            debug_log_path = None
-            errors.append(f"debug_log_write_failed -> {e}")
+            context.close()
+            browser.close()
 
-        snap_info = {"created": 0, "skipped": 0, "error": None, "url": page.url}
-        if always_snapshot:
-            c, s, e = _create_snapshot_pdf(db, opp, page, out_dir)
-            created += c
-            skipped += s
-            snap_info = {"created": c, "skipped": s, "error": e, "url": page.url}
-
-        context.close()
-        browser.close()
-
-    return {
+    result = {
         "created": created,
         "skipped": skipped,
         "errors": errors,
@@ -520,6 +652,29 @@ def download_pdfs_for_opportunity(
         "official_pdf_filename": official_pdf_filename,
         "official_pdf_error": official_pdf_error,
         "debug_log_path": debug_log_path,
-        "snapshot": snap_info if always_snapshot else None,
+        "snapshot": snapshot if always_snapshot else None,
+        "downloaded_files": downloaded_files,
         "folder": str(out_dir),
     }
+    try:
+        result["processing"] = process_opportunity_documents(db, opp.id, force=False)
+    except Exception as exc:
+        result["processing_error"] = str(exc)
+    try:
+        from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs
+
+        result["provider_vendor_sync"] = extract_providers_from_opportunity_pdfs(
+            db,
+            opp,
+            enrich_with_sam=True,
+            organization_id=getattr(opp, "organization_id", None),
+        ).model_dump()
+    except Exception as exc:
+        result["provider_vendor_sync_error"] = str(exc)
+    try:
+        from app.services.pricing_intelligence import extract_price_history_for_opportunity
+
+        result["pricing_intelligence"] = extract_price_history_for_opportunity(db, opp)
+    except Exception as exc:
+        result["pricing_intelligence_error"] = str(exc)
+    return result

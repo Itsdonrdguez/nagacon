@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models.opportunity import Opportunity
@@ -21,6 +21,28 @@ def _clean(v: str | None) -> str | None:
         return None
     s = str(v).strip()
     return s or None
+
+
+def _scope_vendor_leads(query, organization_id: int | None):
+    if organization_id is not None:
+        query = query.filter(
+            or_(
+                VendorLead.organization_id == organization_id,
+                VendorLead.organization_id.is_(None),
+            )
+        )
+    return query
+
+
+def _scope_vendor_quotes(query, organization_id: int | None):
+    if organization_id is not None:
+        query = query.filter(
+            or_(
+                VendorQuote.organization_id == organization_id,
+                VendorQuote.organization_id.is_(None),
+            )
+        )
+    return query
 
 
 def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
@@ -59,6 +81,9 @@ def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, in
         rec = q.first()
         if rec:
             touched = False
+            if rec.organization_id is None and getattr(opp, "organization_id", None) is not None:
+                rec.organization_id = getattr(opp, "organization_id", None)
+                touched = True
             if not rec.nsn and nsn:
                 rec.nsn = nsn
                 touched = True
@@ -83,6 +108,7 @@ def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, in
             continue
 
         db.add(VendorLead(
+            organization_id=getattr(opp, "organization_id", None),
             opportunity_id=opp.id,
             source_type="APPROVED_SOURCE",
             company_name=company_name,
@@ -106,22 +132,24 @@ def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, in
     }
 
 
-def list_vendor_leads(db: Session, opportunity_id: int) -> list[VendorLead]:
+def list_vendor_leads(db: Session, opportunity_id: int, organization_id: int | None = None) -> list[VendorLead]:
+    query = db.query(VendorLead).filter(VendorLead.opportunity_id == opportunity_id)
+    query = _scope_vendor_leads(query, organization_id)
     return (
-        db.query(VendorLead)
-        .filter(VendorLead.opportunity_id == opportunity_id)
+        query
         .order_by(VendorLead.confidence.desc(), VendorLead.company_name.asc().nullslast(), VendorLead.cage.asc().nullslast(), VendorLead.part_number.asc().nullslast())
         .all()
     )
 
 
-def update_vendor_lead(db: Session, opportunity_id: int, lead_id: int, patch: dict[str, Any]) -> VendorLead:
+def update_vendor_lead(db: Session, opportunity_id: int, lead_id: int, patch: dict[str, Any], organization_id: int | None = None) -> VendorLead:
     rec = (
         db.query(VendorLead)
         .filter(VendorLead.opportunity_id == opportunity_id)
         .filter(VendorLead.id == lead_id)
-        .first()
     )
+    rec = _scope_vendor_leads(rec, organization_id)
+    rec = rec.first()
     if not rec:
         raise ValueError("vendor lead not found")
 
@@ -130,6 +158,8 @@ def update_vendor_lead(db: Session, opportunity_id: int, lead_id: int, patch: di
         rec.status = st if st in LEAD_ALLOWED_STATUSES else rec.status
     if "notes" in patch:
         rec.notes = patch["notes"]
+    if rec.organization_id is None and organization_id is not None:
+        rec.organization_id = organization_id
 
     rec.updated_at = datetime.utcnow()
     db.commit()
@@ -137,9 +167,42 @@ def update_vendor_lead(db: Session, opportunity_id: int, lead_id: int, patch: di
     return rec
 
 
+def promote_vendor_lead_to_quote_request(db: Session, opportunity_id: int, lead_id: int, organization_id: int | None = None) -> dict[str, Any]:
+    rec = (
+        db.query(VendorLead)
+        .filter(VendorLead.opportunity_id == opportunity_id)
+        .filter(VendorLead.id == lead_id)
+    )
+    rec = _scope_vendor_leads(rec, organization_id)
+    rec = rec.first()
+    if not rec:
+        raise ValueError("vendor lead not found")
+
+    touched = False
+    if rec.organization_id is None and organization_id is not None:
+        rec.organization_id = organization_id
+        touched = True
+    if rec.status not in {"SHORTLISTED", "SEEDED_TO_QUOTES"}:
+        rec.status = "SHORTLISTED"
+        touched = True
+    if touched:
+        rec.updated_at = datetime.utcnow()
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+
+    return {
+        "lead_id": rec.id,
+        "company_name": rec.company_name,
+        "cage": rec.cage,
+        "status": rec.status,
+        "notes": rec.notes,
+    }
+
+
 def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
     lead_stats = sync_vendor_leads_from_parsed(db, opp)
-    leads = list_vendor_leads(db, opp.id)
+    leads = list_vendor_leads(db, opp.id, organization_id=getattr(opp, "organization_id", None))
     created = 0
     shortlisted = 0
 
@@ -156,6 +219,7 @@ def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
             .filter(VendorQuote.opportunity_id == opp.id)
             .filter(VendorQuote.cage == cage)
         )
+        q = _scope_vendor_quotes(q, getattr(opp, "organization_id", None))
         if part_number is None:
             q = q.filter(VendorQuote.part_number.is_(None))
         else:
@@ -164,6 +228,9 @@ def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
         existing = q.first()
         if existing:
             touched = False
+            if existing.organization_id is None and getattr(opp, "organization_id", None) is not None:
+                existing.organization_id = getattr(opp, "organization_id", None)
+                touched = True
             if (not existing.company_name) and company_name:
                 existing.company_name = company_name
                 touched = True
@@ -175,6 +242,7 @@ def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
             continue
 
         db.add(VendorQuote(
+            organization_id=getattr(opp, "organization_id", None),
             opportunity_id=opp.id,
             cage=cage,
             company_name=company_name,
@@ -198,16 +266,17 @@ def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
     }
 
 
-def list_quotes(db: Session, opportunity_id: int) -> list[VendorQuote]:
+def list_quotes(db: Session, opportunity_id: int, organization_id: int | None = None) -> list[VendorQuote]:
+    query = db.query(VendorQuote).filter(VendorQuote.opportunity_id == opportunity_id)
+    query = _scope_vendor_quotes(query, organization_id)
     return (
-        db.query(VendorQuote)
-        .filter(VendorQuote.opportunity_id == opportunity_id)
+        query
         .order_by(VendorQuote.company_name.asc().nullslast(), VendorQuote.cage.asc(), VendorQuote.part_number.asc().nullslast())
         .all()
     )
 
 
-def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str | None, patch: dict[str, Any]) -> VendorQuote:
+def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str | None, patch: dict[str, Any], organization_id: int | None = None) -> VendorQuote:
     cage = cage.strip()
     if not cage:
         raise ValueError("cage required")
@@ -217,6 +286,7 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
         .filter(VendorQuote.opportunity_id == opportunity_id)
         .filter(VendorQuote.cage == cage)
     )
+    q = _scope_vendor_quotes(q, organization_id)
 
     if part_number is None or str(part_number).strip() == "":
         part_db = None
@@ -227,7 +297,14 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
 
     rec = q.first()
     if not rec:
-        rec = VendorQuote(opportunity_id=opportunity_id, cage=cage, part_number=part_db, status=DEFAULT_STATUS)
+        opp = db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
+        rec = VendorQuote(
+            organization_id=getattr(opp, "organization_id", None),
+            opportunity_id=opportunity_id,
+            cage=cage,
+            part_number=part_db,
+            status=DEFAULT_STATUS,
+        )
         db.add(rec)
         db.flush()
 
@@ -243,6 +320,8 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
     if "status" in patch and patch["status"]:
         st = str(patch["status"]).strip().upper()
         rec.status = st if st in ALLOWED_STATUSES else DEFAULT_STATUS
+    if rec.organization_id is None and organization_id is not None:
+        rec.organization_id = organization_id
 
     rec.updated_at = datetime.utcnow()
     db.commit()

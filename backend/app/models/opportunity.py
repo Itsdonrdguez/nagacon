@@ -14,6 +14,7 @@ class Opportunity(Base):
     __tablename__ = "opportunities"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), index=True, nullable=True)
 
     source: Mapped[str] = mapped_column(String(50), index=True)
     source_opportunity_id: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
@@ -90,7 +91,7 @@ class Opportunity(Base):
 
     @property
     def workspace_url(self):
-        return f"/workspace?opp_id={self.id}"
+        return f"/workspace/{self.id}"
 
     @property
     def workspace_api_url(self):

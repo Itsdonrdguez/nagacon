@@ -1,29 +1,65 @@
-import React from 'react'
+import React, { Suspense, lazy } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { ThemeProvider, NotificationProvider } from './contexts'
 import App from './App'
-import Dashboard from './pages/Dashboard'
-import Opportunities from './pages/Opportunities'
-import Workspace from './pages/Workspace'
-import Vendors from './pages/Vendors'
+import LoadingState from './components/ui/LoadingState/LoadingState'
 import './styles.css'
 
-const queryClient = new QueryClient()
+const Dashboard = lazy(() => import('./pages/Dashboard'))
+const Opportunities = lazy(() => import('./pages/Opportunities'))
+const Workspace = lazy(() => import('./pages/Workspace'))
+const Vendors = lazy(() => import('./pages/Vendors'))
+const Providers = lazy(() => import('./pages/Providers'))
+const NSNIntelligence = lazy(() => import('./pages/NSNIntelligence'))
+const Company = lazy(() => import('./pages/Company'))
+const Ingestion = lazy(() => import('./pages/Ingestion'))
+const Pipeline = lazy(() => import('./pages/Pipeline'))
+const Settings = lazy(() => import('./pages/Settings'))
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000, // 5 minutes
+      retry: 1,
+    },
+  },
+})
+
+function PageFallback() {
+  return (
+    <div className="page">
+      <LoadingState label="Loading page..." />
+    </div>
+  )
+}
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<App />}>
-            <Route index element={<Dashboard />} />
-            <Route path="opportunities" element={<Opportunities />} />
-            <Route path="workspace/:id" element={<Workspace />} />
-            <Route path="vendors" element={<Vendors />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
+      <ThemeProvider>
+        <NotificationProvider>
+          <BrowserRouter>
+            <Suspense fallback={<PageFallback />}>
+              <Routes>
+                <Route path="/" element={<App />}>
+                  <Route index element={<Dashboard />} />
+                  <Route path="company" element={<Company />} />
+                  <Route path="ingestion" element={<Ingestion />} />
+                  <Route path="opportunities" element={<Opportunities />} />
+                  <Route path="pipeline" element={<Pipeline />} />
+                  <Route path="settings" element={<Settings />} />
+                  <Route path="workspace/:id" element={<Workspace />} />
+                  <Route path="vendors" element={<Vendors />} />
+                  <Route path="providers" element={<Providers />} />
+                  <Route path="nsn-intelligence" element={<NSNIntelligence />} />
+                </Route>
+              </Routes>
+            </Suspense>
+          </BrowserRouter>
+        </NotificationProvider>
+      </ThemeProvider>
     </QueryClientProvider>
   </React.StrictMode>
 )

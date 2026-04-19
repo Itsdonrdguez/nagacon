@@ -12,6 +12,7 @@ class WorkspaceArtifact(Base):
     __tablename__ = "workspace_artifacts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), index=True, nullable=True)
     opportunity_id: Mapped[int] = mapped_column(
         ForeignKey("opportunities.id", ondelete="CASCADE"),
         index=True,
@@ -30,6 +31,7 @@ class WorkspaceTask(Base):
     __tablename__ = "workspace_tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), index=True, nullable=True)
     opportunity_id: Mapped[int] = mapped_column(
         ForeignKey("opportunities.id", ondelete="CASCADE"),
         index=True,

@@ -96,6 +96,8 @@ def seed_vendor_leads_from_dibbs_approved_sources(db: Session, opportunity_id: i
         notes = "; ".join(note_bits)
 
         if existing:
+            if existing.organization_id is None and getattr(opportunity, "organization_id", None) is not None:
+                existing.organization_id = getattr(opportunity, "organization_id", None)
             existing.source_type = "DIBBS_APPROVED_SOURCE"
             existing.company_name = company_name or existing.company_name
             existing.cage = cage or existing.cage
@@ -110,6 +112,7 @@ def seed_vendor_leads_from_dibbs_approved_sources(db: Session, opportunity_id: i
             updated += 1
         else:
             lead = VendorLead(
+                organization_id=getattr(opportunity, "organization_id", None),
                 opportunity_id=opportunity_id,
                 source_type="DIBBS_APPROVED_SOURCE",
                 company_name=company_name,

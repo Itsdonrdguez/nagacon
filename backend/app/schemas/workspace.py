@@ -25,6 +25,13 @@ class TaskCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class TaskUpdate(BaseModel):
+    task_type: Optional[str] = None
+    status: Optional[str] = None
+    due_at: Optional[datetime] = None
+    notes: Optional[str] = None
+
+
 class TaskOut(BaseModel):
     id: int
     opportunity_id: int
@@ -40,3 +47,8 @@ class TaskOut(BaseModel):
 
 class GenerateIn(BaseModel):
     opportunity_id: int
+
+
+class ArtifactUpdate(BaseModel):
+    title: Optional[str] = None
+    content_json: Optional[dict[str, Any]] = None

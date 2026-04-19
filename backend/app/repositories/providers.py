@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
@@ -57,6 +57,20 @@ def _display_source(value: str | None) -> str:
     if text.upper() == "USASPENDING":
         return "USAspending"
     return text.title()
+
+
+def _unique(values: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None or value == "":
+            continue
+        key = str(value).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
 
 
 class ProviderRepository:
@@ -224,7 +238,7 @@ class ProviderRepository:
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
         org_id = self._org_id()
-        query = self.db.query(Provider, ProviderItem).outerjoin(ProviderItem, ProviderItem.provider_id == Provider.id)
+        query = self.db.query(Provider.id).outerjoin(ProviderItem, ProviderItem.provider_id == Provider.id)
         if org_id is not None:
             query = query.filter(Provider.organization_id == org_id)
         if q:
@@ -250,14 +264,39 @@ class ProviderRepository:
         if source and source != "all":
             query = query.filter(ProviderItem.source == source)
 
-        total = query.count()
-        rows = query.order_by(Provider.updated_at.desc(), Provider.id.desc()).offset(offset).limit(limit).all()
-        return [self._row_dict(provider, item) for provider, item in rows], total
+        distinct_ids = query.distinct()
+        total = distinct_ids.count()
+        page_ids = [
+            row[0]
+            for row in distinct_ids
+            .order_by(Provider.id.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        ]
+        if not page_ids:
+            return [], total
 
-    def _row_dict(self, provider: Provider, item: ProviderItem | None) -> dict[str, Any]:
+        providers = (
+            self.db.query(Provider)
+            .options(selectinload(Provider.items))
+            .filter(Provider.id.in_(page_ids))
+            .all()
+        )
+        provider_by_id = {provider.id: provider for provider in providers}
+        return [self._row_dict(provider_by_id[provider_id]) for provider_id in page_ids if provider_id in provider_by_id], total
+
+    def _row_dict(self, provider: Provider, item: ProviderItem | None = None) -> dict[str, Any]:
+        item_rows = sorted(
+            list(getattr(provider, "items", None) or []),
+            key=lambda row: (float(getattr(row, "confidence", None) or 0), getattr(row, "id", 0)),
+            reverse=True,
+        )
+        primary = item or (item_rows[0] if item_rows else None)
+        item_summaries = [self._item_summary(row) for row in item_rows]
         return {
             "provider_id": provider.id,
-            "provider_item_id": item.id if item else None,
+            "provider_item_id": primary.id if primary else None,
             "company_name": provider.company_name,
             "canonical_name": provider.canonical_name,
             "identity_source": provider.identity_source,
@@ -271,15 +310,34 @@ class ProviderRepository:
             "phone": provider.phone,
             "provider_notes": provider.notes,
             "status": provider.status,
-            "nsn": item.nsn if item else None,
-            "fsc": item.fsc if item else None,
-            "nomenclature": item.nomenclature if item else None,
-            "relationship_type": item.relationship_type if item else None,
-            "source": item.source if item else None,
-            "source_url": item.source_url if item else None,
-            "confidence": item.confidence if item else None,
-            "item_notes": item.notes if item else None,
+            "nsn": primary.nsn if primary else None,
+            "fsc": primary.fsc if primary else None,
+            "nomenclature": primary.nomenclature if primary else None,
+            "relationship_type": primary.relationship_type if primary else None,
+            "source": primary.source if primary else None,
+            "source_url": primary.source_url if primary else None,
+            "confidence": primary.confidence if primary else None,
+            "item_notes": primary.notes if primary else None,
+            "item_count": len(item_rows),
+            "relationship_types": _unique([row.relationship_type for row in item_rows]),
+            "sources": _unique([row.source for row in item_rows]),
+            "nsns": _unique([row.nsn for row in item_rows]),
+            "fscs": _unique([row.fsc for row in item_rows]),
+            "item_summaries": item_summaries,
             "updated_at": provider.updated_at,
+        }
+
+    def _item_summary(self, item: ProviderItem) -> dict[str, Any]:
+        return {
+            "provider_item_id": item.id,
+            "nsn": item.nsn,
+            "fsc": item.fsc,
+            "nomenclature": item.nomenclature,
+            "relationship_type": item.relationship_type,
+            "source": item.source,
+            "source_url": item.source_url,
+            "confidence": item.confidence,
+            "notes": item.notes,
         }
 
     def import_csv(self, content: str) -> ProviderImportResult:

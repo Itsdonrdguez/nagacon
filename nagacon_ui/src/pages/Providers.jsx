@@ -147,8 +147,11 @@ export default function Providers() {
   const sourceCounts = useMemo(() => {
     const counts = {}
     rows.forEach((row) => {
-      const key = row.source || 'No Source'
-      counts[key] = (counts[key] || 0) + 1
+      const sources = row.sources?.length ? row.sources : [row.source || 'No Source']
+      sources.forEach((source) => {
+        const key = source || 'No Source'
+        counts[key] = (counts[key] || 0) + 1
+      })
     })
     return counts
   }, [rows])
@@ -343,17 +346,45 @@ export default function Providers() {
               </TableHeader>
               <TableBody>
                 {rows.map((row) => (
-                  <TableRow key={`${row.provider_id}-${row.provider_item_id || 'provider'}`}>
+                  <TableRow key={row.provider_id}>
                     <TableCell>
                       <div className="row-title">{row.company_name}</div>
-                      <div className="row-subtitle">{row.cage ? `CAGE ${row.cage}` : 'CAGE not set'}{row.email ? ` | ${row.email}` : ''}</div>
+                      <div className="row-subtitle">
+                        {row.cage ? `CAGE ${row.cage}` : 'CAGE not set'}
+                        {row.email ? ` | ${row.email}` : ''}
+                        {row.item_count ? ` | ${row.item_count} item link${row.item_count === 1 ? '' : 's'}` : ''}
+                      </div>
                     </TableCell>
                     <TableCell>
-                      <div className="row-title">{row.nomenclature || 'Item not specified'}</div>
-                      <div className="row-subtitle">{row.nsn || 'NSN not set'}{row.fsc ? ` | FSC ${row.fsc}` : ''}</div>
+                      {(row.item_summaries || []).slice(0, 3).map((item) => (
+                        <div key={item.provider_item_id || `${item.nsn}-${item.relationship_type}`} className="provider-item-line">
+                          <div className="row-title">{item.nomenclature || item.nsn || 'Item not specified'}</div>
+                          <div className="row-subtitle">
+                            {item.nsn || 'NSN not set'}
+                            {item.fsc ? ` | FSC ${item.fsc}` : ''}
+                            {item.source ? ` | ${item.source}` : ''}
+                          </div>
+                        </div>
+                      ))}
+                      {(row.item_summaries || []).length === 0 ? (
+                        <>
+                          <div className="row-title">{row.nomenclature || 'Item not specified'}</div>
+                          <div className="row-subtitle">{row.nsn || 'NSN not set'}{row.fsc ? ` | FSC ${row.fsc}` : ''}</div>
+                        </>
+                      ) : null}
+                      {(row.item_summaries || []).length > 3 ? (
+                        <div className="row-subtitle">+{row.item_summaries.length - 3} more item links</div>
+                      ) : null}
                     </TableCell>
-                    <TableCell><Badge label={row.relationship_type || 'Unknown'} variant="default" /></TableCell>
-                    <TableCell>{row.source || '-'}</TableCell>
+                    <TableCell>
+                      <div className="badge-stack">
+                        {(row.relationship_types?.length ? row.relationship_types : [row.relationship_type || 'Unknown']).slice(0, 4).map((type) => (
+                          <Badge key={type} label={type || 'Unknown'} variant="default" />
+                        ))}
+                        {(row.relationship_types || []).length > 4 ? <Badge label={`+${row.relationship_types.length - 4}`} variant="info" /> : null}
+                      </div>
+                    </TableCell>
+                    <TableCell>{(row.sources?.length ? row.sources : [row.source]).filter(Boolean).join(', ') || '-'}</TableCell>
                     <TableCell>
                       {row.website ? (
                         <a href={row.website} target="_blank" rel="noreferrer">Open</a>

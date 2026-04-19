@@ -60,6 +60,17 @@ def test_resolve_provider_identity_uses_official_cage_profile():
 
 
 def test_provider_row_dict_returns_empty_alias_list_for_existing_rows():
+    item = SimpleNamespace(
+        id=11,
+        nsn="4110-01-534-2682",
+        fsc="4110",
+        nomenclature="Refrigeration Unit",
+        relationship_type="Confirmed Awardee",
+        source="USAspending",
+        source_url="AWD-1",
+        confidence=95,
+        notes="Award evidence",
+    )
     provider = SimpleNamespace(
         id=7,
         company_name="Acme Defense",
@@ -75,9 +86,14 @@ def test_provider_row_dict_returns_empty_alias_list_for_existing_rows():
         phone=None,
         notes=None,
         status="active",
+        items=[item],
         updated_at=datetime(2026, 4, 19),
     )
 
     row = ProviderRepository(object())._row_dict(provider, None)
 
     assert row["aliases"] == []
+    assert row["item_count"] == 1
+    assert row["relationship_types"] == ["Confirmed Awardee"]
+    assert row["sources"] == ["USAspending"]
+    assert row["item_summaries"][0]["provider_item_id"] == 11

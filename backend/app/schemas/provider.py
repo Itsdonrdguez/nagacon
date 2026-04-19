@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -96,6 +96,12 @@ class ProviderRowOut(BaseModel):
     source_url: Optional[str] = None
     confidence: Optional[float] = None
     item_notes: Optional[str] = None
+    item_count: int = 0
+    relationship_types: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    nsns: list[str] = Field(default_factory=list)
+    fscs: list[str] = Field(default_factory=list)
+    item_summaries: list[dict[str, Any]] = Field(default_factory=list)
     updated_at: datetime
 
 

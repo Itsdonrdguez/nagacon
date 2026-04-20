@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.models.company_profile import CompanyProfile
 from app.schemas.opportunity import RawOpportunity
+from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
+from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
 from app.services.provider_settings_service import get_effective_sam_api_key
 from app.services.scrapers.dibbs_scraper import fetch_dibbs_opportunities
@@ -155,31 +157,45 @@ def _dedupe_raw_opportunities(raw_opps: list[RawOpportunity]) -> list[RawOpportu
     return unique
 
 
-def _ingest_many(db: Session, raw_opps: list[RawOpportunity]) -> dict[str, Any]:
+def _ingest_many(
+    db: Session,
+    raw_opps: list[RawOpportunity],
+    *,
+    organization_id: int | None = None,
+    collect_dibbs_ids: bool = False,
+) -> dict[str, Any]:
     inserted = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
+    dibbs_opportunity_ids: list[int] = []
 
     for raw in raw_opps:
         try:
-            result = upsert_raw_opportunity(db, raw, force_refresh=True)
+            result = upsert_raw_opportunity(db, raw, force_refresh=True, organization_id=organization_id)
             if result == "inserted":
                 inserted += 1
             elif result == "updated":
                 updated += 1
             else:
                 skipped += 1
+            if collect_dibbs_ids and str(raw.source or "").upper() == "DIBBS":
+                opp = find_existing_opportunity(db, raw)
+                if opp and getattr(opp, "id", None):
+                    dibbs_opportunity_ids.append(opp.id)
         except Exception as exc:
             db.rollback()
             errors.append(str(exc))
 
-    return {
+    out = {
         "inserted": inserted,
         "updated": updated,
         "skipped": skipped,
         "errors": errors,
     }
+    if collect_dibbs_ids:
+        out["dibbs_opportunity_ids"] = dibbs_opportunity_ids
+    return out
 
 
 def _filter_sam_by_naics(raw_opps: list[RawOpportunity], allowed_naics: list[str]) -> list[RawOpportunity]:
@@ -259,7 +275,17 @@ def run_company_profile_ingest(
         dibbs_results.append({"code": fsc_code, "raw_rows": len(rows)})
         dibbs_raw.extend(rows)
     dibbs_raw = _dedupe_raw_opportunities(dibbs_raw)
-    dibbs_ingest = _ingest_many(db, dibbs_raw)
+    organization_id = getattr(profile, "organization_id", None) if profile is not None else None
+    dibbs_ingest = _ingest_many(db, dibbs_raw, organization_id=organization_id, collect_dibbs_ids=True)
+    dibbs_ids = list(dibbs_ingest.pop("dibbs_opportunity_ids", []) or [])
+    if dibbs_ids:
+        dibbs_ingest["part_finder_enrichment"] = enrich_dibbs_opportunities_after_ingest(
+            db,
+            dibbs_ids,
+            organization_id=organization_id,
+            queue_nsn_build=False,
+            max_items=len(dibbs_ids),
+        )
     dibbs_ingest["errors"] = list(dict.fromkeys((dibbs_ingest.get("errors") or []) + dibbs_errors))
     dibbs_ingest["diagnostics"] = {
         "used_codes": plan["dibbs"]["fsc_codes"],
@@ -296,7 +322,7 @@ def run_company_profile_ingest(
             sam_results.append({"query": query, "raw_rows": 0, "naics_filtered_rows": 0, "error": str(exc)})
             sam_errors.append(str(exc))
     sam_raw = _dedupe_raw_opportunities(sam_raw)
-    sam_ingest = _ingest_many(db, sam_raw)
+    sam_ingest = _ingest_many(db, sam_raw, organization_id=organization_id)
     sam_ingest["errors"] = list(dict.fromkeys((sam_ingest.get("errors") or []) + sam_errors))
     sam_ingest["diagnostics"] = {
         "queries": sam_results,

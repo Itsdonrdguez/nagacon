@@ -106,6 +106,10 @@ def _find_existing(db: Session, raw: RawOpportunity) -> Opportunity | None:
     return None
 
 
+def find_existing_opportunity(db: Session, raw: RawOpportunity) -> Opportunity | None:
+    return _find_existing(db, raw)
+
+
 def _copy_field(existing: Opportunity, raw: RawOpportunity, field_name: str, force_refresh: bool) -> bool:
     incoming = _prepare_value(field_name, getattr(raw, field_name, None))
     current = getattr(existing, field_name, None)

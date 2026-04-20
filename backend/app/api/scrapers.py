@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.schemas.opportunity import RawOpportunity
+from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
+from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
 from app.services.provider_settings_service import get_effective_sam_api_key
 from app.services.scrapers.dibbs_scraper import fetch_dibbs_opportunities
@@ -147,31 +149,60 @@ def _dedupe_raw_opportunities(raw_opps: list[RawOpportunity]) -> list[RawOpportu
     return unique
 
 
-def _ingest_many(db: Session, raw_opps: list[RawOpportunity]) -> dict[str, Any]:
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ingest_many(
+    db: Session,
+    raw_opps: list[RawOpportunity],
+    *,
+    auto_enrich_dibbs: bool = False,
+    queue_nsn_build: bool = False,
+    organization_id: int | None = None,
+) -> dict[str, Any]:
     inserted = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
+    dibbs_opportunity_ids: list[int] = []
 
     for raw in raw_opps:
         try:
-            result = upsert_raw_opportunity(db, raw, force_refresh=True)
+            result = upsert_raw_opportunity(db, raw, force_refresh=True, organization_id=organization_id)
             if result == "inserted":
                 inserted += 1
             elif result == "updated":
                 updated += 1
             else:
                 skipped += 1
+            if str(raw.source or "").upper() == "DIBBS":
+                opp = find_existing_opportunity(db, raw)
+                if opp and getattr(opp, "id", None):
+                    dibbs_opportunity_ids.append(opp.id)
         except Exception as exc:
             db.rollback()
             errors.append(str(exc))
 
-    return {
+    out = {
         "inserted": inserted,
         "updated": updated,
         "skipped": skipped,
         "errors": errors,
     }
+    if auto_enrich_dibbs and dibbs_opportunity_ids:
+        out["part_finder_enrichment"] = enrich_dibbs_opportunities_after_ingest(
+            db,
+            dibbs_opportunity_ids,
+            organization_id=organization_id,
+            queue_nsn_build=queue_nsn_build,
+            max_items=len(dibbs_opportunity_ids),
+        )
+    return out
 
 
 @router.post("/sam/run")
@@ -211,7 +242,12 @@ def run_dibbs_scraper(
     payload = dict(payload or {})
     max_pages = int(payload.get("max_pages") or 4)
     raw_opps = fetch_dibbs_opportunities(params=payload, max_pages=max_pages)
-    out = _ingest_many(db, raw_opps)
+    out = _ingest_many(
+        db,
+        raw_opps,
+        auto_enrich_dibbs=_as_bool(payload.get("auto_enrich_parts"), True),
+        queue_nsn_build=_as_bool(payload.get("queue_nsn_build"), False),
+    )
     if payload.get("debug"):
         out["diagnostics"] = {
             "request_fsc": payload.get("fsc") or payload.get("fsc_code"),
@@ -463,7 +499,12 @@ def run_multi_source_search(
                 dibbs_raw = _dedupe_raw_opportunities(dibbs_raw)
 
                 if dibbs_raw:
-                    dibbs_result = _ingest_many(db, dibbs_raw)
+                    dibbs_result = _ingest_many(
+                        db,
+                        dibbs_raw,
+                        auto_enrich_dibbs=_as_bool(payload.get("auto_enrich_parts"), True),
+                        queue_nsn_build=_as_bool(payload.get("queue_nsn_build"), False),
+                    )
                     dibbs_result["diagnostics"] = {
                         "used_codes": dibbs_fsc_codes,
                         "per_code_limit": limit,

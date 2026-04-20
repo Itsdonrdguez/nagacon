@@ -4,6 +4,8 @@ from app.core.config import settings
 from app.services.app_settings_service import get_setting
 from app.services.org_service import ensure_default_organization
 
+SECRET_MASK = "********"
+
 
 def _org_id(db):
     org = ensure_default_organization(db)
@@ -25,14 +27,16 @@ def get_provider_settings(db) -> dict:
             "name": getattr(ensure_default_organization(db), "name", None),
             "slug": getattr(ensure_default_organization(db), "slug", None),
         } if ensure_default_organization(db) else None,
-        "sam_api_key": sam_api_key,
-        "openai_api_key": openai_api_key,
+        "sam_api_key": "",
+        "openai_api_key": "",
         "openai_model": openai_model,
         "smtp_host": smtp_host,
         "smtp_port": smtp_port,
         "smtp_from_email": smtp_from_email,
         "sam_configured": bool(sam_api_key or getattr(settings, "SAM_API_KEY", None)),
         "openai_configured": bool(openai_api_key or getattr(settings, "OPENAI_API_KEY", None)),
+        "sam_api_key_display": SECRET_MASK if bool(sam_api_key or getattr(settings, "SAM_API_KEY", None)) else "",
+        "openai_api_key_display": SECRET_MASK if bool(openai_api_key or getattr(settings, "OPENAI_API_KEY", None)) else "",
         "smtp_configured": bool((smtp_host or getattr(settings, "SMTP_HOST", None)) and (smtp_from_email or getattr(settings, "SMTP_FROM_EMAIL", None))),
     }
 

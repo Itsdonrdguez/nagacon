@@ -35,15 +35,15 @@ export default function Settings() {
 
   useEffect(() => {
     if (integrationSettingsQuery.data) {
-      setExternalApiKeysCsv(integrationSettingsQuery.data.external_api_keys_csv || '')
+      setExternalApiKeysCsv('')
     }
   }, [integrationSettingsQuery.data])
 
   useEffect(() => {
     if (providerSettingsQuery.data) {
       setProviderForm({
-        sam_api_key: providerSettingsQuery.data.sam_api_key || '',
-        openai_api_key: providerSettingsQuery.data.openai_api_key || '',
+        sam_api_key: '',
+        openai_api_key: '',
         openai_model: providerSettingsQuery.data.openai_model || 'gpt-4o-mini',
         smtp_host: providerSettingsQuery.data.smtp_host || '',
         smtp_port: providerSettingsQuery.data.smtp_port || '',
@@ -138,13 +138,13 @@ export default function Settings() {
               label="SAM API Key"
               value={providerForm.sam_api_key}
               onChange={(event) => setProviderForm((current) => ({ ...current, sam_api_key: event.target.value }))}
-              placeholder="SAM-..."
+              placeholder={providerSettingsQuery.data?.sam_configured ? 'Configured. Enter a new key to replace it.' : 'SAM-...'}
             />
             <Input
               label="OpenAI API Key"
               value={providerForm.openai_api_key}
               onChange={(event) => setProviderForm((current) => ({ ...current, openai_api_key: event.target.value }))}
-              placeholder="sk-..."
+              placeholder={providerSettingsQuery.data?.openai_configured ? 'Configured. Enter a new key to replace it.' : 'sk-...'}
             />
             <Input
               label="OpenAI Model"
@@ -183,6 +183,9 @@ export default function Settings() {
             {saveProviderMutation.error ? <span className="form-error">{saveProviderMutation.error.message || 'Failed to save provider settings.'}</span> : null}
           </div>
           <div className="panel-subtitle">
+            Secret values are hidden after saving. Leave a key blank to keep the current value.
+          </div>
+          <div className="panel-subtitle">
             Recommended low-cost starting model for NagaCon agent tests: <code>gpt-4o-mini</code>
           </div>
         </div>
@@ -208,10 +211,10 @@ export default function Settings() {
               className="textarea-field"
               value={externalApiKeysCsv}
               onChange={(event) => setExternalApiKeysCsv(event.target.value)}
-              placeholder="key-one, key-two, key-three"
+              placeholder={integrationSettingsQuery.data?.configured ? 'Configured keys are hidden. Enter replacement keys to rotate them.' : 'key-one, key-two, key-three'}
             />
             <div className="panel-subtitle">
-              Use commas to separate multiple keys.
+              Use commas to separate multiple keys. Leave blank to keep existing keys.
             </div>
           </div>
           <div className="company-form-actions">
@@ -228,7 +231,7 @@ export default function Settings() {
             <div className="row-title">Current status</div>
             <div className="row-subtitle">
               {integrationSettingsQuery.data?.configured
-                ? `${(integrationSettingsQuery.data.external_api_keys || []).length} external API key(s) configured.`
+                ? `${integrationSettingsQuery.data.external_api_key_count || 0} external API key(s) configured.`
                 : 'No external API keys configured yet.'}
             </div>
           </div>

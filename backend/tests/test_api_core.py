@@ -492,8 +492,76 @@ def test_settings_route_updates_external_api_keys(client, monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "saved"
-    assert payload["external_api_keys"] == ["alpha", "beta"]
+    assert payload["external_api_keys"] == ["********", "********"]
+    assert payload["external_api_keys_csv"] == ""
+    assert payload["external_api_key_count"] == 2
     assert payload["organization"]["slug"] == "default"
+
+
+def test_settings_route_preserves_existing_external_api_keys_on_blank_save(client, monkeypatch):
+    stored = {"value": "alpha, beta"}
+    default_org = SimpleNamespace(id=9, name="Default Organization", slug="default")
+
+    monkeypatch.setattr(
+        "app.api.routes.settings.get_setting",
+        lambda db, setting_key, default=None, organization_id=None: stored["value"] if setting_key == "external_api_keys" and organization_id == 9 else default,
+    )
+    monkeypatch.setattr("app.api.routes.settings.ensure_default_organization", lambda db: default_org)
+
+    def fake_upsert(db, setting_key, setting_value, organization_id=None):
+        stored["value"] = setting_value
+        return SimpleNamespace(id=5)
+
+    monkeypatch.setattr("app.api.routes.settings.upsert_setting", fake_upsert)
+
+    response = client.put("/api/settings/integrations", json={"external_api_keys_csv": ""})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert stored["value"] == "alpha, beta"
+    assert payload["external_api_keys"] == ["********", "********"]
+    assert payload["external_api_key_count"] == 2
+
+
+def test_provider_settings_blank_secret_fields_are_not_saved(client, monkeypatch):
+    saved_keys = []
+    default_org = SimpleNamespace(id=9, name="Default Organization", slug="default")
+
+    monkeypatch.setattr("app.api.routes.settings.ensure_default_organization", lambda db: default_org)
+
+    def fake_upsert(db, setting_key, setting_value, organization_id=None):
+        saved_keys.append((setting_key, setting_value))
+        return SimpleNamespace(id=5)
+
+    monkeypatch.setattr("app.api.routes.settings.upsert_setting", fake_upsert)
+    monkeypatch.setattr(
+        "app.api.routes.settings.get_provider_settings",
+        lambda db: {
+            "organization": {"id": 9, "name": "Default Organization", "slug": "default"},
+            "sam_api_key": "",
+            "openai_api_key": "",
+            "openai_model": "gpt-4o-mini",
+            "smtp_host": "",
+            "smtp_port": "",
+            "smtp_from_email": "",
+            "sam_configured": True,
+            "openai_configured": True,
+            "sam_api_key_display": "********",
+            "openai_api_key_display": "********",
+            "smtp_configured": False,
+        },
+    )
+
+    response = client.put(
+        "/api/settings/providers",
+        json={"sam_api_key": "", "openai_api_key": "", "openai_model": "gpt-4o-mini"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "saved"
+    assert "sam_api_key" not in [key for key, _ in saved_keys]
+    assert "openai_api_key" not in [key for key, _ in saved_keys]
 
 
 def test_current_organization_route_returns_default_org(client, monkeypatch):

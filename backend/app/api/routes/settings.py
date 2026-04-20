@@ -9,21 +9,36 @@ from app.services.org_service import ensure_default_organization
 from app.services.provider_settings_service import get_provider_settings
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+SECRET_MASK = "********"
+
+
+def _org_payload(org):
+    return {
+        "id": getattr(org, "id", None),
+        "name": getattr(org, "name", None),
+        "slug": getattr(org, "slug", None),
+    } if org else None
+
+
+def _split_keys(value: str | None) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _masked_keys(keys: list[str]) -> list[str]:
+    return [SECRET_MASK for _ in keys]
 
 
 @router.get("/integrations")
 def get_integration_settings(db: Session = Depends(get_db)):
     org = ensure_default_organization(db)
     raw = get_setting(db, "external_api_keys", default="", organization_id=getattr(org, "id", None)) or ""
-    keys = [item.strip() for item in raw.split(",") if item.strip()]
+    keys = _split_keys(raw)
     return {
-        "organization": {
-            "id": getattr(org, "id", None),
-            "name": getattr(org, "name", None),
-            "slug": getattr(org, "slug", None),
-        } if org else None,
-        "external_api_keys": keys,
-        "external_api_keys_csv": ", ".join(keys),
+        "organization": _org_payload(org),
+        "external_api_keys": _masked_keys(keys),
+        "external_api_keys_csv": "",
+        "external_api_key_count": len(keys),
+        "external_api_keys_display": ", ".join(_masked_keys(keys)),
         "configured": len(keys) > 0,
     }
 
@@ -31,19 +46,24 @@ def get_integration_settings(db: Session = Depends(get_db)):
 @router.put("/integrations")
 def update_integration_settings(payload: dict, db: Session = Depends(get_db)):
     org = ensure_default_organization(db)
+    org_id = getattr(org, "id", None)
+    existing_value = get_setting(db, "external_api_keys", default="", organization_id=org_id) or ""
     csv_value = (payload.get("external_api_keys_csv") or "").strip()
+    clear_requested = bool(payload.get("clear_external_api_keys"))
+    if not csv_value and existing_value and not clear_requested:
+        csv_value = existing_value
+    if clear_requested:
+        csv_value = ""
     record = upsert_setting(db, "external_api_keys", csv_value, organization_id=getattr(org, "id", None))
-    keys = [item.strip() for item in csv_value.split(",") if item.strip()]
+    keys = _split_keys(csv_value)
     return {
         "status": "saved",
         "record_id": getattr(record, "id", None),
-        "organization": {
-            "id": getattr(org, "id", None),
-            "name": getattr(org, "name", None),
-            "slug": getattr(org, "slug", None),
-        } if org else None,
-        "external_api_keys": keys,
-        "external_api_keys_csv": ", ".join(keys),
+        "organization": _org_payload(org),
+        "external_api_keys": _masked_keys(keys),
+        "external_api_keys_csv": "",
+        "external_api_key_count": len(keys),
+        "external_api_keys_display": ", ".join(_masked_keys(keys)),
         "configured": len(keys) > 0,
     }
 
@@ -58,11 +78,14 @@ def update_provider_settings(payload: dict, db: Session = Depends(get_db)):
     org = ensure_default_organization(db)
     org_id = getattr(org, "id", None)
 
-    def save(key: str, value: str | None):
-        upsert_setting(db, key, (value or "").strip(), organization_id=org_id)
+    def save(key: str, value: str | None, *, preserve_blank: bool = False, clear_key: str | None = None):
+        incoming = (value or "").strip()
+        if preserve_blank and not incoming and not payload.get(clear_key or ""):
+            return
+        upsert_setting(db, key, "" if payload.get(clear_key or "") else incoming, organization_id=org_id)
 
-    save("sam_api_key", payload.get("sam_api_key"))
-    save("openai_api_key", payload.get("openai_api_key"))
+    save("sam_api_key", payload.get("sam_api_key"), preserve_blank=True, clear_key="clear_sam_api_key")
+    save("openai_api_key", payload.get("openai_api_key"), preserve_blank=True, clear_key="clear_openai_api_key")
     save("openai_model", payload.get("openai_model"))
     save("smtp_host", payload.get("smtp_host"))
     save("smtp_port", payload.get("smtp_port"))

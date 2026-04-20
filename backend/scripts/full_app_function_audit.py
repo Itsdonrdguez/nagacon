@@ -10,7 +10,10 @@ from typing import Any
 from urllib import error, parse, request
 
 from app.main import app
+from app.core.db import SessionLocal
+from app.services.app_settings_service import get_setting
 from app.services.audit.function_audit import audit_routes, route_key
+from app.services.org_service import ensure_default_organization
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
@@ -90,9 +93,14 @@ def get_json(base_url: str, path: str, *, api_key: str | None = None) -> Any:
 
 
 def configured_integration_key(base_url: str) -> str | None:
-    settings = get_json(base_url, "/api/settings/integrations")
-    keys = (settings or {}).get("external_api_keys") or []
-    return keys[0] if keys else None
+    db = SessionLocal()
+    try:
+        org = ensure_default_organization(db)
+        stored = get_setting(db, "external_api_keys", default="", organization_id=getattr(org, "id", None)) or ""
+        keys = [item.strip() for item in stored.split(",") if item.strip()]
+        return keys[0] if keys else None
+    finally:
+        db.close()
 
 
 def collect_context(base_url: str, *, max_examples: int, api_key: str | None) -> dict[str, list[Any]]:

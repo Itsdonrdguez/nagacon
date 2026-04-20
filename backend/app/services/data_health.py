@@ -77,6 +77,38 @@ def _status(count: int, thin_threshold: int = 1) -> str:
     return "ready"
 
 
+def _catalog_status(latest_publog: dict[str, Any] | None, nsn_count: int, reference_count: int) -> str:
+    if not latest_publog or nsn_count <= 0:
+        return "missing"
+    if latest_publog.get("status") != "completed" or nsn_count < 1000 or reference_count <= 0:
+        return "thin"
+    return "ready"
+
+
+def _vendor_status(provider_count: int, provider_item_coverage: float, leads_per_opportunity: float) -> str:
+    if provider_count <= 0:
+        return "missing"
+    if provider_count < 25 or provider_item_coverage < 0.5 or leads_per_opportunity < 0.05:
+        return "thin"
+    return "ready"
+
+
+def _award_status(award_history_count: int, nsn_award_evidence_count: int) -> str:
+    if award_history_count <= 0 and nsn_award_evidence_count <= 0:
+        return "missing"
+    if nsn_award_evidence_count <= 0:
+        return "thin"
+    return "ready"
+
+
+def _workflow_status(opportunity_count: int, part_finder_artifacts: int) -> str:
+    if opportunity_count <= 0:
+        return "missing"
+    if part_finder_artifacts <= 0:
+        return "thin"
+    return "ready"
+
+
 def _latest_publog_run(db: Session) -> dict[str, Any] | None:
     run = db.query(NsnCatalogImportRun).order_by(NsnCatalogImportRun.completed_at.desc().nullslast()).first()
     if not run:
@@ -149,11 +181,12 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         "part_finder_artifacts": part_finder_artifacts,
     }
 
+    latest_publog = _latest_publog_run(db)
     categories = [
         {
             "key": "nsn_catalog",
             "label": "NSN Catalog",
-            "status": _status(counts["nsn_master"]),
+            "status": _catalog_status(latest_publog, counts["nsn_master"], counts["nsn_references"]),
             "summary": "PUB LOG base item records, references, interchangeability, and evidence.",
             "metrics": [
                 {"label": "NSNs", "value": counts["nsn_master"]},
@@ -165,7 +198,11 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         {
             "key": "vendor_intelligence",
             "label": "Vendor Intelligence",
-            "status": _status(counts["providers"]),
+            "status": _vendor_status(
+                counts["providers"],
+                coverage["provider_item_coverage"],
+                coverage["vendor_leads_per_opportunity"],
+            ),
             "summary": "Providers, CAGE-linked items, leads, quotes, and awardee evidence.",
             "metrics": [
                 {"label": "Providers", "value": counts["providers"]},
@@ -177,7 +214,7 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         {
             "key": "award_history",
             "label": "Award History",
-            "status": _status(counts["award_history"] + counts["nsn_award_evidence"]),
+            "status": _award_status(counts["award_history"], counts["nsn_award_evidence"]),
             "summary": "USAspending and closed-solicitation award evidence used for vendor discovery.",
             "metrics": [
                 {"label": "Opportunity Awards", "value": counts["award_history"]},
@@ -188,7 +225,7 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         {
             "key": "workflow",
             "label": "Workflow Automation",
-            "status": _status(counts["opportunities"]),
+            "status": _workflow_status(counts["opportunities"], part_finder_artifacts),
             "summary": "Opportunities, workspace artifacts, Part Finder runs, and background jobs.",
             "metrics": [
                 {"label": "Opportunities", "value": counts["opportunities"]},
@@ -203,7 +240,7 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         {
             "key": "publog_imported",
             "label": "PUB LOG import",
-            "status": "ready" if counts["nsn_master"] > 0 else "missing",
+            "status": _catalog_status(latest_publog, counts["nsn_master"], counts["nsn_references"]),
             "detail": "NSN master records are required for the free NSN-NOW-style backbone.",
         },
         {
@@ -221,7 +258,7 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         {
             "key": "award_evidence",
             "label": "Award evidence",
-            "status": "ready" if counts["award_history"] + counts["nsn_award_evidence"] > 0 else "missing",
+            "status": _award_status(counts["award_history"], counts["nsn_award_evidence"]),
             "detail": "Award records are the bridge from closed solicitations to vendor history.",
         },
         {
@@ -253,7 +290,7 @@ def build_data_health(db: Session, organization_id: int | None = None, now: date
         "coverage": coverage,
         "categories": categories,
         "readiness_checks": readiness_checks,
-        "latest_publog_import": _latest_publog_run(db),
+        "latest_publog_import": latest_publog,
         "source_freshness": source_freshness,
         "saas_readiness": saas_readiness,
     }

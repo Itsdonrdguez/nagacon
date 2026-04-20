@@ -656,6 +656,15 @@ export default function Workspace() {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
     },
   })
+  const refreshPartFinderMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post(`/api/parts/opportunity/${id}/refresh`)
+      return res.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+    },
+  })
 
   const data = workspaceQuery.data
   const opp = data?.opportunity || {}
@@ -686,6 +695,12 @@ export default function Workspace() {
   const complianceArtifact = artifacts.find((artifact) => artifact.artifact_type === 'COMPLIANCE_BRIEF') || null
   const vendorResearchArtifact = artifacts.find((artifact) => artifact.artifact_type === 'VENDOR_RESEARCH') || null
   const submissionPackageArtifact = artifacts.find((artifact) => artifact.artifact_type === 'SUBMISSION_PACKAGE') || null
+  const partFinderArtifact = artifacts.find((artifact) => artifact.artifact_type === 'PART_FINDER') || null
+  const partFinder = partFinderArtifact?.content_json?.part_finder || {}
+  const partFinderPart = partFinder.part || {}
+  const partFinderProviders = partFinder.providers || []
+  const partFinderAwardees = partFinder.awardees || []
+  const partFinderNextActions = partFinder.next_actions || []
   const packagePriceHistory = submissionPackageArtifact?.content_json?.price_history || {}
   const nsnIntelligence =
     nsnIntelligenceQuery.data
@@ -1383,6 +1398,88 @@ export default function Workspace() {
       </Card>
 
           <div className="workspace-summary-grid">
+            <Card title="Part Finder">
+              <div className="workspace-action-column">
+                <div className="results-toolbar">
+                  <div>
+                    <div className="row-title">
+                      {partFinderPart.item_name || factNomenclature || 'Part intelligence not saved yet'}
+                    </div>
+                    <div className="panel-subtitle">
+                      {partFinderArtifact
+                        ? `Last refreshed ${formatDateTime(partFinderArtifact.created_at)}`
+                        : 'Run Part Finder to identify the part, sourcing clues, providers, and awardees.'}
+                    </div>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    loading={refreshPartFinderMutation.isPending}
+                    onClick={() => refreshPartFinderMutation.mutate()}
+                  >
+                    Refresh Part Finder
+                  </Button>
+                </div>
+
+                <div className="summary-inline-list">
+                  {[
+                    ['NSN', partFinderPart.nsn || factNsn || '-'],
+                    ['Quantity', partFinderPart.quantity_display || factQuantity || '-'],
+                    ['FSC', partFinderPart.fsc || factFsc || '-'],
+                    ['NIIN', partFinderPart.niin || '-'],
+                    ['References', partFinderPart.reference_count ?? '-'],
+                    ['Confidence', partFinder.confidence?.identity ? `Identity ${partFinder.confidence.identity} | Supplier ${partFinder.confidence.supplier}` : '-'],
+                  ].map(([label, value]) => (
+                    <div key={`part-finder-${label}`} className="summary-inline-item">
+                      <span className="summary-inline-label">{label}</span>
+                      <span className="summary-inline-value">{value}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <BriefDetailsBox
+                  title="Part Numbers"
+                  items={(partFinderPart.part_numbers || []).slice(0, 8).map((item) => item)}
+                  emptyMessage="No part/reference numbers found yet."
+                />
+
+                <div className="bid-readiness-grid">
+                  <div>
+                    <div className="row-title">Provider Candidates</div>
+                    <div className="artifact-list">
+                      {(partFinderProviders.length ? partFinderProviders.slice(0, 5) : []).map((provider, index) => (
+                        <div key={`part-provider-${provider.provider_id || provider.cage || index}`} className="artifact-list-item">
+                          {provider.name || provider.cage || 'Provider'}
+                          {provider.cage ? ` | CAGE ${provider.cage}` : ''}
+                          {provider.roles?.length ? ` | ${provider.roles.slice(0, 2).join(', ')}` : ''}
+                        </div>
+                      ))}
+                      {!partFinderProviders.length ? <div className="artifact-list-item">No provider candidates found yet.</div> : null}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="row-title">Awardee Evidence</div>
+                    <div className="artifact-list">
+                      {(partFinderAwardees.length ? partFinderAwardees.slice(0, 5) : []).map((awardee, index) => (
+                        <div key={`part-awardee-${awardee.cage || awardee.name || index}`} className="artifact-list-item">
+                          {awardee.name || awardee.cage || 'Awardee'}
+                          {awardee.cage ? ` | CAGE ${awardee.cage}` : ''}
+                          {awardee.award_count ? ` | ${awardee.award_count} award${awardee.award_count === 1 ? '' : 's'}` : ''}
+                          {awardee.total_award_amount ? ` | ${formatCurrency(awardee.total_award_amount)}` : ''}
+                        </div>
+                      ))}
+                      {!partFinderAwardees.length ? <div className="artifact-list-item">No awardee evidence found yet.</div> : null}
+                    </div>
+                  </div>
+                </div>
+
+                <StructuredList
+                  title="Next Sourcing Actions"
+                  items={partFinderNextActions}
+                  emptyMessage="Refresh Part Finder to generate sourcing actions."
+                />
+              </div>
+            </Card>
+
             <Card title="Bid Readiness">
               <div className="workspace-action-column">
                 <div className="artifact-note-box">

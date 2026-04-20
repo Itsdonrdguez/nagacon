@@ -12,7 +12,7 @@ from app.services.part_vendor_leads import (
     seed_quotes_from_part_finder_leads,
 )
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
-from app.services.vendor_service import sync_quote_status_from_outreach_artifact
+from app.services.vendor_service import add_business_days, mark_quote_followed_up, sync_quote_status_from_outreach_artifact
 
 
 def test_part_finder_extracts_part_target_from_dibbs_search_row():
@@ -279,6 +279,9 @@ def test_outreach_artifact_sent_updates_linked_quote_status():
         opportunity_id=77,
         organization_id=4,
         status="NOT_REQUESTED",
+        requested_at=None,
+        last_follow_up_at=None,
+        next_follow_up_at=None,
         notes=None,
         updated_at=None,
     )
@@ -314,6 +317,8 @@ def test_outreach_artifact_sent_updates_linked_quote_status():
     assert result["updated"] is True
     assert result["vendor_quote_id"] == 100
     assert quote.status == "REQUESTED"
+    assert quote.requested_at is not None
+    assert quote.next_follow_up_at is not None
     assert "workspace artifact 501" in quote.notes
     assert added == [quote]
 
@@ -337,3 +342,64 @@ def test_outreach_artifact_draft_does_not_update_quote_status():
     )
 
     assert result == {"updated": False, "reason": "action_not_sent"}
+
+
+def test_add_business_days_skips_weekends():
+    start = datetime(2026, 4, 17, 10, 0, 0)
+
+    result = add_business_days(start, 2)
+
+    assert result.date().isoformat() == "2026-04-21"
+
+
+def test_mark_quote_followed_up_reschedules_requested_quote():
+    quote = SimpleNamespace(
+        id=100,
+        opportunity_id=77,
+        organization_id=4,
+        status="REQUESTED",
+        requested_at=datetime(2026, 4, 17, 10, 0, 0),
+        last_follow_up_at=None,
+        next_follow_up_at=datetime(2026, 4, 21, 10, 0, 0),
+        follow_up_count=0,
+        notes=None,
+        updated_at=None,
+    )
+    added = []
+
+    class FakeQuery:
+        def filter(self, *args):
+            return self
+
+        def first(self):
+            return quote
+
+    class FakeDB:
+        def query(self, model):
+            assert model is VendorQuote
+            return FakeQuery()
+
+        def add(self, rec):
+            added.append(rec)
+
+        def commit(self):
+            pass
+
+        def refresh(self, rec):
+            pass
+
+    result = mark_quote_followed_up(
+        FakeDB(),
+        opportunity_id=77,
+        quote_id=100,
+        organization_id=4,
+        notes="Called supplier, awaiting price.",
+    )
+
+    assert result["vendor_quote_id"] == 100
+    assert result["follow_up_count"] == 1
+    assert quote.last_follow_up_at is not None
+    assert quote.next_follow_up_at is not None
+    assert quote.next_follow_up_at > quote.last_follow_up_at
+    assert "Called supplier" in quote.notes
+    assert added == [quote]

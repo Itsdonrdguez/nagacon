@@ -81,6 +81,10 @@ class VendorQuote(Base):
     status: Mapped[str] = mapped_column(String(24), default="NOT_REQUESTED", index=True)
     unit_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     lead_time_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    follow_up_count: Mapped[int] = mapped_column(Integer, default=0)
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 

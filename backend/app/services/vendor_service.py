@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_
@@ -14,6 +14,7 @@ from app.services.rfq_parser import parse_dibbs_sources
 DEFAULT_STATUS = "NOT_REQUESTED"
 ALLOWED_STATUSES = {"NOT_REQUESTED", "REQUESTED", "RECEIVED", "NO_BID", "INVALID"}
 LEAD_ALLOWED_STATUSES = {"NEW", "REVIEW", "SHORTLISTED", "SEEDED_TO_QUOTES", "IGNORED"}
+FOLLOW_UP_BUSINESS_DAYS = 2
 
 
 def _clean(v: str | None) -> str | None:
@@ -43,6 +44,29 @@ def _scope_vendor_quotes(query, organization_id: int | None):
             )
         )
     return query
+
+
+def add_business_days(start: datetime, business_days: int) -> datetime:
+    current = start
+    remaining = max(int(business_days or 0), 0)
+    while remaining > 0:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
+
+def _set_quote_requested_follow_up(rec: VendorQuote, now: datetime | None = None) -> None:
+    current_time = now or datetime.utcnow()
+    if not getattr(rec, "requested_at", None):
+        rec.requested_at = current_time
+    if not getattr(rec, "next_follow_up_at", None):
+        rec.next_follow_up_at = add_business_days(getattr(rec, "last_follow_up_at", None) or rec.requested_at or current_time, FOLLOW_UP_BUSINESS_DAYS)
+
+
+def _clear_quote_follow_up_if_terminal(rec: VendorQuote) -> None:
+    if str(getattr(rec, "status", "") or "").strip().upper() in {"RECEIVED", "NO_BID", "INVALID", "NOT_REQUESTED"}:
+        rec.next_follow_up_at = None
 
 
 def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
@@ -320,6 +344,10 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
     if "status" in patch and patch["status"]:
         st = str(patch["status"]).strip().upper()
         rec.status = st if st in ALLOWED_STATUSES else DEFAULT_STATUS
+        if rec.status == "REQUESTED":
+            _set_quote_requested_follow_up(rec)
+        else:
+            _clear_quote_follow_up_if_terminal(rec)
     if rec.organization_id is None and organization_id is not None:
         rec.organization_id = organization_id
 
@@ -357,6 +385,7 @@ def sync_quote_status_from_outreach_artifact(db: Session, artifact: Any, action:
         }
 
     rec.status = "REQUESTED"
+    _set_quote_requested_follow_up(rec)
     rec.updated_at = datetime.utcnow()
     note = f"Outreach sent from workspace artifact {getattr(artifact, 'id', None)}."
     existing_notes = str(rec.notes or "").strip()
@@ -367,4 +396,43 @@ def sync_quote_status_from_outreach_artifact(db: Session, artifact: Any, action:
         "updated": True,
         "vendor_quote_id": rec.id,
         "status": rec.status,
+    }
+
+
+def mark_quote_followed_up(db: Session, opportunity_id: int, quote_id: int, organization_id: int | None = None, notes: str | None = None) -> dict[str, Any]:
+    query = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.opportunity_id == opportunity_id)
+        .filter(VendorQuote.id == quote_id)
+    )
+    query = _scope_vendor_quotes(query, organization_id)
+    rec = query.first()
+    if not rec:
+        raise ValueError("vendor quote not found")
+
+    if str(rec.status or "").strip().upper() != "REQUESTED":
+        raise ValueError("follow-up can only be logged for requested quotes")
+
+    now = datetime.utcnow()
+    if not rec.requested_at:
+        rec.requested_at = now
+    rec.last_follow_up_at = now
+    rec.next_follow_up_at = add_business_days(now, FOLLOW_UP_BUSINESS_DAYS)
+    rec.follow_up_count = int(rec.follow_up_count or 0) + 1
+    rec.updated_at = now
+
+    note = notes or f"Follow-up logged on {now.date().isoformat()}."
+    existing_notes = str(rec.notes or "").strip()
+    if note and note not in existing_notes:
+        rec.notes = f"{existing_notes}\n{note}".strip() if existing_notes else note
+
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return {
+        "vendor_quote_id": rec.id,
+        "status": rec.status,
+        "follow_up_count": rec.follow_up_count,
+        "last_follow_up_at": rec.last_follow_up_at,
+        "next_follow_up_at": rec.next_follow_up_at,
     }

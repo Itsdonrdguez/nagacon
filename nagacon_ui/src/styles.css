@@ -1188,6 +1188,29 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   background: linear-gradient(180deg, #f8fbff 0%, #f8fafc 100%);
 }
 
+.quote-follow-up-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.quote-follow-up-due {
+  border-color: #f59e0b;
+  background: #fffbeb;
+}
+
+.quote-follow-up-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
 .structured-copy {
   color: #334155;
   line-height: 1.65;

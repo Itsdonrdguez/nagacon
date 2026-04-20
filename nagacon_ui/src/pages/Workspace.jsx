@@ -605,6 +605,19 @@ export default function Workspace() {
       queryClient.invalidateQueries({ queryKey: ['vendor-quotes', id] })
     },
   })
+  const logQuoteFollowUpMutation = useMutation({
+    mutationFn: async ({ quoteId, notes }) => {
+      const res = await api.post(`/api/vendors/quotes/${quoteId}/follow-up`, {
+        opportunity_id: Number(id),
+        notes,
+      })
+      return res.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+      queryClient.invalidateQueries({ queryKey: ['vendor-quotes', id] })
+    },
+  })
   const restoreArtifactMutation = useMutation({
     mutationFn: async ({ artifactId, versionIndex }) => {
       const res = await api.post(`/api/workspace/artifacts/${artifactId}/restore`, { version_index: versionIndex })
@@ -1718,6 +1731,22 @@ export default function Workspace() {
                         {quote.lead_time_days ? ` | ${quote.lead_time_days} day lead time` : ''}
                       </div>
                     </div>
+                    <div className={`quote-follow-up-box ${quote.follow_up_due ? 'quote-follow-up-due' : ''}`}>
+                      <div className="quote-follow-up-header">
+                        <div className="row-title">Follow-up</div>
+                        <Badge
+                          label={quote.follow_up_label || 'No follow-up schedule'}
+                          variant={quote.follow_up_due ? 'warning' : quote.follow_up_status === 'CLOSED' ? 'success' : 'info'}
+                        />
+                      </div>
+                      <div className="panel-subtitle">
+                        {compactMeta([
+                          quote.requested_at ? `Requested ${formatDateOnly(quote.requested_at)}` : '',
+                          quote.last_follow_up_at ? `Last ${formatDateOnly(quote.last_follow_up_at)}` : '',
+                          quote.follow_up_count ? `${quote.follow_up_count} follow-up${quote.follow_up_count === 1 ? '' : 's'}` : '',
+                        ]) || 'A follow-up schedule starts after the quote request is sent.'}
+                      </div>
+                    </div>
                     <div className="company-form-grid">
                       <Input label="Status" value={quote.status || ''} onChange={(event) => patchVendorQuoteDraft(quote.id, 'status', event.target.value)} />
                       <Input label="Unit Price" type="number" value={quote.unit_price ?? ''} onChange={(event) => patchVendorQuoteDraft(quote.id, 'unit_price', event.target.value === '' ? '' : Number(event.target.value))} />
@@ -1755,6 +1784,20 @@ export default function Workspace() {
                         }
                       >
                         Save Quote Response
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={String(quote.status || '').toUpperCase() !== 'REQUESTED'}
+                        loading={logQuoteFollowUpMutation.isPending}
+                        onClick={() =>
+                          logQuoteFollowUpMutation.mutate({
+                            quoteId: quote.id,
+                            notes: `Follow-up logged for ${quote.company_name || quote.cage || 'vendor'}.`,
+                          })
+                        }
+                      >
+                        Log Follow-up
                       </Button>
                     </div>
                   </Card>

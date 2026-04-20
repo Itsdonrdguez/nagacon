@@ -49,6 +49,13 @@ class VendorQuoteOut(BaseModel):
     status: str
     unit_price: float | None = None
     lead_time_days: int | None = None
+    requested_at: datetime | None = None
+    last_follow_up_at: datetime | None = None
+    next_follow_up_at: datetime | None = None
+    follow_up_count: int = 0
+    follow_up_status: str | None = None
+    follow_up_label: str | None = None
+    follow_up_due: bool = False
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -59,6 +66,11 @@ class VendorQuoteOut(BaseModel):
 
 class SeedRequest(BaseModel):
     opportunity_id: int = Field(..., ge=1)
+
+
+class FollowUpRequest(BaseModel):
+    opportunity_id: int = Field(..., ge=1)
+    notes: str | None = None
 
 
 class UpsertRequest(BaseModel):

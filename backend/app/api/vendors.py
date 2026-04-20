@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -8,9 +10,10 @@ from app.core.deps import get_current_organization, get_db
 from app.models.opportunity import Opportunity
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
-from app.schemas.vendor import VendorLeadOut, VendorLeadUpsertRequest, VendorQuoteOut, SeedRequest, UpsertRequest
+from app.schemas.vendor import FollowUpRequest, VendorLeadOut, VendorLeadUpsertRequest, VendorQuoteOut, SeedRequest, UpsertRequest
 from app.services.vendor_service import (
     list_quotes,
+    mark_quote_followed_up,
     seed_quotes_from_parsed,
     sync_vendor_leads_from_parsed,
     update_vendor_lead,
@@ -81,6 +84,40 @@ def _serialize_leads_with_provider_context(db: Session, leads: list[VendorLead])
     return rows
 
 
+def _serialize_quote(quote) -> dict:
+    row = VendorQuoteOut.model_validate(quote).model_dump()
+    status = str(row.get("status") or "").upper()
+    next_follow_up_at = row.get("next_follow_up_at")
+    follow_up_due = False
+    follow_up_status = None
+    follow_up_label = None
+    if status == "REQUESTED":
+        if next_follow_up_at:
+            follow_up_due = next_follow_up_at <= datetime.utcnow()
+            follow_up_status = "DUE" if follow_up_due else "SCHEDULED"
+            follow_up_label = (
+                "Follow up now"
+                if follow_up_due
+                else f"Follow up {next_follow_up_at.date().isoformat()}"
+            )
+        else:
+            follow_up_status = "MISSING_SCHEDULE"
+            follow_up_label = "Follow-up schedule missing"
+    elif status in {"RECEIVED", "NO_BID", "INVALID"}:
+        follow_up_status = "CLOSED"
+        follow_up_label = "No follow-up needed"
+    else:
+        follow_up_status = "NOT_REQUESTED"
+        follow_up_label = "Request not sent"
+
+    row.update({
+        "follow_up_due": follow_up_due,
+        "follow_up_status": follow_up_status,
+        "follow_up_label": follow_up_label,
+    })
+    return row
+
+
 @router.get("/leads", response_model=list[VendorLeadOut])
 def get_leads(
     opportunity_id: int,
@@ -137,7 +174,7 @@ def upsert_lead(req: VendorLeadUpsertRequest, db: Session = Depends(get_db), cur
 
 @router.get("/quotes", response_model=list[VendorQuoteOut])
 def get_quotes(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
-    return list_quotes(db, opportunity_id, organization_id=getattr(current_org, "id", None))
+    return [_serialize_quote(quote) for quote in list_quotes(db, opportunity_id, organization_id=getattr(current_org, "id", None))]
 
 
 @router.post("/quotes/seed")
@@ -164,4 +201,30 @@ def upsert(req: UpsertRequest, db: Session = Depends(get_db), current_org=Depend
         rec = upsert_quote(db, req.opportunity_id, req.cage, req.part_number, patch, organization_id=getattr(current_org, "id", None))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return rec
+    return _serialize_quote(rec)
+
+
+@router.post("/quotes/{quote_id}/follow-up", response_model=VendorQuoteOut)
+def log_quote_follow_up(
+    quote_id: int,
+    req: FollowUpRequest,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    try:
+        mark_quote_followed_up(
+            db,
+            req.opportunity_id,
+            quote_id,
+            organization_id=getattr(current_org, "id", None),
+            notes=req.notes,
+        )
+        rec = next(
+            quote for quote in list_quotes(db, req.opportunity_id, organization_id=getattr(current_org, "id", None))
+            if quote.id == quote_id
+        )
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="vendor quote not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _serialize_quote(rec)

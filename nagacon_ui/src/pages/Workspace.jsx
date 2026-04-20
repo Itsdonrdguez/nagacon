@@ -560,6 +560,7 @@ export default function Workspace() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+      queryClient.invalidateQueries({ queryKey: ['vendor-quotes', id] })
     },
   })
   const outreachLogMutation = useMutation({
@@ -569,6 +570,7 @@ export default function Workspace() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+      queryClient.invalidateQueries({ queryKey: ['vendor-quotes', id] })
     },
   })
   const promoteVendorLeadMutation = useMutation({

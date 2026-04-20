@@ -23,7 +23,7 @@ from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipe
 from app.services.research.usaspending_research_service import search_usaspending_for_opportunity, seed_usaspending_vendors_into_leads
 from app.services.intelligence.nsn_intelligence_service import get_nsn_intelligence, run_nsn_intelligence
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs, seed_vendor_leads_from_providers
-from app.services.vendor_service import promote_vendor_lead_to_quote_request, sync_vendor_leads_from_parsed
+from app.services.vendor_service import promote_vendor_lead_to_quote_request, sync_quote_status_from_outreach_artifact, sync_vendor_leads_from_parsed
 from app.services.vendor_email_automation import generate_quote_request_email
 from app.services.vendor_email_automation import send_email_message
 from app.services.vendors.discovery import discover_vendors_for_opportunity
@@ -1128,12 +1128,14 @@ def log_artifact_outreach(artifact_id: int, payload: dict, db: Session = Depends
         content["_meta"]["artifact_status"] = "DRAFT"
     rec.content_json = content
     db.add(rec)
+    quote_status_sync = sync_quote_status_from_outreach_artifact(db, rec, action, organization_id=org_id)
     db.commit()
     db.refresh(rec)
 
     return {
         "artifact": _artifact_payload(rec),
         "mailto_url": f"mailto:{recipient or ''}?subject={content.get('subject') or ''}",
+        "quote_status_sync": quote_status_sync,
     }
 
 
@@ -1176,10 +1178,12 @@ def send_artifact_email(artifact_id: int, payload: dict | None = None, db: Sessi
     content["_meta"]["artifact_status"] = "SENT"
     rec.content_json = content
     db.add(rec)
+    quote_status_sync = sync_quote_status_from_outreach_artifact(db, rec, "sent", organization_id=org_id)
     db.commit()
     db.refresh(rec)
 
     return {
         "artifact": _artifact_payload(rec),
         "send_result": send_result,
+        "quote_status_sync": quote_status_sync,
     }

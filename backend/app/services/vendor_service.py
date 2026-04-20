@@ -327,3 +327,44 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
     db.commit()
     db.refresh(rec)
     return rec
+
+
+def sync_quote_status_from_outreach_artifact(db: Session, artifact: Any, action: str | None, organization_id: int | None = None) -> dict[str, Any]:
+    normalized_action = str(action or "").strip().lower()
+    content = getattr(artifact, "content_json", None) or {}
+    quote_id = content.get("vendor_quote_id")
+    if normalized_action != "sent":
+        return {"updated": False, "reason": "action_not_sent"}
+    if not quote_id:
+        return {"updated": False, "reason": "missing_vendor_quote_id"}
+
+    query = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.id == quote_id)
+        .filter(VendorQuote.opportunity_id == getattr(artifact, "opportunity_id", None))
+    )
+    query = _scope_vendor_quotes(query, organization_id)
+    rec = query.first()
+    if not rec:
+        return {"updated": False, "reason": "quote_not_found", "vendor_quote_id": quote_id}
+
+    if rec.status and str(rec.status).strip().upper() != DEFAULT_STATUS:
+        return {
+            "updated": False,
+            "reason": "status_already_set",
+            "vendor_quote_id": rec.id,
+            "status": rec.status,
+        }
+
+    rec.status = "REQUESTED"
+    rec.updated_at = datetime.utcnow()
+    note = f"Outreach sent from workspace artifact {getattr(artifact, 'id', None)}."
+    existing_notes = str(rec.notes or "").strip()
+    if note not in existing_notes:
+        rec.notes = f"{existing_notes}\n{note}".strip() if existing_notes else note
+    db.add(rec)
+    return {
+        "updated": True,
+        "vendor_quote_id": rec.id,
+        "status": rec.status,
+    }

@@ -12,6 +12,7 @@ from app.services.part_vendor_leads import (
     seed_quotes_from_part_finder_leads,
 )
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
+from app.services.vendor_service import sync_quote_status_from_outreach_artifact
 
 
 def test_part_finder_extracts_part_target_from_dibbs_search_row():
@@ -270,3 +271,69 @@ def test_part_finder_quote_seed_creates_email_draft(monkeypatch):
     assert artifacts[0].content_json["vendor_quote_id"] == 100
     assert artifacts[0].content_json["generated_from"] == "part_finder_quote_auto_outreach"
     assert artifacts[0].content_json["_meta"]["artifact_subtype"] == "PART_FINDER_QUOTE_EMAIL"
+
+
+def test_outreach_artifact_sent_updates_linked_quote_status():
+    quote = SimpleNamespace(
+        id=100,
+        opportunity_id=77,
+        organization_id=4,
+        status="NOT_REQUESTED",
+        notes=None,
+        updated_at=None,
+    )
+    artifact = SimpleNamespace(
+        id=501,
+        opportunity_id=77,
+        content_json={"vendor_quote_id": 100},
+    )
+    added = []
+
+    class FakeQuery:
+        def filter(self, *args):
+            return self
+
+        def first(self):
+            return quote
+
+    class FakeDB:
+        def query(self, model):
+            assert model is VendorQuote
+            return FakeQuery()
+
+        def add(self, rec):
+            added.append(rec)
+
+    result = sync_quote_status_from_outreach_artifact(
+        FakeDB(),
+        artifact,
+        "sent",
+        organization_id=4,
+    )
+
+    assert result["updated"] is True
+    assert result["vendor_quote_id"] == 100
+    assert quote.status == "REQUESTED"
+    assert "workspace artifact 501" in quote.notes
+    assert added == [quote]
+
+
+def test_outreach_artifact_draft_does_not_update_quote_status():
+    artifact = SimpleNamespace(
+        id=501,
+        opportunity_id=77,
+        content_json={"vendor_quote_id": 100},
+    )
+
+    class FakeDB:
+        def query(self, model):
+            raise AssertionError("draft actions should not query quotes")
+
+    result = sync_quote_status_from_outreach_artifact(
+        FakeDB(),
+        artifact,
+        "draft_saved",
+        organization_id=4,
+    )
+
+    assert result == {"updated": False, "reason": "action_not_sent"}

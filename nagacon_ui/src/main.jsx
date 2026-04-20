@@ -8,6 +8,7 @@ import LoadingState from './components/ui/LoadingState/LoadingState'
 import './styles.css'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
+const WorkQueue = lazy(() => import('./pages/WorkQueue'))
 const Opportunities = lazy(() => import('./pages/Opportunities'))
 const Workspace = lazy(() => import('./pages/Workspace'))
 const Vendors = lazy(() => import('./pages/Vendors'))
@@ -45,6 +46,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
               <Routes>
                 <Route path="/" element={<App />}>
                   <Route index element={<Dashboard />} />
+                  <Route path="work-queue" element={<WorkQueue />} />
                   <Route path="company" element={<Company />} />
                   <Route path="ingestion" element={<Ingestion />} />
                   <Route path="opportunities" element={<Opportunities />} />

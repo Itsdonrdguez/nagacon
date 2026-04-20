@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from app.api import opportunities as opportunities_api
 from app.api import integrations as integrations_api
 from app.api import workspace as workspace_api
+from app.api import work_queue as work_queue_api
 from app.api.routes import company as company_api
 from app.api.routes import pipeline as pipeline_api
 from app.core import security as security_core
@@ -584,6 +585,48 @@ def test_auth_me_returns_current_user_and_org(client):
     payload = response.json()
     assert payload["user"]["email"] == "owner@nagacon.local"
     assert payload["organization"]["slug"] == "default"
+
+
+def test_work_queue_today_returns_daily_actions(client, monkeypatch):
+    def fake_build_daily_work_queue(db, organization_id=None, limit=200):
+        assert organization_id == 1
+        assert limit == 50
+        return {
+            "items": [
+                {
+                    "id": "QUOTE_FOLLOW_UP_DUE:7:100",
+                    "type": "QUOTE_FOLLOW_UP_DUE",
+                    "priority": "HIGH",
+                    "title": "Follow up with Acme",
+                    "subtitle": "Quote request is due for follow-up.",
+                    "opportunity": {
+                        "id": 7,
+                        "title": "Valve",
+                        "solicitation_number": "SOL-7",
+                        "source": "DIBBS",
+                        "agency": "DLA",
+                        "due_at": None,
+                        "workspace_url": "/workspace/7",
+                    },
+                    "due_at": None,
+                    "action_label": "Open Workspace",
+                    "action_url": "/workspace/7",
+                    "meta": {"quote_id": 100},
+                }
+            ],
+            "summary": {"HIGH": 1, "QUOTE_FOLLOW_UP_DUE": 1},
+            "total": 1,
+            "generated_at": "2026-04-20T12:00:00",
+        }
+
+    monkeypatch.setattr(work_queue_api, "build_daily_work_queue", fake_build_daily_work_queue)
+
+    response = client.get("/api/work-queue/today", params={"limit": 50})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["type"] == "QUOTE_FOLLOW_UP_DUE"
 
 
 def test_opportunity_read_extracts_requested_quantity_from_dibbs_search_row():

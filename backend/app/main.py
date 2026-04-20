@@ -22,6 +22,7 @@ from app.api.vendor_email import router as vendor_email_router
 from app.api.vendors import router as vendors_router
 from app.api.vendors_dibbs_approved_sources import router as vendors_dibbs_approved_sources_router
 from app.api.vendors_lead_cleanup import router as vendors_lead_cleanup_router
+from app.api.work_queue import router as work_queue_router
 from app.api.workspace import router as workspace_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.analytics import router as analytics_router
@@ -62,6 +63,7 @@ CORE_ROUTERS = [
     files_router,
     scrapers_router,
     search_jobs_router,
+    work_queue_router,
     submissions_router,
     settings_router,
 ]

@@ -2,6 +2,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from app.api import opportunities as opportunities_api
+from app.api import data_health as data_health_api
 from app.api import integrations as integrations_api
 from app.api import notifications as notifications_api
 from app.api import saas_readiness as saas_readiness_api
@@ -664,6 +665,30 @@ def test_source_freshness_route_returns_source_status(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["summary"]["fresh"] == 1
+
+
+def test_data_health_route_returns_readiness_summary(client, monkeypatch):
+    monkeypatch.setattr(
+        data_health_api,
+        "build_data_health",
+        lambda db, organization_id=None: {
+            "organization_id": organization_id,
+            "summary": {"ready": 2, "thin": 1, "missing": 0},
+            "counts": {"opportunities": 10, "nsn_master": 100},
+            "coverage": {"references_per_nsn": 3.2},
+            "categories": [{"key": "nsn_catalog", "status": "ready"}],
+            "readiness_checks": [{"key": "publog_imported", "status": "ready"}],
+            "generated_at": "2026-04-20T12:00:00",
+        },
+    )
+
+    response = client.get("/api/data-health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["organization_id"] == 1
+    assert payload["summary"]["ready"] == 2
+    assert payload["counts"]["nsn_master"] == 100
 
 
 def test_saas_readiness_route_returns_org_scope_audit(client, monkeypatch):

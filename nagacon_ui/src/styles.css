@@ -1321,6 +1321,66 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   background: #ffffff;
 }
 
+.data-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.data-health-card {
+  min-height: 220px;
+}
+
+.data-health-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.data-health-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.data-health-metric {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid #dbe5f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.data-health-metric span {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.data-health-metric strong {
+  color: #0f172a;
+  font-size: 18px;
+  white-space: nowrap;
+}
+
+.data-health-readiness,
+.data-health-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.error-text {
+  color: #b91c1c;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .work-queue-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1512,7 +1572,9 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
 
   .submission-package-hero,
   .submission-package-grid,
-  .submission-package-columns {
+  .submission-package-columns,
+  .data-health-grid,
+  .data-health-metrics {
     grid-template-columns: 1fr;
   }
 

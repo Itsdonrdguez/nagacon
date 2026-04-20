@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from app.api.dibbs import router as dibbs_router
 from app.api.bid_submissions import router as submissions_router
+from app.api.data_health import router as data_health_router
 from app.api.dibbs_enrich import router as dibbs_enrich_router
 from app.api.export import router as export_router
 from app.api.notifications import router as notifications_router
@@ -59,6 +60,7 @@ CORE_ROUTERS = [
     parts_router,
     notifications_router,
     source_freshness_router,
+    data_health_router,
     saas_readiness_router,
     workspace_router,
     pipeline_router,

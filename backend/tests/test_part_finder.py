@@ -1,6 +1,8 @@
+from datetime import datetime
 from types import SimpleNamespace
 
 from app.schemas.opportunity import RawOpportunity
+from app.models.provider import Provider
 from app.models.vendor import VendorLead, VendorQuote
 from app.services.part_vendor_leads import _build_part_finder_candidates, seed_quotes_from_part_finder_leads
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
@@ -137,6 +139,17 @@ def test_part_finder_quote_seed_creates_quote_for_high_confidence_cage_lead():
         raw_text=None,
         updated_at=None,
     )
+    provider = SimpleNamespace(
+        id=31,
+        organization_id=4,
+        company_name="Acme Medical Official",
+        cage="1ABC2",
+        contact_name="Jane Buyer",
+        email="quotes@acme.test",
+        phone="555-0101",
+        website="https://acme.test",
+        updated_at=datetime(2026, 4, 19),
+    )
     added = []
 
     class FakeQuery:
@@ -156,6 +169,8 @@ def test_part_finder_quote_seed_creates_quote_for_high_confidence_cage_lead():
             return [lead] if self.model is VendorLead else []
 
         def first(self):
+            if self.model is Provider:
+                return provider
             return None
 
     class FakeDB:
@@ -183,4 +198,8 @@ def test_part_finder_quote_seed_creates_quote_for_high_confidence_cage_lead():
     assert added[0].cage == "1ABC2"
     assert added[0].part_number == "ABC-123"
     assert added[0].status == "NOT_REQUESTED"
+    assert added[0].contact_name == "Jane Buyer"
+    assert added[0].email == "quotes@acme.test"
+    assert added[0].phone == "555-0101"
+    assert "Website: https://acme.test" in added[0].notes
     assert lead.status == "SEEDED_TO_QUOTES"

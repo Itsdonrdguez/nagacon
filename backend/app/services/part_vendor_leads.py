@@ -7,6 +7,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models.opportunity import Opportunity
+from app.models.provider import Provider
 from app.models.vendor import VendorLead, VendorQuote
 
 DEFAULT_QUOTE_STATUS = "NOT_REQUESTED"
@@ -105,19 +106,16 @@ def seed_quotes_from_part_finder_leads(
             continue
         part_number = _clean(lead.part_number, 80)
         quote = _find_existing_quote(db, opp.id, cage, part_number, organization_id=org_id)
+        provider = _find_provider_for_cage(db, cage, organization_id=org_id)
         notes = _quote_notes_from_lead(lead)
         if quote:
-            touched = False
-            if quote.organization_id is None and org_id is not None:
-                quote.organization_id = org_id
-                touched = True
-            if lead.company_name and not quote.company_name:
-                quote.company_name = lead.company_name
-                touched = True
-            merged_notes = _merge_text(quote.notes, notes)
-            if merged_notes != quote.notes:
-                quote.notes = merged_notes
-                touched = True
+            touched = _fill_quote_from_lead_and_provider(
+                quote,
+                lead,
+                provider,
+                organization_id=org_id,
+                notes=notes,
+            )
             if touched:
                 quote.updated_at = datetime.utcnow()
                 updated += 1
@@ -126,9 +124,16 @@ def seed_quotes_from_part_finder_leads(
                 organization_id=org_id,
                 opportunity_id=opp.id,
                 cage=cage,
-                company_name=lead.company_name,
+                company_name=lead.company_name or getattr(provider, "company_name", None),
                 part_number=part_number,
                 status=DEFAULT_QUOTE_STATUS,
+                notes=notes,
+            )
+            _fill_quote_from_lead_and_provider(
+                quote,
+                lead,
+                provider,
+                organization_id=org_id,
                 notes=notes,
             )
             db.add(quote)
@@ -291,6 +296,47 @@ def _find_existing_quote(
     return query.first()
 
 
+def _find_provider_for_cage(db: Session, cage: str, *, organization_id: int | None = None) -> Provider | None:
+    query = db.query(Provider).filter(func.upper(func.coalesce(Provider.cage, "")) == cage.upper())
+    if organization_id is not None:
+        query = query.filter(or_(Provider.organization_id == organization_id, Provider.organization_id.is_(None)))
+    return (
+        query
+        .order_by(Provider.organization_id.desc().nullslast(), Provider.updated_at.desc(), Provider.id.desc())
+        .first()
+    )
+
+
+def _fill_quote_from_lead_and_provider(
+    quote: VendorQuote,
+    lead: VendorLead,
+    provider: Provider | None,
+    *,
+    organization_id: int | None = None,
+    notes: str | None = None,
+) -> bool:
+    touched = False
+    if quote.organization_id is None and organization_id is not None:
+        quote.organization_id = organization_id
+        touched = True
+    if not quote.company_name:
+        quote.company_name = lead.company_name or getattr(provider, "company_name", None)
+        touched = bool(quote.company_name) or touched
+    if provider:
+        for attr in ["contact_name", "email", "phone"]:
+            value = getattr(provider, attr, None)
+            if value and not getattr(quote, attr, None):
+                setattr(quote, attr, value)
+                touched = True
+        provider_note = _provider_contact_note(provider)
+        notes = _merge_text(notes, provider_note)
+    merged_notes = _merge_text(quote.notes, notes)
+    if merged_notes != quote.notes:
+        quote.notes = merged_notes
+        touched = True
+    return touched
+
+
 def _update_lead(rec: VendorLead, candidate: dict[str, Any], *, organization_id: int | None = None) -> bool:
     touched = False
     for attr in ["company_name", "cage", "part_number", "nsn"]:
@@ -374,6 +420,16 @@ def _quote_notes_from_lead(lead: VendorLead) -> str:
         lead.notes,
     ]
     return " ".join(part for part in parts if part)[:4000]
+
+
+def _provider_contact_note(provider: Provider) -> str | None:
+    parts = [
+        "Provider contact enrichment.",
+        f"Website: {provider.website}." if provider.website else None,
+        f"Email: {provider.email}." if provider.email else None,
+        f"Phone: {provider.phone}." if provider.phone else None,
+    ]
+    return " ".join(part for part in parts if part) or None
 
 
 def _merge_text(current: str | None, incoming: str | None, *, max_len: int = 4000) -> str | None:

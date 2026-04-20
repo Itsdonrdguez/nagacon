@@ -7,7 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.models.opportunity import Opportunity
 from app.services.part_finder import find_part_for_opportunity
-from app.services.part_vendor_leads import seed_quotes_from_part_finder_leads, seed_vendor_leads_from_part_finder_result
+from app.services.part_vendor_leads import (
+    create_email_drafts_for_part_finder_quotes,
+    seed_quotes_from_part_finder_leads,
+    seed_vendor_leads_from_part_finder_result,
+)
 from app.services.workspace_service import create_artifact
 
 
@@ -56,6 +60,11 @@ def enrich_dibbs_opportunities_after_ingest(
                 opp,
                 organization_id=organization_id,
             ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "seedable_count": 0}
+            email_drafts = create_email_drafts_for_part_finder_quotes(
+                db,
+                opp,
+                quote_seed,
+            ) if result.get("status") == "ok" else {"created": 0, "skipped": 0, "errors": []}
             item = {
                 "opportunity_id": opportunity_id,
                 "status": result.get("status"),
@@ -65,6 +74,7 @@ def enrich_dibbs_opportunities_after_ingest(
                 "artifact_id": getattr(artifact, "id", None),
                 "vendor_leads": vendor_leads,
                 "quote_seed": quote_seed,
+                "email_drafts": email_drafts,
             }
             if queue_nsn_build and item["nsn"]:
                 from app.services.search_jobs import start_search_job

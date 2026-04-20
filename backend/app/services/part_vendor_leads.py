@@ -9,6 +9,9 @@ from sqlalchemy.orm import Session
 from app.models.opportunity import Opportunity
 from app.models.provider import Provider
 from app.models.vendor import VendorLead, VendorQuote
+from app.models.workspace import WorkspaceArtifact
+from app.services.vendor_email_automation import generate_quote_request_email
+from app.services.workspace_service import create_artifact
 
 DEFAULT_QUOTE_STATUS = "NOT_REQUESTED"
 
@@ -167,6 +170,91 @@ def seed_quotes_from_part_finder_leads(
     }
 
 
+def create_email_drafts_for_part_finder_quotes(
+    db: Session,
+    opp: Opportunity,
+    quote_seed: dict[str, Any],
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    seeded_quotes = quote_seed.get("seeded") or []
+    created = 0
+    skipped = 0
+    errors: list[str] = []
+    drafts: list[dict[str, Any]] = []
+    existing_quote_ids = _existing_email_draft_quote_ids(db, opp.id)
+
+    for item in seeded_quotes[:limit]:
+        quote_id = item.get("quote_id")
+        if not quote_id:
+            skipped += 1
+            continue
+        if int(quote_id) in existing_quote_ids:
+            skipped += 1
+            continue
+        quote = (
+            db.query(VendorQuote)
+            .filter(VendorQuote.id == int(quote_id), VendorQuote.opportunity_id == opp.id)
+            .first()
+        )
+        if not quote:
+            skipped += 1
+            continue
+        if not _clean(quote.email):
+            skipped += 1
+            continue
+        try:
+            draft = generate_quote_request_email(opportunity_id=opp.id, db=db, vendor_quote_id=quote.id)
+            artifact = create_artifact(
+                db,
+                opp.id,
+                "EMAIL_DRAFT",
+                f"Vendor Email Draft - {draft.get('company_name') or quote.company_name or quote.cage or quote.id}",
+                content_json={
+                    **draft,
+                    "target_vendor_name": draft.get("company_name") or quote.company_name,
+                    "target_vendor_email": draft.get("to") or quote.email,
+                    "vendor_quote_id": quote.id,
+                    "generated_from": "part_finder_quote_auto_outreach",
+                    "_meta": {
+                        "artifact_type": "EMAIL_DRAFT",
+                        "artifact_category": "OUTREACH",
+                        "artifact_subtype": "PART_FINDER_QUOTE_EMAIL",
+                        "artifact_status": "DRAFT",
+                    },
+                    "_outreach_log": [
+                        {
+                            "action": "draft_created",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "recipient": draft.get("to") or quote.email,
+                            "vendor_name": draft.get("company_name") or quote.company_name,
+                            "source": "part_finder_quote_auto_outreach",
+                        }
+                    ],
+                },
+            )
+            created += 1
+            existing_quote_ids.add(quote.id)
+            drafts.append(
+                {
+                    "artifact_id": artifact.id,
+                    "quote_id": quote.id,
+                    "to": draft.get("to") or quote.email,
+                    "company_name": draft.get("company_name") or quote.company_name,
+                }
+            )
+        except Exception as exc:
+            db.rollback()
+            errors.append(f"Quote {quote_id}: {exc}")
+
+    return {
+        "created": created,
+        "skipped": skipped,
+        "errors": errors,
+        "drafts": drafts,
+    }
+
+
 def _build_part_finder_candidates(result: dict[str, Any], *, limit: int = 25) -> list[dict[str, Any]]:
     part = result.get("part") or {}
     nsn = _clean(part.get("nsn"))
@@ -294,6 +382,29 @@ def _find_existing_quote(
     else:
         query = query.filter(VendorQuote.part_number.is_(None))
     return query.first()
+
+
+def _existing_email_draft_quote_ids(db: Session, opportunity_id: int) -> set[int]:
+    artifacts = (
+        db.query(WorkspaceArtifact)
+        .filter(
+            WorkspaceArtifact.opportunity_id == opportunity_id,
+            WorkspaceArtifact.artifact_type == "EMAIL_DRAFT",
+        )
+        .all()
+    )
+    quote_ids: set[int] = set()
+    for artifact in artifacts:
+        content = artifact.content_json or {}
+        quote_id = content.get("vendor_quote_id")
+        generated_from = content.get("generated_from")
+        subtype = (content.get("_meta") or {}).get("artifact_subtype")
+        if quote_id and (generated_from == "part_finder_quote_auto_outreach" or subtype == "PART_FINDER_QUOTE_EMAIL"):
+            try:
+                quote_ids.add(int(quote_id))
+            except (TypeError, ValueError):
+                continue
+    return quote_ids
 
 
 def _find_provider_for_cage(db: Session, cage: str, *, organization_id: int | None = None) -> Provider | None:

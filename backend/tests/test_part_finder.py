@@ -4,7 +4,13 @@ from types import SimpleNamespace
 from app.schemas.opportunity import RawOpportunity
 from app.models.provider import Provider
 from app.models.vendor import VendorLead, VendorQuote
-from app.services.part_vendor_leads import _build_part_finder_candidates, seed_quotes_from_part_finder_leads
+from app.models.workspace import WorkspaceArtifact
+from app.services import part_vendor_leads
+from app.services.part_vendor_leads import (
+    _build_part_finder_candidates,
+    create_email_drafts_for_part_finder_quotes,
+    seed_quotes_from_part_finder_leads,
+)
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
 
 
@@ -203,3 +209,64 @@ def test_part_finder_quote_seed_creates_quote_for_high_confidence_cage_lead():
     assert added[0].phone == "555-0101"
     assert "Website: https://acme.test" in added[0].notes
     assert lead.status == "SEEDED_TO_QUOTES"
+
+
+def test_part_finder_quote_seed_creates_email_draft(monkeypatch):
+    quote = SimpleNamespace(
+        id=100,
+        opportunity_id=77,
+        company_name="Acme Medical",
+        cage="1ABC2",
+        email="quotes@acme.test",
+    )
+    artifacts = []
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return [] if self.model is WorkspaceArtifact else []
+
+        def first(self):
+            return quote if self.model is VendorQuote else None
+
+    class FakeDB:
+        def query(self, model):
+            return FakeQuery(model)
+
+        def rollback(self):
+            self.rolled_back = True
+
+    monkeypatch.setattr(
+        part_vendor_leads,
+        "generate_quote_request_email",
+        lambda opportunity_id, db, vendor_quote_id: {
+            "to": "quotes@acme.test",
+            "company_name": "Acme Medical",
+            "subject": "Quote Request",
+            "body": "Please quote.",
+        },
+    )
+
+    def fake_create_artifact(db, opp_id, artifact_type, title, content_json=None, **kwargs):
+        artifact = SimpleNamespace(id=501, content_json=content_json, title=title)
+        artifacts.append(artifact)
+        return artifact
+
+    monkeypatch.setattr(part_vendor_leads, "create_artifact", fake_create_artifact)
+
+    result = create_email_drafts_for_part_finder_quotes(
+        FakeDB(),
+        SimpleNamespace(id=77),
+        {"seeded": [{"quote_id": 100}]},
+    )
+
+    assert result["created"] == 1
+    assert result["drafts"][0]["artifact_id"] == 501
+    assert artifacts[0].content_json["vendor_quote_id"] == 100
+    assert artifacts[0].content_json["generated_from"] == "part_finder_quote_auto_outreach"
+    assert artifacts[0].content_json["_meta"]["artifact_subtype"] == "PART_FINDER_QUOTE_EMAIL"

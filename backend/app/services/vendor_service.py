@@ -69,6 +69,44 @@ def _clear_quote_follow_up_if_terminal(rec: VendorQuote) -> None:
         rec.next_follow_up_at = None
 
 
+def build_quote_follow_up_summary(quotes: list[Any], now: datetime | None = None) -> dict[str, Any]:
+    current_time = now or datetime.utcnow()
+    summary: dict[str, Any] = {
+        "total": len(quotes),
+        "requested": 0,
+        "due": 0,
+        "scheduled": 0,
+        "closed": 0,
+        "not_requested": 0,
+        "missing_schedule": 0,
+        "due_quote_ids": [],
+        "next_due_at": None,
+    }
+    next_due_at = None
+    for quote in quotes:
+        status = str(getattr(quote, "status", "") or "").strip().upper()
+        next_follow_up_at = getattr(quote, "next_follow_up_at", None)
+        if status == "REQUESTED":
+            summary["requested"] += 1
+            if next_follow_up_at and next_follow_up_at <= current_time:
+                summary["due"] += 1
+                summary["due_quote_ids"].append(getattr(quote, "id", None))
+            elif next_follow_up_at:
+                summary["scheduled"] += 1
+                if next_due_at is None or next_follow_up_at < next_due_at:
+                    next_due_at = next_follow_up_at
+            else:
+                summary["missing_schedule"] += 1
+        elif status in {"RECEIVED", "NO_BID", "INVALID"}:
+            summary["closed"] += 1
+        else:
+            summary["not_requested"] += 1
+
+    summary["due_quote_ids"] = [quote_id for quote_id in summary["due_quote_ids"] if quote_id is not None]
+    summary["next_due_at"] = next_due_at
+    return summary
+
+
 def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
     parsed = getattr(opp, "parsed_json", None) or {}
     if not parsed and getattr(opp, "raw_text", None):

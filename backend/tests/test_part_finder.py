@@ -12,7 +12,7 @@ from app.services.part_vendor_leads import (
     seed_quotes_from_part_finder_leads,
 )
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
-from app.services.vendor_service import add_business_days, mark_quote_followed_up, sync_quote_status_from_outreach_artifact
+from app.services.vendor_service import add_business_days, build_quote_follow_up_summary, mark_quote_followed_up, sync_quote_status_from_outreach_artifact
 
 
 def test_part_finder_extracts_part_target_from_dibbs_search_row():
@@ -403,3 +403,26 @@ def test_mark_quote_followed_up_reschedules_requested_quote():
     assert quote.next_follow_up_at > quote.last_follow_up_at
     assert "Called supplier" in quote.notes
     assert added == [quote]
+
+
+def test_quote_follow_up_summary_counts_due_and_scheduled_quotes():
+    now = datetime(2026, 4, 22, 12, 0, 0)
+    quotes = [
+        SimpleNamespace(id=1, status="REQUESTED", next_follow_up_at=datetime(2026, 4, 22, 9, 0, 0)),
+        SimpleNamespace(id=2, status="REQUESTED", next_follow_up_at=datetime(2026, 4, 24, 9, 0, 0)),
+        SimpleNamespace(id=3, status="REQUESTED", next_follow_up_at=None),
+        SimpleNamespace(id=4, status="RECEIVED", next_follow_up_at=None),
+        SimpleNamespace(id=5, status="NOT_REQUESTED", next_follow_up_at=None),
+    ]
+
+    summary = build_quote_follow_up_summary(quotes, now=now)
+
+    assert summary["total"] == 5
+    assert summary["requested"] == 3
+    assert summary["due"] == 1
+    assert summary["scheduled"] == 1
+    assert summary["missing_schedule"] == 1
+    assert summary["closed"] == 1
+    assert summary["not_requested"] == 1
+    assert summary["due_quote_ids"] == [1]
+    assert summary["next_due_at"] == datetime(2026, 4, 24, 9, 0, 0)

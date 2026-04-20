@@ -12,6 +12,7 @@ from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
 from app.schemas.vendor import FollowUpRequest, VendorLeadOut, VendorLeadUpsertRequest, VendorQuoteOut, SeedRequest, UpsertRequest
 from app.services.vendor_service import (
+    build_quote_follow_up_summary,
     list_quotes,
     mark_quote_followed_up,
     seed_quotes_from_parsed,
@@ -175,6 +176,17 @@ def upsert_lead(req: VendorLeadUpsertRequest, db: Session = Depends(get_db), cur
 @router.get("/quotes", response_model=list[VendorQuoteOut])
 def get_quotes(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     return [_serialize_quote(quote) for quote in list_quotes(db, opportunity_id, organization_id=getattr(current_org, "id", None))]
+
+
+@router.get("/quotes/follow-ups/summary")
+def get_quote_follow_up_summary(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+    quotes = list_quotes(db, opportunity_id, organization_id=getattr(current_org, "id", None))
+    summary = build_quote_follow_up_summary(quotes)
+    next_due_at = summary.get("next_due_at")
+    return {
+        **summary,
+        "next_due_at": next_due_at.isoformat() if next_due_at else None,
+    }
 
 
 @router.post("/quotes/seed")

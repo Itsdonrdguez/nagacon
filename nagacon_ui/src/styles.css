@@ -1211,6 +1211,42 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   flex-wrap: wrap;
 }
 
+.quote-follow-up-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.quote-filter-chip {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #334155;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 0.45rem 0.7rem;
+  cursor: pointer;
+}
+
+.quote-filter-chip:hover,
+.quote-filter-active {
+  border-color: #0f766e;
+  background: #ecfdf5;
+  color: #0f766e;
+}
+
+.quote-follow-up-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid #f59e0b;
+  border-radius: 8px;
+  background: #fffbeb;
+}
+
 .structured-copy {
   color: #334155;
   line-height: 1.65;

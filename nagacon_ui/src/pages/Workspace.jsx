@@ -272,6 +272,7 @@ export default function Workspace() {
   const [selectedArtifactCompare, setSelectedArtifactCompare] = useState(null)
   const [selectedFileId, setSelectedFileId] = useState(null)
   const [activeIntakeJobId, setActiveIntakeJobId] = useState(null)
+  const [quoteFilter, setQuoteFilter] = useState('all')
 
   const workspaceQuery = useQuery({
     queryKey: ['workspace', id],
@@ -819,6 +820,23 @@ export default function Workspace() {
       }
     })
     .sort(compareQuoteCandidates)
+  const quoteFollowUpSummary = vendorQuotes.reduce((acc, quote) => {
+    const status = String(quote.status || '').toUpperCase()
+    acc.total += 1
+    if (quote.follow_up_due) acc.due += 1
+    if (status === 'REQUESTED') acc.requested += 1
+    else if (status === 'RECEIVED') acc.received += 1
+    else if (status === 'NOT_REQUESTED' || !status) acc.notRequested += 1
+    return acc
+  }, { total: 0, due: 0, requested: 0, received: 0, notRequested: 0 })
+  const visibleVendorQuotes = vendorQuotes.filter((quote) => {
+    const status = String(quote.status || '').toUpperCase()
+    if (quoteFilter === 'due') return Boolean(quote.follow_up_due)
+    if (quoteFilter === 'requested') return status === 'REQUESTED'
+    if (quoteFilter === 'received') return status === 'RECEIVED'
+    if (quoteFilter === 'not_requested') return status === 'NOT_REQUESTED' || !status
+    return true
+  })
   const recommendedQuote = quoteComparison.find((quote) => quote.normalized_status === 'RECEIVED' && quote.hasPrice) || quoteComparison[0] || null
   const selectedQuote = quoteComparison.find((quote) => String(quote.id) === String(submissionForm.planned_vendor_quote_id || '')) || null
   const packageVendor = selectedQuote || recommendedQuote || null
@@ -1708,8 +1726,41 @@ export default function Workspace() {
                   </Button>
                 </div>
               </div>
+              <div className="quote-follow-up-summary">
+                <button type="button" className={`quote-filter-chip ${quoteFilter === 'all' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('all')}>
+                  All {quoteFollowUpSummary.total}
+                </button>
+                <button type="button" className={`quote-filter-chip ${quoteFilter === 'due' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('due')}>
+                  Due {quoteFollowUpSummary.due}
+                </button>
+                <button type="button" className={`quote-filter-chip ${quoteFilter === 'requested' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('requested')}>
+                  Requested {quoteFollowUpSummary.requested}
+                </button>
+                <button type="button" className={`quote-filter-chip ${quoteFilter === 'received' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('received')}>
+                  Received {quoteFollowUpSummary.received}
+                </button>
+                <button type="button" className={`quote-filter-chip ${quoteFilter === 'not_requested' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('not_requested')}>
+                  Not Requested {quoteFollowUpSummary.notRequested}
+                </button>
+              </div>
+              {quoteFollowUpSummary.due > 0 ? (
+                <div className="quote-follow-up-alert">
+                  <div>
+                    <div className="row-title">Follow-ups Due</div>
+                    <div className="panel-subtitle">{quoteFollowUpSummary.due} vendor {quoteFollowUpSummary.due === 1 ? 'needs' : 'need'} a quote follow-up today.</div>
+                  </div>
+                  <Button size="sm" variant="secondary" onClick={() => setQuoteFilter('due')}>
+                    View Due
+                  </Button>
+                </div>
+              ) : null}
               <div className="vendor-grid">
-                {vendorQuotes.map((quote) => (
+                {visibleVendorQuotes.length === 0 ? (
+                  <EmptyState
+                    title="No quotes match this filter"
+                    subtitle="Try another quote status filter or refresh from vendor leads."
+                  />
+                ) : visibleVendorQuotes.map((quote) => (
                   <Card key={quote.id} className="vendor-card">
                     <div className="vendor-header">
                       <div className="vendor-id">{quote.company_name || quote.cage || `Quote ${quote.id}`}</div>

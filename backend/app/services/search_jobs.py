@@ -13,6 +13,7 @@ from app.services.awardee_enrichment import enrich_awardees_for_opportunity
 from app.services.company_profile_ingest import run_company_profile_ingest
 from app.services.dibbs.pdf_bulk_export import export_dibbs_pdfs_for_fscs
 from app.services.nsn_catalog.build import build_nsn_intelligence
+from app.services.nsn_catalog.publog_sync import sync_publog_package
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
 
 _jobs: dict[str, dict[str, Any]] = {}
@@ -206,6 +207,19 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 run_usaspending=bool(payload.get("run_usaspending", True)),
                 limit=int(payload.get("limit") or 50),
                 organization_id=payload.get("organization_id"),
+                progress_callback=lambda event: _append_progress(job_id, event),
+            )
+        elif kind == "publog_sync":
+            result = sync_publog_package(
+                db,
+                zip_path=payload.get("zip_path"),
+                publog_dir=payload.get("publog_dir"),
+                source_version=payload.get("source_version"),
+                nsns=payload.get("nsns"),
+                target_limit=int(payload.get("target_limit") or 250),
+                dry_run=bool(payload.get("dry_run", False)),
+                force=bool(payload.get("force", False)),
+                compute_hash=bool(payload.get("compute_hash", False)),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         elif kind == "awardee_enrichment":

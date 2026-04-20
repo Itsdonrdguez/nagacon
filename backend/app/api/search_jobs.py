@@ -13,7 +13,7 @@ def create_search_job(payload: dict = Body(default={}), current_org=Depends(get_
     payload = dict(payload or {})
     payload.setdefault("organization_id", getattr(current_org, "id", None))
     kind = str(payload.get("kind") or "manual").strip().lower()
-    allowed = {"profile", "manual", "dibbs_pdf_bulk_download", "workspace_intake", "nsn_build", "awardee_enrichment"}
+    allowed = {"profile", "manual", "dibbs_pdf_bulk_download", "workspace_intake", "nsn_build", "awardee_enrichment", "publog_sync"}
     if kind not in allowed:
         raise HTTPException(status_code=400, detail=f"Search job kind must be one of: {', '.join(sorted(allowed))}")
     return start_search_job(kind, payload)

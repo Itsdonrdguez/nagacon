@@ -10,6 +10,7 @@ from app.api import source_freshness as source_freshness_api
 from app.api import workspace as workspace_api
 from app.api import work_queue as work_queue_api
 from app.api.routes import company as company_api
+from app.api.routes import nsn as nsn_api
 from app.api.routes import pipeline as pipeline_api
 from app.core import security as security_core
 from app.schemas.company import CompanyProfileCreate
@@ -689,6 +690,60 @@ def test_data_health_route_returns_readiness_summary(client, monkeypatch):
     assert payload["organization_id"] == 1
     assert payload["summary"]["ready"] == 2
     assert payload["counts"]["nsn_master"] == 100
+
+
+def test_publog_status_route_returns_package_status(client, monkeypatch):
+    monkeypatch.setattr(
+        nsn_api,
+        "get_publog_package_status",
+        lambda db: {
+            "status": "ready",
+            "zip_path": "backend/PublogDVD.zip",
+            "publog_dir": "backend/publog_work",
+            "source_version": "2026-04",
+            "latest_run": None,
+        },
+    )
+
+    response = client.get("/api/nsn/publog/status")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+def test_publog_sync_route_starts_controlled_sync(client, monkeypatch):
+    def fake_sync_publog_package(db, **kwargs):
+        assert kwargs["target_limit"] == 10
+        assert kwargs["dry_run"] is True
+        assert kwargs["force"] is False
+        return {
+            "status": "ok",
+            "target_count": 1,
+            "targets": ["4110-01-534-2682"],
+            "imported": 1,
+        }
+
+    monkeypatch.setattr(nsn_api, "sync_publog_package", fake_sync_publog_package)
+
+    response = client.post("/api/nsn/publog/sync", json={"target_limit": 10, "dry_run": True})
+
+    assert response.status_code == 200
+    assert response.json()["target_count"] == 1
+
+
+def test_publog_sync_job_route_queues_background_job(client, monkeypatch):
+    def fake_start_search_job(kind, payload):
+        assert kind == "publog_sync"
+        assert payload["organization_id"] == 1
+        assert payload["target_limit"] == 5
+        return {"id": "job-1", "kind": kind, "status": "queued"}
+
+    monkeypatch.setattr(nsn_api, "start_search_job", fake_start_search_job)
+
+    response = client.post("/api/nsn/publog/sync-job", json={"target_limit": 5})
+
+    assert response.status_code == 200
+    assert response.json()["kind"] == "publog_sync"
 
 
 def test_saas_readiness_route_returns_org_scope_audit(client, monkeypatch):

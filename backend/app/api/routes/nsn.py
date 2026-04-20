@@ -1,18 +1,59 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_db
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.catalog_service import get_nsn_catalog_summary
 from app.services.nsn_catalog.publog_decomp import import_publog_nsn
+from app.services.nsn_catalog.publog_sync import get_publog_package_status, sync_publog_package
 from app.services.nsn_catalog.provider_seeding import seed_providers_from_nsn_catalog
 from app.services.nsn_catalog.refresh import refresh_nsn_intelligence
 from app.services.search_jobs import start_search_job
 
 
 router = APIRouter(prefix="/api/nsn", tags=["nsn-intelligence"])
+
+
+@router.get("/publog/status")
+def get_publog_status(
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    return get_publog_package_status(db)
+
+
+@router.post("/publog/sync")
+def sync_publog(
+    payload: dict | None = Body(default=None),
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    payload = dict(payload or {})
+    return sync_publog_package(
+        db,
+        zip_path=payload.get("zip_path"),
+        publog_dir=payload.get("publog_dir"),
+        source_version=payload.get("source_version"),
+        nsns=payload.get("nsns"),
+        target_limit=max(min(int(payload.get("target_limit") or 250), 1000), 1),
+        dry_run=bool(payload.get("dry_run", False)),
+        force=bool(payload.get("force", False)),
+        compute_hash=bool(payload.get("compute_hash", False)),
+    )
+
+
+@router.post("/publog/sync-job")
+def sync_publog_job(
+    payload: dict | None = Body(default=None),
+    current_org=Depends(get_current_organization),
+):
+    payload = dict(payload or {})
+    payload.setdefault("organization_id", getattr(current_org, "id", None))
+    payload["kind"] = "publog_sync"
+    payload["target_limit"] = max(min(int(payload.get("target_limit") or 250), 1000), 1)
+    return start_search_job("publog_sync", payload)
 
 
 @router.get("/{nsn}")

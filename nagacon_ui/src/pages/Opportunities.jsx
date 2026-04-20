@@ -42,11 +42,14 @@ const formatAwardDate = (value) => {
   return new Date(value).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
-const awardStatusLabel = (status) => {
+const opportunitySignalLabel = (opp) => {
+  if (opp?.requested_quantity_display) return opp.requested_quantity_display
+  if (opp?.award_intelligence_status === 'ACTIVE_RFQ') return null
+  const status = opp?.award_intelligence_status
   if (status === 'READY_FOR_USASPENDING_CHECK') return 'Award follow-up due'
   if (status === 'AWAITING_USASPENDING') return 'Awaiting USAspending'
   if (status === 'USASPENDING_CONFIRMED') return 'Award evidence found'
-  return 'Active RFQ'
+  return null
 }
 
 export default function Opportunities() {
@@ -377,7 +380,7 @@ export default function Opportunities() {
                     <div className="row-subtitle">
                       {opp.solicitation_number || 'Solicitation unavailable'}
                       {opp.workflow_label ? ` | ${opp.workflow_label}` : ''}
-                      {opp.award_intelligence_status ? ` | ${awardStatusLabel(opp.award_intelligence_status)}` : ''}
+                      {opportunitySignalLabel(opp) ? ` | ${opportunitySignalLabel(opp)}` : ''}
                     </div>
                   </TableCell>
                   <TableCell>

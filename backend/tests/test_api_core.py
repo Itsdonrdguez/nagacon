@@ -584,3 +584,45 @@ def test_auth_me_returns_current_user_and_org(client):
     payload = response.json()
     assert payload["user"]["email"] == "owner@nagacon.local"
     assert payload["organization"]["slug"] == "default"
+
+
+def test_opportunity_read_extracts_requested_quantity_from_dibbs_search_row():
+    from app.schemas.opportunity import OpportunityRead
+
+    payload = OpportunityRead.model_validate(
+        {
+            "id": 1,
+            "source": "DIBBS",
+            "source_opportunity_id": "SPE2DS26T9653",
+            "solicitation_number": "6515-01-646-2617",
+            "title": "TOURNIQUET, NONPNEUM",
+            "raw_payload": {"dibbs_search_row": {"quantity": "8"}},
+        }
+    ).model_dump()
+
+    assert payload["requested_quantity"] == "8"
+    assert payload["requested_quantity_display"] == "Qty: 8"
+
+
+def test_opportunity_read_extracts_requested_quantity_from_dibbs_detail():
+    from app.schemas.opportunity import OpportunityRead
+
+    payload = OpportunityRead.model_validate(
+        {
+            "id": 1,
+            "source": "DIBBS",
+            "source_opportunity_id": "SPE2DS26T9653",
+            "solicitation_number": "SPE2DS26T9653",
+            "title": "TOURNIQUET, NONPNEUM",
+            "raw_payload": {
+                "dibbs_detail": {
+                    "solicitations": [
+                        {"solicitation_number": "SPE2DS26T9653", "qty": "12"},
+                    ]
+                }
+            },
+        }
+    ).model_dump()
+
+    assert payload["requested_quantity"] == "12"
+    assert payload["requested_quantity_display"] == "Qty: 12"

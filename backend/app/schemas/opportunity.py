@@ -156,6 +156,38 @@ class OpportunityRead(OpportunityBase):
     def award_follow_up_eligible(self) -> bool:
         return self.award_intelligence_status == "READY_FOR_USASPENDING_CHECK"
 
+    @computed_field
+    @property
+    def requested_quantity(self) -> str | None:
+        payload = self.raw_payload if isinstance(self.raw_payload, dict) else {}
+        search_row = payload.get("dibbs_search_row") if isinstance(payload.get("dibbs_search_row"), dict) else {}
+        qty = _clean_quantity(search_row.get("quantity"))
+        if qty:
+            return qty
+
+        dibbs_detail = payload.get("dibbs_detail") if isinstance(payload.get("dibbs_detail"), dict) else {}
+        structured = dibbs_detail.get("structured") if isinstance(dibbs_detail.get("structured"), dict) else dibbs_detail
+        solicitations = structured.get("solicitations") if isinstance(structured, dict) else []
+        if isinstance(solicitations, list):
+            for row in solicitations:
+                if not isinstance(row, dict):
+                    continue
+                if self.solicitation_number and row.get("solicitation_number"):
+                    left = "".join(ch for ch in str(self.solicitation_number) if ch.isalnum()).upper()
+                    right = "".join(ch for ch in str(row.get("solicitation_number")) if ch.isalnum()).upper()
+                    if left and right and left != right:
+                        continue
+                qty = _clean_quantity(row.get("qty") or row.get("quantity"))
+                if qty:
+                    return qty
+
+        return None
+
+    @computed_field
+    @property
+    def requested_quantity_display(self) -> str | None:
+        return f"Qty: {self.requested_quantity}" if self.requested_quantity else None
+
     model_config = {"from_attributes": True}
 
 
@@ -164,3 +196,10 @@ class IngestResult(BaseModel):
     updated: int = 0
     skipped: int = 0
     errors: list[str] = Field(default_factory=list)
+
+
+def _clean_quantity(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text.replace(",", "")

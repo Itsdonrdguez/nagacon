@@ -150,6 +150,9 @@ export default function WorkQueue() {
         <Button variant="secondary" onClick={() => workQueueQuery.refetch()}>
           Refresh
         </Button>
+        <a className="btn btn-secondary btn-sm" href={`${api.defaults.baseURL}/api/export/work_queue.csv`}>
+          Export CSV
+        </a>
       </div>
 
       <div className="stats-grid">

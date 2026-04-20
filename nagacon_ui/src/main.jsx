@@ -18,6 +18,7 @@ const Company = lazy(() => import('./pages/Company'))
 const Ingestion = lazy(() => import('./pages/Ingestion'))
 const Pipeline = lazy(() => import('./pages/Pipeline'))
 const Settings = lazy(() => import('./pages/Settings'))
+const SourceFreshness = lazy(() => import('./pages/SourceFreshness'))
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -52,6 +53,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
                   <Route path="opportunities" element={<Opportunities />} />
                   <Route path="pipeline" element={<Pipeline />} />
                   <Route path="settings" element={<Settings />} />
+                  <Route path="source-freshness" element={<SourceFreshness />} />
                   <Route path="workspace/:id" element={<Workspace />} />
                   <Route path="vendors" element={<Vendors />} />
                   <Route path="providers" element={<Providers />} />

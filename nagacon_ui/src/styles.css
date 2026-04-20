@@ -1297,6 +1297,30 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   align-items: center;
 }
 
+.topbar-notification-link {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #dbe5f0;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #0f766e;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 0.45rem 0.7rem;
+  text-decoration: none;
+}
+
+.source-freshness-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid #dbe5f0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
 .work-queue-actions {
   display: flex;
   flex-wrap: wrap;

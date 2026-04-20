@@ -3,6 +3,9 @@ from types import SimpleNamespace
 
 from app.api import opportunities as opportunities_api
 from app.api import integrations as integrations_api
+from app.api import notifications as notifications_api
+from app.api import saas_readiness as saas_readiness_api
+from app.api import source_freshness as source_freshness_api
 from app.api import workspace as workspace_api
 from app.api import work_queue as work_queue_api
 from app.api.routes import company as company_api
@@ -627,6 +630,58 @@ def test_work_queue_today_returns_daily_actions(client, monkeypatch):
     payload = response.json()
     assert payload["total"] == 1
     assert payload["items"][0]["type"] == "QUOTE_FOLLOW_UP_DUE"
+
+
+def test_notifications_route_returns_work_queue_alerts(client, monkeypatch):
+    monkeypatch.setattr(
+        notifications_api,
+        "build_notifications",
+        lambda db, organization_id=None, limit=20: {
+            "items": [{"id": "n1", "title": "Follow up", "priority": "HIGH"}],
+            "unread_count": 1,
+            "generated_at": "2026-04-20T12:00:00",
+        },
+    )
+
+    response = client.get("/api/notifications")
+
+    assert response.status_code == 200
+    assert response.json()["unread_count"] == 1
+
+
+def test_source_freshness_route_returns_source_status(client, monkeypatch):
+    monkeypatch.setattr(
+        source_freshness_api,
+        "build_source_freshness",
+        lambda db, organization_id=None: {
+            "sources": [{"key": "publog", "status": "fresh"}],
+            "summary": {"fresh": 1},
+            "generated_at": "2026-04-20T12:00:00",
+        },
+    )
+
+    response = client.get("/api/source-freshness")
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["fresh"] == 1
+
+
+def test_saas_readiness_route_returns_org_scope_audit(client, monkeypatch):
+    monkeypatch.setattr(
+        saas_readiness_api,
+        "build_org_scope_audit",
+        lambda db, organization_id=None: {
+            "organization_id": organization_id,
+            "tables": [],
+            "warnings": [],
+            "summary": {"ready_for_saas": True},
+        },
+    )
+
+    response = client.get("/api/saas-readiness/org-scope")
+
+    assert response.status_code == 200
+    assert response.json()["organization_id"] == 1
 
 
 def test_opportunity_read_extracts_requested_quantity_from_dibbs_search_row():

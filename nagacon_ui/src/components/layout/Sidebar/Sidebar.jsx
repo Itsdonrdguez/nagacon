@@ -10,6 +10,7 @@ const items = [
   ['/vendors', 'Vendor Intelligence'],
   ['/providers', 'Providers'],
   ['/nsn-intelligence', 'NSN Intelligence'],
+  ['/source-freshness', 'Source Freshness'],
   ['/settings', 'Settings'],
 ]
 

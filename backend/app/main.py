@@ -8,6 +8,7 @@ from app.api.dibbs import router as dibbs_router
 from app.api.bid_submissions import router as submissions_router
 from app.api.dibbs_enrich import router as dibbs_enrich_router
 from app.api.export import router as export_router
+from app.api.notifications import router as notifications_router
 from app.api.opportunities import router as opportunities_router
 from app.api.parts import router as parts_router
 from app.api.proposal_assist import router as proposal_assist_router
@@ -16,6 +17,8 @@ from app.api.research import router as research_router
 from app.api.scoring import router as scoring_router
 from app.api.scrapers import router as scrapers_router
 from app.api.search_jobs import router as search_jobs_router
+from app.api.saas_readiness import router as saas_readiness_router
+from app.api.source_freshness import router as source_freshness_router
 from app.api.usaspending_vendor_intel import router as usaspending_vendor_intel_router
 from app.api.vendor_discovery import router as vendor_discovery_router
 from app.api.vendor_email import router as vendor_email_router
@@ -54,6 +57,9 @@ CORE_ROUTERS = [
     auth_router,
     opportunities_router,
     parts_router,
+    notifications_router,
+    source_freshness_router,
+    saas_readiness_router,
     workspace_router,
     pipeline_router,
     providers_router,

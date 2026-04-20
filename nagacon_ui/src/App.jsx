@@ -1,4 +1,4 @@
-import { Outlet } from 'react-router-dom'
+import { Link, Outlet } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { api } from './api/client'
 import Sidebar from './components/layout/Sidebar/Sidebar'
@@ -9,6 +9,14 @@ export default function App() {
     queryKey: ['auth-me'],
     queryFn: async () => {
       const res = await api.get('/api/auth/me')
+      return res.data
+    },
+    retry: 1,
+  })
+  const notificationsQuery = useQuery({
+    queryKey: ['notifications'],
+    queryFn: async () => {
+      const res = await api.get('/api/notifications')
       return res.data
     },
     retry: 1,
@@ -28,6 +36,9 @@ export default function App() {
               {authQuery.data?.user?.role ? ` | ${authQuery.data.user.role}` : ''}
             </div>
           </div>
+          <Link className="topbar-notification-link" to="/work-queue">
+            {notificationsQuery.data?.unread_count || 0} alerts
+          </Link>
         </div>
         <RouteErrorBoundary>
           <Outlet />

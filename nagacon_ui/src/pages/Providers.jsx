@@ -143,6 +143,7 @@ export default function Providers() {
 
   const rows = providersQuery.data?.items || []
   const total = providersQuery.data?.total || 0
+  const exportProvidersUrl = `${api.defaults.baseURL}/api/export/providers.csv`
 
   const sourceCounts = useMemo(() => {
     const counts = {}
@@ -181,6 +182,9 @@ export default function Providers() {
           <h1 className="page-title">Providers</h1>
           <div className="page-subtitle">A reusable database of distributors, manufacturers, approved sources, and awardees tied to NSNs and FSCs.</div>
         </div>
+        <a className="btn btn-secondary btn-sm" href={exportProvidersUrl}>
+          Export Providers CSV
+        </a>
       </div>
 
       <Card title="Provider Search">

@@ -1297,6 +1297,14 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   align-items: center;
 }
 
+.work-queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  align-items: center;
+}
+
 .structured-copy {
   color: #334155;
   line-height: 1.65;

@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom'
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { Badge, Button, Card, EmptyState, LoadingState } from '../components/ui'
 
@@ -45,6 +45,7 @@ const compactMeta = (parts) => parts.filter(Boolean).join(' | ')
 
 export default function WorkQueue() {
   const [filter, setFilter] = useState('all')
+  const queryClient = useQueryClient()
   const workQueueQuery = useQuery({
     queryKey: ['work-queue-today'],
     queryFn: async () => {
@@ -57,10 +58,64 @@ export default function WorkQueue() {
   const data = workQueueQuery.data || {}
   const items = data.items || []
   const summary = data.summary || {}
+  const refreshQueue = () => {
+    queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
+  }
+  const runPartFinderMutation = useMutation({
+    mutationFn: async (opportunityId) => {
+      const res = await api.post(`/api/parts/opportunity/${opportunityId}/refresh`)
+      return res.data
+    },
+    onSuccess: refreshQueue,
+  })
+  const syncVendorLeadsMutation = useMutation({
+    mutationFn: async (opportunityId) => {
+      const res = await api.post('/api/vendors/leads/sync', { opportunity_id: Number(opportunityId) })
+      return res.data
+    },
+    onSuccess: refreshQueue,
+  })
+  const logFollowUpMutation = useMutation({
+    mutationFn: async ({ opportunityId, quoteId, companyName }) => {
+      const res = await api.post(`/api/vendors/quotes/${quoteId}/follow-up`, {
+        opportunity_id: Number(opportunityId),
+        notes: `Follow-up logged from Daily Work Queue${companyName ? ` for ${companyName}` : ''}.`,
+      })
+      return res.data
+    },
+    onSuccess: refreshQueue,
+  })
   const visibleItems = items.filter((item) => {
     if (filter === 'all') return true
     return item.priority === filter || item.type === filter
   })
+  const actionLoading = (item) => {
+    if (item.type === 'MISSING_PART_FINDER') return runPartFinderMutation.isPending
+    if (item.type === 'MISSING_VENDOR_LEADS') return syncVendorLeadsMutation.isPending
+    if (item.type === 'QUOTE_FOLLOW_UP_DUE') return logFollowUpMutation.isPending
+    return false
+  }
+  const runItemAction = (item) => {
+    const opportunityId = item.opportunity?.id
+    if (!opportunityId) return
+    if (item.type === 'MISSING_PART_FINDER') {
+      runPartFinderMutation.mutate(opportunityId)
+    } else if (item.type === 'MISSING_VENDOR_LEADS') {
+      syncVendorLeadsMutation.mutate(opportunityId)
+    } else if (item.type === 'QUOTE_FOLLOW_UP_DUE' && item.meta?.quote_id) {
+      logFollowUpMutation.mutate({
+        opportunityId,
+        quoteId: item.meta.quote_id,
+        companyName: item.meta.company_name || item.meta.cage,
+      })
+    }
+  }
+  const directActionLabel = (item) => {
+    if (item.type === 'MISSING_PART_FINDER') return 'Run Part Finder'
+    if (item.type === 'MISSING_VENDOR_LEADS') return 'Sync Leads'
+    if (item.type === 'QUOTE_FOLLOW_UP_DUE') return 'Log Follow-up'
+    return ''
+  }
 
   if (workQueueQuery.isLoading) {
     return (
@@ -161,9 +216,21 @@ export default function WorkQueue() {
                     ])}
                   </div>
                 </div>
-                <Link className="btn btn-secondary btn-sm" to={item.action_url}>
-                  {item.action_label || 'Open Workspace'}
-                </Link>
+                <div className="work-queue-actions">
+                  {directActionLabel(item) ? (
+                    <Button
+                      size="sm"
+                      loading={actionLoading(item)}
+                      disabled={item.type === 'QUOTE_FOLLOW_UP_DUE' && !item.meta?.quote_id}
+                      onClick={() => runItemAction(item)}
+                    >
+                      {directActionLabel(item)}
+                    </Button>
+                  ) : null}
+                  <Link className="btn btn-secondary btn-sm" to={item.action_url}>
+                    {item.action_label || 'Open Workspace'}
+                  </Link>
+                </div>
               </div>
             ))}
           </div>

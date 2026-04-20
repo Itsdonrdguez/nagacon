@@ -8,6 +8,10 @@ READ_ONLY_MUTATING_LOOKING_GETS = {
     "/api/export/bid_package",
 }
 
+READ_ONLY_POSTS = {
+    "/api/parts/find",
+}
+
 AI_OR_GENERATION_MARKERS = (
     "/agents/",
     "/proposal",
@@ -95,7 +99,7 @@ def classify_route(method: str, path: str, name: str = "") -> AuditRoute:
             reason="Can invoke AI, generate artifacts, or create suggested work product.",
         )
 
-    if normalized_method == "GET":
+    if normalized_method == "GET" or (normalized_method == "POST" and path in READ_ONLY_POSTS):
         if path.startswith("/api/integrations"):
             return AuditRoute(
                 name=name,

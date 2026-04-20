@@ -14,7 +14,7 @@ def test_live_runnable_audit_routes_are_read_only_or_protected_reads():
     live_routes = [route for route in audit_routes(app) if route.runnable_live]
 
     assert live_routes
-    assert all(route.method == "GET" for route in live_routes)
+    assert all(route.method == "GET" or route.path == "/api/parts/find" for route in live_routes)
     assert all(route.category in {"read", "protected_read"} for route in live_routes)
 
 

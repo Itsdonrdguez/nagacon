@@ -9,6 +9,7 @@ from app.api.bid_submissions import router as submissions_router
 from app.api.dibbs_enrich import router as dibbs_enrich_router
 from app.api.export import router as export_router
 from app.api.opportunities import router as opportunities_router
+from app.api.parts import router as parts_router
 from app.api.proposal_assist import router as proposal_assist_router
 from app.api.phase3 import router as phase3_router
 from app.api.research import router as research_router
@@ -51,6 +52,7 @@ CORE_ROUTERS = [
     health_router,
     auth_router,
     opportunities_router,
+    parts_router,
     workspace_router,
     pipeline_router,
     providers_router,

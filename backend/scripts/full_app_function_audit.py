@@ -24,11 +24,19 @@ SECRET_PATTERNS = (
 )
 
 
-def http_call(method: str, url: str, *, api_key: str | None = None, timeout: int = 25) -> tuple[int | None, str, int]:
+def http_call(
+    method: str,
+    url: str,
+    *,
+    api_key: str | None = None,
+    timeout: int = 25,
+    body: dict[str, Any] | None = None,
+) -> tuple[int | None, str, int]:
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["X-API-Key"] = api_key
-    req = request.Request(url, method=method, headers=headers)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = request.Request(url, method=method, headers=headers, data=data)
     started = time.time()
     try:
         with request.urlopen(req, timeout=timeout) as resp:
@@ -241,6 +249,16 @@ def with_default_query(path: str, context: dict[str, list[Any]]) -> str:
     return path
 
 
+def body_for_path(path: str, context: dict[str, list[Any]], max_examples: int) -> dict[str, Any] | None:
+    if path == "/api/parts/find":
+        return {
+            "opportunity_ids": (context.get("opportunity_id") or [])[:max_examples],
+            "nsns": (context.get("nsn") or [])[:max_examples],
+            "limit": max_examples,
+        }
+    return None
+
+
 def run_audit(base_url: str, *, max_examples: int, api_key: str | None, timeout: int) -> dict[str, Any]:
     context = collect_context(base_url, max_examples=max_examples, api_key=api_key)
     rows = []
@@ -263,7 +281,13 @@ def run_audit(base_url: str, *, max_examples: int, api_key: str | None, timeout:
                 )
                 break
             key = api_key if route.category == "protected_read" else None
-            status, body, ms = http_call(route.method, f"{base_url}{path}", api_key=key, timeout=timeout)
+            status, body, ms = http_call(
+                route.method,
+                f"{base_url}{path}",
+                api_key=key,
+                timeout=timeout,
+                body=body_for_path(path, context, max_examples),
+            )
             rows.append(
                 {
                     "route": route_key(route),

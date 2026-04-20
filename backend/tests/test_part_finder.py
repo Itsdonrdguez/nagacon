@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 
 from app.schemas.opportunity import RawOpportunity
-from app.services.part_vendor_leads import _build_part_finder_candidates
+from app.models.vendor import VendorLead, VendorQuote
+from app.services.part_vendor_leads import _build_part_finder_candidates, seed_quotes_from_part_finder_leads
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
 
 
@@ -117,3 +118,69 @@ def test_part_finder_vendor_seed_candidates_merge_provider_and_awardee():
     assert candidates[0]["cage"] == "1ABC2"
     assert candidates[0]["part_number"] == "ABC-123"
     assert candidates[0]["is_approved_source"] is True
+
+
+def test_part_finder_quote_seed_creates_quote_for_high_confidence_cage_lead():
+    lead = SimpleNamespace(
+        id=12,
+        opportunity_id=77,
+        organization_id=4,
+        source_type="PART_FINDER_PROVIDER_AWARDEE",
+        company_name="Acme Medical",
+        cage="1ABC2",
+        part_number="ABC-123",
+        nsn="6515-01-646-2617",
+        status="NEW",
+        confidence=91,
+        is_approved_source=True,
+        notes="Provider and awardee evidence.",
+        raw_text=None,
+        updated_at=None,
+    )
+    added = []
+
+    class FakeQuery:
+        def __init__(self, model):
+            self.model = model
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def limit(self, value):
+            return self
+
+        def all(self):
+            return [lead] if self.model is VendorLead else []
+
+        def first(self):
+            return None
+
+    class FakeDB:
+        def query(self, model):
+            return FakeQuery(model)
+
+        def add(self, item):
+            added.append(item)
+
+        def flush(self):
+            for index, item in enumerate(added, start=100):
+                item.id = index
+
+        def commit(self):
+            self.committed = True
+
+    result = seed_quotes_from_part_finder_leads(
+        FakeDB(),
+        SimpleNamespace(id=77, organization_id=4),
+        organization_id=4,
+    )
+
+    assert result["created"] == 1
+    assert result["seeded"][0]["quote_id"] == 100
+    assert added[0].cage == "1ABC2"
+    assert added[0].part_number == "ABC-123"
+    assert added[0].status == "NOT_REQUESTED"
+    assert lead.status == "SEEDED_TO_QUOTES"

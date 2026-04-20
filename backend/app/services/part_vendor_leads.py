@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models.opportunity import Opportunity
-from app.models.vendor import VendorLead
+from app.models.vendor import VendorLead, VendorQuote
+
+DEFAULT_QUOTE_STATUS = "NOT_REQUESTED"
 
 
 def seed_vendor_leads_from_part_finder_result(
@@ -62,6 +64,100 @@ def seed_vendor_leads_from_part_finder_result(
         "updated": updated,
         "skipped": skipped,
         "candidate_count": len(candidates),
+        "seeded": seeded,
+    }
+
+
+def seed_quotes_from_part_finder_leads(
+    db: Session,
+    opp: Opportunity,
+    *,
+    organization_id: int | None = None,
+    min_confidence: int = 75,
+    limit: int = 10,
+) -> dict[str, Any]:
+    org_id = organization_id or getattr(opp, "organization_id", None)
+    query = (
+        db.query(VendorLead)
+        .filter(VendorLead.opportunity_id == opp.id)
+        .filter(VendorLead.cage.is_not(None), VendorLead.cage != "")
+        .filter(VendorLead.confidence >= min_confidence)
+        .filter(VendorLead.source_type.ilike("%PART_FINDER%"))
+        .filter(VendorLead.status != "IGNORED")
+    )
+    if org_id is not None:
+        query = query.filter(or_(VendorLead.organization_id == org_id, VendorLead.organization_id.is_(None)))
+    leads = (
+        query
+        .order_by(VendorLead.is_approved_source.desc(), VendorLead.confidence.desc(), VendorLead.company_name.asc().nullslast())
+        .limit(limit)
+        .all()
+    )
+
+    created = 0
+    updated = 0
+    skipped = 0
+    seeded: list[dict[str, Any]] = []
+    for lead in leads:
+        cage = _clean(lead.cage, 10)
+        if not cage:
+            skipped += 1
+            continue
+        part_number = _clean(lead.part_number, 80)
+        quote = _find_existing_quote(db, opp.id, cage, part_number, organization_id=org_id)
+        notes = _quote_notes_from_lead(lead)
+        if quote:
+            touched = False
+            if quote.organization_id is None and org_id is not None:
+                quote.organization_id = org_id
+                touched = True
+            if lead.company_name and not quote.company_name:
+                quote.company_name = lead.company_name
+                touched = True
+            merged_notes = _merge_text(quote.notes, notes)
+            if merged_notes != quote.notes:
+                quote.notes = merged_notes
+                touched = True
+            if touched:
+                quote.updated_at = datetime.utcnow()
+                updated += 1
+        else:
+            quote = VendorQuote(
+                organization_id=org_id,
+                opportunity_id=opp.id,
+                cage=cage,
+                company_name=lead.company_name,
+                part_number=part_number,
+                status=DEFAULT_QUOTE_STATUS,
+                notes=notes,
+            )
+            db.add(quote)
+            db.flush()
+            created += 1
+
+        if lead.status != "SEEDED_TO_QUOTES":
+            lead.status = "SEEDED_TO_QUOTES"
+            lead.updated_at = datetime.utcnow()
+        seeded.append(
+            {
+                "lead_id": lead.id,
+                "quote_id": quote.id,
+                "company_name": lead.company_name,
+                "cage": cage,
+                "part_number": part_number,
+                "confidence": lead.confidence,
+            }
+        )
+
+    if created or updated or seeded:
+        db.commit()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "seedable_count": len(leads),
+        "min_confidence": min_confidence,
         "seeded": seeded,
     }
 
@@ -173,6 +269,28 @@ def _find_existing_lead(db: Session, opportunity_id: int, candidate: dict[str, A
     return query.first()
 
 
+def _find_existing_quote(
+    db: Session,
+    opportunity_id: int,
+    cage: str,
+    part_number: str | None,
+    *,
+    organization_id: int | None = None,
+) -> VendorQuote | None:
+    query = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.opportunity_id == opportunity_id)
+        .filter(func.upper(func.coalesce(VendorQuote.cage, "")) == cage.upper())
+    )
+    if organization_id is not None:
+        query = query.filter(or_(VendorQuote.organization_id == organization_id, VendorQuote.organization_id.is_(None)))
+    if part_number:
+        query = query.filter(VendorQuote.part_number == part_number)
+    else:
+        query = query.filter(VendorQuote.part_number.is_(None))
+    return query.first()
+
+
 def _update_lead(rec: VendorLead, candidate: dict[str, Any], *, organization_id: int | None = None) -> bool:
     touched = False
     for attr in ["company_name", "cage", "part_number", "nsn"]:
@@ -244,6 +362,18 @@ def _lead_seed_payload(rec: VendorLead, action: str) -> dict[str, Any]:
         "source_type": rec.source_type,
         "confidence": rec.confidence,
     }
+
+
+def _quote_notes_from_lead(lead: VendorLead) -> str:
+    parts = [
+        "Auto-created from Part Finder vendor evidence.",
+        f"Lead source: {lead.source_type}." if lead.source_type else None,
+        f"Lead confidence: {lead.confidence}." if lead.confidence is not None else None,
+        f"NSN: {lead.nsn}." if lead.nsn else None,
+        "Approved-source signal present." if lead.is_approved_source else None,
+        lead.notes,
+    ]
+    return " ".join(part for part in parts if part)[:4000]
 
 
 def _merge_text(current: str | None, incoming: str | None, *, max_len: int = 4000) -> str | None:

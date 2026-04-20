@@ -469,6 +469,7 @@ export default function Workspace() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+      queryClient.invalidateQueries({ queryKey: ['vendor-leads', id] })
     },
   })
   const generateEmailMutation = useMutation({

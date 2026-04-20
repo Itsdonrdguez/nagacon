@@ -5,7 +5,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.models.opportunity import Opportunity
 from app.services.part_finder import find_part_for_opportunity
+from app.services.part_vendor_leads import seed_vendor_leads_from_part_finder_result
 from app.services.workspace_service import create_artifact
 
 
@@ -37,8 +39,18 @@ def enrich_dibbs_opportunities_after_ingest(
 
     for opportunity_id in ids:
         try:
+            opp = _get_opportunity(db, opportunity_id, organization_id=organization_id)
+            if not opp:
+                errors.append({"opportunity_id": opportunity_id, "error": "Opportunity not found"})
+                continue
             result = find_part_for_opportunity(db, opportunity_id, organization_id=organization_id)
             artifact = _persist_part_finder_artifact(db, opportunity_id, result)
+            vendor_leads = seed_vendor_leads_from_part_finder_result(
+                db,
+                opp,
+                result,
+                organization_id=organization_id,
+            ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "candidate_count": 0}
             item = {
                 "opportunity_id": opportunity_id,
                 "status": result.get("status"),
@@ -46,6 +58,7 @@ def enrich_dibbs_opportunities_after_ingest(
                 "quantity": (result.get("part") or {}).get("quantity"),
                 "item_name": (result.get("part") or {}).get("item_name"),
                 "artifact_id": getattr(artifact, "id", None),
+                "vendor_leads": vendor_leads,
             }
             if queue_nsn_build and item["nsn"]:
                 from app.services.search_jobs import start_search_job
@@ -76,6 +89,13 @@ def enrich_dibbs_opportunities_after_ingest(
         "errors": errors,
         "items": items,
     }
+
+
+def _get_opportunity(db: Session, opportunity_id: int, *, organization_id: int | None = None) -> Opportunity | None:
+    query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
+    if organization_id is not None:
+        query = query.filter(Opportunity.organization_id == organization_id)
+    return query.first()
 
 
 def _persist_part_finder_artifact(db: Session, opportunity_id: int, result: dict[str, Any]):

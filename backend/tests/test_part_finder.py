@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from app.schemas.opportunity import RawOpportunity
+from app.services.part_vendor_leads import _build_part_finder_candidates
 from app.services.part_finder import _target_from_opportunity, find_parts_batch
 
 
@@ -80,3 +81,39 @@ def test_dibbs_scraper_ingest_auto_runs_part_finder_enrichment(monkeypatch):
     assert result["inserted"] == 1
     assert result["part_finder_enrichment"]["processed"] == 1
     assert calls == [([88], 4, True, 1)]
+
+
+def test_part_finder_vendor_seed_candidates_merge_provider_and_awardee():
+    result = {
+        "part": {
+            "nsn": "6515-01-646-2617",
+            "part_numbers": ["ABC-123"],
+        },
+        "providers": [
+            {
+                "name": "Acme Medical",
+                "cage": "1ABC2",
+                "roles": ["Approved Source"],
+                "sources": ["PUB LOG"],
+                "confidence": 88,
+            }
+        ],
+        "awardees": [
+            {
+                "name": "Acme Medical",
+                "cage": "1ABC2",
+                "award_count": 3,
+                "total_award_amount": 12500,
+                "latest_award_date": "2025-01-03",
+            }
+        ],
+    }
+
+    candidates = _build_part_finder_candidates(result)
+
+    assert len(candidates) == 1
+    assert candidates[0]["source_type"] == "PART_FINDER_PROVIDER_AWARDEE"
+    assert candidates[0]["company_name"] == "Acme Medical"
+    assert candidates[0]["cage"] == "1ABC2"
+    assert candidates[0]["part_number"] == "ABC-123"
+    assert candidates[0]["is_approved_source"] is True

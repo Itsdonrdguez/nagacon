@@ -30,6 +30,12 @@ def _source_label(lead: VendorLead, provider_item: ProviderItem | None = None) -
         return "Approved Source"
     if "NSN" in source:
         return "Exact NSN Match"
+    if "PART_FINDER_PROVIDER_AWARDEE" in source:
+        return "Part Finder Provider + Awardee"
+    if "PART_FINDER_PROVIDER" in source:
+        return "Part Finder Provider"
+    if "PART_FINDER_AWARDEE" in source:
+        return "Part Finder Awardee"
     if "USASPENDING" in source or "AWARDEE" in source:
         return "Past Awardee"
     if provider_item is not None:

@@ -1,4 +1,5 @@
-import { useQuery } from '@tanstack/react-query'
+import { useEffect, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { Badge, Button, Card, EmptyState, LoadingState } from '../components/ui'
 
@@ -41,6 +42,8 @@ function MetricList({ metrics = [] }) {
 }
 
 export default function DataHealth() {
+  const queryClient = useQueryClient()
+  const [publogJobId, setPublogJobId] = useState(null)
   const dataHealthQuery = useQuery({
     queryKey: ['data-health'],
     queryFn: async () => {
@@ -49,6 +52,41 @@ export default function DataHealth() {
     },
     retry: 1,
   })
+  const publogStatusQuery = useQuery({
+    queryKey: ['publog-status'],
+    queryFn: async () => {
+      const res = await api.get('/api/nsn/publog/status')
+      return res.data
+    },
+    retry: 1,
+  })
+  const publogJobQuery = useQuery({
+    queryKey: ['search-job', publogJobId],
+    enabled: Boolean(publogJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${publogJobId}`)
+      return res.data
+    },
+  })
+  const publogSyncMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/nsn/publog/sync-job', { target_limit: 250 })
+      return res.data
+    },
+    onSuccess: (job) => {
+      setPublogJobId(job.id)
+    },
+  })
+
+  useEffect(() => {
+    if (publogJobQuery.data?.status !== 'success') return
+    queryClient.invalidateQueries({ queryKey: ['data-health'] })
+    queryClient.invalidateQueries({ queryKey: ['publog-status'] })
+  }, [publogJobQuery.data?.status, publogJobQuery.data?.completed_at, queryClient])
 
   if (dataHealthQuery.isLoading) {
     return (
@@ -80,6 +118,10 @@ export default function DataHealth() {
   const freshnessSources = data.source_freshness?.sources || []
   const saasSummary = data.saas_readiness?.summary || {}
   const latestPublog = data.latest_publog_import
+  const publogStatus = publogStatusQuery.data || {}
+  const publogJob = publogJobQuery.data
+  const publogJobRunning = publogJob?.status === 'queued' || publogJob?.status === 'running'
+  const latestPublogSource = latestPublog || publogStatus.latest_run
 
   return (
     <div className="page">
@@ -176,33 +218,94 @@ export default function DataHealth() {
           </div>
         </Card>
 
-        <Card title="Latest PUB LOG Import">
-          {latestPublog ? (
+        <Card title="PUB LOG Package">
+          <div className="data-health-stack">
+            <div className="source-freshness-row">
+              <div>
+                <div className="row-title">{publogStatus.source_version || 'PUB LOG package'}</div>
+                <div className="panel-subtitle">{publogStatus.zip_path || 'ZIP path unavailable'}</div>
+                <div className="row-subtitle">
+                  {publogStatus.zip?.size_bytes
+                    ? `${formatNumber(publogStatus.zip.size_bytes)} bytes | ${publogStatus.zip.member_count || 0} files`
+                    : 'Package metadata unavailable'}
+                </div>
+              </div>
+              <Badge label={publogStatus.status || 'unknown'} variant={STATUS_VARIANT[publogStatus.status] || 'default'} />
+            </div>
+            <div className="data-health-action-row">
+              <Button
+                loading={publogSyncMutation.isPending || publogJobRunning}
+                disabled={publogStatus.status !== 'ready'}
+                onClick={() => publogSyncMutation.mutate()}
+              >
+                Sync PUB LOG Targets
+              </Button>
+              <Button variant="secondary" onClick={() => publogStatusQuery.refetch()}>
+                Check Package
+              </Button>
+            </div>
+            {publogJob ? (
+              <div className="publog-job-box">
+                <div className="source-freshness-row">
+                  <div>
+                    <div className="row-title">PUB LOG sync job</div>
+                    <div className="panel-subtitle">
+                      {(publogJob.progress?.current_label || 'Running package sync').trim()}
+                    </div>
+                    <div className="row-subtitle">
+                      Status: {publogJob.status} | {publogJob.progress?.percent || 0}% complete
+                    </div>
+                  </div>
+                  <Badge
+                    label={publogJob.status}
+                    variant={
+                      publogJob.status === 'success'
+                        ? 'success'
+                        : publogJob.status === 'failed'
+                          ? 'error'
+                          : 'warning'
+                    }
+                  />
+                </div>
+                {publogJob.result?.target_count ? (
+                  <div className="row-subtitle">
+                    Targets: {publogJob.result.target_count} | Imported: {publogJob.result.imported || 0} | Failed: {publogJob.result.failed || 0}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </Card>
+      </div>
+
+      <Card title="Latest PUB LOG Import">
+        {latestPublogSource ? (
+          <div className="data-health-stack">
             <div className="data-health-stack">
               <div className="source-freshness-row">
                 <div>
-                  <div className="row-title">{latestPublog.source_name}</div>
-                  <div className="panel-subtitle">{latestPublog.source_file || 'No source file recorded'}</div>
-                  <div className="row-subtitle">Completed {formatDate(latestPublog.completed_at)}</div>
+                  <div className="row-title">{latestPublogSource.source_name}</div>
+                  <div className="panel-subtitle">{latestPublogSource.source_file || 'No source file recorded'}</div>
+                  <div className="row-subtitle">Completed {formatDate(latestPublogSource.completed_at)}</div>
                 </div>
-                <Badge label={latestPublog.status} variant={latestPublog.status === 'completed' ? 'success' : 'warning'} />
+                <Badge label={latestPublogSource.status} variant={latestPublogSource.status === 'completed' ? 'success' : 'warning'} />
               </div>
               <MetricList
                 metrics={[
-                  { label: 'Rows Seen', value: latestPublog.rows_seen },
-                  { label: 'Rows Imported', value: latestPublog.rows_imported },
+                  { label: 'Rows Seen', value: latestPublogSource.rows_seen },
+                  { label: 'Rows Imported', value: latestPublogSource.rows_imported },
                 ]}
               />
-              {latestPublog.error ? <div className="error-text">{latestPublog.error}</div> : null}
+              {latestPublogSource.error ? <div className="error-text">{latestPublogSource.error}</div> : null}
             </div>
-          ) : (
-            <EmptyState
-              title="No PUB LOG import yet"
-              subtitle="Import PublogDVD.zip to populate NSN master, reference, and interchangeability data."
-            />
-          )}
-        </Card>
-      </div>
+          </div>
+        ) : (
+          <EmptyState
+            title="No PUB LOG import yet"
+            subtitle="Import PublogDVD.zip to populate NSN master, reference, and interchangeability data."
+          />
+        )}
+      </Card>
 
       <Card title="Source Freshness">
         <div className="work-queue-list">

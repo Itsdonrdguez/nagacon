@@ -81,7 +81,8 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
     nsn_awards = summarize_nsn_award_evidence(db, target.nsn)
     pricing = _price_summary(db, target)
     identity_confidence = _identity_confidence(master, references)
-    alternate_graph = _alternate_graph(target, references, interchangeability, evidence, providers, vendor_recommendations)
+    related_masters = _related_master_map(db, interchangeability)
+    alternate_graph = _alternate_graph(target, references, interchangeability, evidence, providers, vendor_recommendations, related_masters)
 
     return {
         "status": "ok",
@@ -406,6 +407,7 @@ def _alternate_graph(
     evidence: list[NsnEvidence],
     providers: list[dict[str, Any]],
     vendor_recommendations: list[dict[str, Any]],
+    related_masters: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     part_numbers = []
     cages = []
@@ -426,10 +428,13 @@ def _alternate_graph(
                 "source": row.source_name,
             })
     for row in interchangeability:
+        related_master = related_masters.get(row.related_compact_nsn or "", {})
         related_nodes.append({
             "node_type": "nsn" if not str(row.related_nsn or "").startswith("INC-") else "related_inc",
             "related_value": row.related_nsn,
             "related_compact": row.related_compact_nsn,
+            "related_item_name": related_master.get("item_name") or row.notes,
+            "related_fsc": related_master.get("fsc"),
             "relationship_type": row.relationship_type,
             "notes": row.notes,
             "source": row.source_name,
@@ -451,6 +456,8 @@ def _alternate_graph(
         "part_numbers": _dedupe_dicts(part_numbers, ["part_number", "cage", "source"]),
         "cages": _dedupe_dicts(cages, ["cage", "source"]),
         "related_nodes": _dedupe_dicts(related_nodes, ["related_value", "relationship_type", "source"]),
+        "actual_related_nsn_count": len([row for row in related_nodes if row.get("node_type") == "nsn"]),
+        "concept_only_count": len([row for row in related_nodes if row.get("node_type") != "nsn"]),
         "provider_count": len(providers),
         "vendor_candidate_count": len(vendor_recommendations),
     }
@@ -466,3 +473,29 @@ def _dedupe_dicts(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[str,
         seen.add(token)
         out.append(row)
     return out
+
+
+def _related_master_map(db: Session, interchangeability: list[NsnInterchangeability]) -> dict[str, dict[str, Any]]:
+    related_compacts = sorted(
+        {
+            row.related_compact_nsn
+            for row in interchangeability
+            if row.related_compact_nsn and len(str(row.related_compact_nsn)) == 13
+        }
+    )
+    if not related_compacts:
+        return {}
+    rows = (
+        db.query(NsnMaster)
+        .filter(NsnMaster.compact_nsn.in_(related_compacts))
+        .all()
+    )
+    return {
+        row.compact_nsn: {
+            "nsn": row.nsn,
+            "compact_nsn": row.compact_nsn,
+            "item_name": row.item_name,
+            "fsc": row.fsc,
+        }
+        for row in rows
+    }

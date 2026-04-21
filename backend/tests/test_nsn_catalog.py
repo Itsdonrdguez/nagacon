@@ -2,6 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.services.nsn_catalog.normalizer import normalize_nsn
+from app.services.nsn_catalog.catalog_service import _alternate_graph
+from app.services.nsn_catalog.publog_decomp import _resolve_related_nsn_candidates
 from app.services.nsn_catalog.publog_importer import parse_publog_csv, parse_publog_row
 from app.services.nsn_catalog.provider_seeding import (
     catalog_reference_confidence,
@@ -82,6 +84,26 @@ def test_parse_publog_csv_handles_interchangeability_headers():
     assert rows[0].related_nsn == "4110-01-123-4567"
     assert rows[0].relationship_type == "substitute"
     assert rows[0].order_of_use == "1"
+
+
+def test_resolve_related_nsn_candidates_maps_related_inc_to_actual_nsns():
+    rows = _resolve_related_nsn_candidates(
+        "6515016462617",
+        [{"RELATED_INC": "35972", "ITEM_NAME": "TEST KIT,THEOPHYLLINE DETERMINAT"}],
+        {
+            "35972": [
+                {"FSC": "6550", "NIIN": "014856112", "INC": "35972", "ITEM_NAME": "TEST KIT,THEOPHYLLINE DETERMINAT"},
+                {"FSC": "6550", "NIIN": "014858613", "INC": "35972", "ITEM_NAME": "TEST KIT,THEOPHYLLINE DETERMINAT"},
+            ]
+        },
+    )
+
+    assert [row["related_nsn"] for row in rows] == [
+        "6550-01-485-6112",
+        "6550-01-485-8613",
+    ]
+    assert all(row["relationship_type"] == "related_item_concept_nsn" for row in rows)
+    assert all(row["related_inc"] == "35972" for row in rows)
 
 
 def test_provider_payload_from_catalog_reference_labels_oem_candidate():
@@ -203,6 +225,40 @@ def test_vendor_recommendations_merge_catalog_provider_award_and_price(monkeypat
     assert "Price History Supplier" in candidate["roles"]
     assert any(item["type"] == "catalog_reference" for item in candidate["evidence"])
     assert any(item["type"] == "award_history" for item in candidate["evidence"])
+
+
+def test_alternate_graph_includes_named_related_nsns():
+    graph = _alternate_graph(
+        normalize_nsn("6515016462617"),
+        references=[],
+        interchangeability=[
+            SimpleNamespace(
+                related_nsn="6550-01-485-6112",
+                related_compact_nsn="6550014856112",
+                relationship_type="related_item_concept_nsn",
+                notes="TEST KIT,THEOPHYLLINE DETERMINAT",
+                source_name="PUB_LOG_V_H6_RELATED",
+                confidence=0.72,
+            )
+        ],
+        evidence=[],
+        providers=[],
+        vendor_recommendations=[],
+        related_masters={
+            "6550014856112": {
+                "nsn": "6550-01-485-6112",
+                "compact_nsn": "6550014856112",
+                "item_name": "TEST KIT,THEOPHYLLINE DETERMINAT",
+                "fsc": "6550",
+            }
+        },
+    )
+
+    assert graph["actual_related_nsn_count"] == 1
+    assert graph["concept_only_count"] == 0
+    assert graph["related_nodes"][0]["related_value"] == "6550-01-485-6112"
+    assert graph["related_nodes"][0]["related_item_name"] == "TEST KIT,THEOPHYLLINE DETERMINAT"
+    assert graph["related_nodes"][0]["related_fsc"] == "6550"
 
 
 def test_usaspending_context_expands_with_catalog_references():

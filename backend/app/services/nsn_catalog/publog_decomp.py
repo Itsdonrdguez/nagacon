@@ -170,6 +170,7 @@ def import_publog_nsn(
     )
     cage_rows = _query_cage_profiles(root, part_rows)
     related_rows = _query_related_item_concepts(root, nsn_rows)
+    resolved_related_nsn_rows = _query_resolved_related_nsns(root, target.compact, related_rows)
 
     master_created = False
     references_created = 0
@@ -203,6 +204,25 @@ def import_publog_nsn(
             created_interchange = _upsert_related_interchange(db, target.nsn, target.compact, row, source_version)
             interchange_created += int(created_interchange)
             interchange_updated += int(not created_interchange)
+        for row in resolved_related_nsn_rows:
+            _upsert_master(
+                db,
+                row["related_nsn"],
+                row["related_compact_nsn"],
+                {
+                    "FSC": row.get("related_fsc"),
+                    "NIIN": row.get("related_niin"),
+                    "INC": row.get("related_inc"),
+                    "ITEM_NAME": row.get("related_item_name"),
+                },
+                source_version,
+            )
+            created = _upsert_related_nsn_evidence(db, target.nsn, target.compact, row, source_version)
+            evidence_created += int(created)
+            evidence_updated += int(not created)
+            created_interchange = _upsert_resolved_related_interchange(db, target.nsn, target.compact, row, source_version)
+            interchange_created += int(created_interchange)
+            interchange_updated += int(not created_interchange)
         db.commit()
 
     return {
@@ -221,6 +241,7 @@ def import_publog_nsn(
         "characteristic_rows": len(characteristic_rows),
         "cage_rows": len(cage_rows),
         "related_rows": len(related_rows),
+        "resolved_related_nsn_rows": len(resolved_related_nsn_rows),
         "master_created": master_created,
         "references_created": references_created,
         "references_updated": references_updated,
@@ -234,6 +255,7 @@ def import_publog_nsn(
         "characteristic_samples": characteristic_rows[:10],
         "cage_samples": cage_rows[:10],
         "related_samples": related_rows[:10],
+        "resolved_related_nsn_samples": resolved_related_nsn_rows[:10],
     }
 
 
@@ -266,6 +288,57 @@ def _query_related_item_concepts(root: Path, nsn_rows: list[dict[str, str]]) -> 
         )
     except Exception:
         return []
+
+
+def _query_resolved_related_nsns(root: Path, compact_nsn: str, related_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    related_incs = sorted({(row.get("RELATED_INC") or "").strip() for row in related_rows if (row.get("RELATED_INC") or "").strip()})
+    if not related_incs:
+        return []
+    lookup: dict[str, list[dict[str, str]]] = {}
+    for related_inc in related_incs[:25]:
+        try:
+            lookup[related_inc] = run_decomp_query(
+                root,
+                f"select FSC,NIIN,INC,ITEM_NAME from P_FLIS_NSN WHERE INC='{related_inc}'",
+            )
+        except Exception:
+            lookup[related_inc] = []
+    return _resolve_related_nsn_candidates(compact_nsn, related_rows, lookup)
+
+
+def _resolve_related_nsn_candidates(
+    compact_nsn: str,
+    related_rows: list[dict[str, str]],
+    lookup: dict[str, list[dict[str, str]]],
+) -> list[dict[str, str]]:
+    resolved: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in related_rows:
+        related_inc = (row.get("RELATED_INC") or "").strip()
+        source_item_name = (row.get("ITEM_NAME") or "").strip()
+        if not related_inc:
+            continue
+        for candidate in lookup.get(related_inc, []):
+            target = normalize_nsn(f"{candidate.get('FSC') or ''}{candidate.get('NIIN') or ''}")
+            if not target or target.compact == compact_nsn:
+                continue
+            key = target.compact
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(
+                {
+                    "related_inc": related_inc,
+                    "source_item_name": source_item_name,
+                    "related_nsn": target.nsn,
+                    "related_compact_nsn": target.compact,
+                    "related_fsc": target.fsc,
+                    "related_niin": target.niin,
+                    "related_item_name": (candidate.get("ITEM_NAME") or "").strip() or source_item_name,
+                    "relationship_type": "related_item_concept_nsn",
+                }
+            )
+    return resolved
 
 
 def _read_publog_version(root: Path) -> str | None:
@@ -563,6 +636,95 @@ def _upsert_related_interchange(
         "source_version": source_version,
         "confidence": 0.6,
         "notes": row.get("ITEM_NAME"),
+        "raw_payload": row,
+    }
+    if existing:
+        for key, value in payload.items():
+            setattr(existing, key, value)
+        db.add(existing)
+        return False
+    db.add(NsnInterchangeability(**payload))
+    return True
+
+
+def _upsert_related_nsn_evidence(
+    db: Session,
+    nsn: str,
+    compact_nsn: str,
+    row: dict[str, str],
+    source_version: str | None,
+) -> bool:
+    related_nsn = (row.get("related_nsn") or "").strip()
+    if not related_nsn:
+        return False
+    claim_value = " | ".join(
+        part
+        for part in [related_nsn, row.get("related_item_name"), f"INC {row.get('related_inc')}" if row.get("related_inc") else None]
+        if part
+    )[:500]
+    existing = (
+        db.query(NsnEvidence)
+        .filter(
+            NsnEvidence.compact_nsn == compact_nsn,
+            NsnEvidence.claim_type == "related_nsn_candidate",
+            NsnEvidence.claim_value == claim_value,
+            NsnEvidence.source_name == "PUB_LOG_V_H6_RELATED",
+        )
+        .first()
+    )
+    payload = {
+        "nsn": nsn,
+        "compact_nsn": compact_nsn,
+        "claim_type": "related_nsn_candidate",
+        "claim_value": claim_value,
+        "source_name": "PUB_LOG_V_H6_RELATED",
+        "source_version": source_version,
+        "matched_by": "related_inc_to_nsn",
+        "confidence": 0.74,
+        "evidence_text": f"Resolved related INC {row.get('related_inc')} to NSN {related_nsn}",
+        "raw_payload": row,
+    }
+    if existing:
+        for key, value in payload.items():
+            setattr(existing, key, value)
+        db.add(existing)
+        return False
+    db.add(NsnEvidence(**payload))
+    return True
+
+
+def _upsert_resolved_related_interchange(
+    db: Session,
+    nsn: str,
+    compact_nsn: str,
+    row: dict[str, str],
+    source_version: str | None,
+) -> bool:
+    related_nsn = (row.get("related_nsn") or "").strip()
+    related_compact_nsn = (row.get("related_compact_nsn") or "").strip()
+    if not related_nsn or not related_compact_nsn:
+        return False
+    existing = (
+        db.query(NsnInterchangeability)
+        .filter(
+            NsnInterchangeability.compact_nsn == compact_nsn,
+            NsnInterchangeability.related_compact_nsn == related_compact_nsn,
+            NsnInterchangeability.relationship_type == "related_item_concept_nsn",
+            NsnInterchangeability.source_name == "PUB_LOG_V_H6_RELATED",
+        )
+        .first()
+    )
+    payload = {
+        "nsn": nsn,
+        "compact_nsn": compact_nsn,
+        "related_nsn": related_nsn,
+        "related_compact_nsn": related_compact_nsn,
+        "relationship_type": "related_item_concept_nsn",
+        "order_of_use": None,
+        "source_name": "PUB_LOG_V_H6_RELATED",
+        "source_version": source_version,
+        "confidence": 0.72 if row.get("related_fsc") == nsn[:4] else 0.68,
+        "notes": row.get("related_item_name") or row.get("source_item_name"),
         "raw_payload": row,
     }
     if existing:

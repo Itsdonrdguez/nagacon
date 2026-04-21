@@ -359,6 +359,12 @@ export default function NSNIntelligence() {
                     <div className="row-title">Connected Part Numbers</div>
                     <div className="row-subtitle">{numberLabel(alternateGraph.part_numbers?.length || 0)} linked part numbers</div>
                   </div>
+                  {alternateGraph.actual_related_nsn_count ? (
+                    <div className="simple-list-row">
+                      <div className="row-title">Connected NSNs</div>
+                      <div className="row-subtitle">{numberLabel(alternateGraph.actual_related_nsn_count)} resolved related NSN candidates</div>
+                    </div>
+                  ) : null}
                   {(alternateGraph.part_numbers || []).slice(0, 6).map((row, index) => (
                     <div className="simple-list-row" key={`${row.part_number}-${row.cage}-${index}`}>
                       <div className="row-title">{row.part_number || 'Unknown part'}{row.company_name ? ` | ${row.company_name}` : ''}</div>
@@ -367,8 +373,15 @@ export default function NSNIntelligence() {
                   ))}
                   {(alternateGraph.related_nodes || []).slice(0, 6).map((row, index) => (
                     <div className="simple-list-row" key={`${row.related_value}-${row.relationship_type}-${index}`}>
-                      <div className="row-title">{row.related_value || 'Related item'} </div>
-                      <div className="row-subtitle">{row.relationship_type || 'related'}{row.notes ? ` | ${row.notes}` : ''}</div>
+                      <div className="row-title">
+                        {row.related_value || 'Related item'}
+                        {row.related_item_name ? ` | ${row.related_item_name}` : ''}
+                      </div>
+                      <div className="row-subtitle">
+                        {row.relationship_type || 'related'}
+                        {row.related_fsc ? ` | FSC ${row.related_fsc}` : ''}
+                        {row.notes ? ` | ${row.notes}` : ''}
+                      </div>
                     </div>
                   ))}
                 </div>

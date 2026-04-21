@@ -9,7 +9,7 @@ from app.models.nsn_catalog import NsnIntelligenceSnapshot
 from app.services.nsn_catalog.award_evidence import persist_nsn_award_evidence
 from app.services.nsn_catalog.catalog_service import get_nsn_catalog_summary
 from app.services.nsn_catalog.normalizer import normalize_nsn
-from app.services.nsn_catalog.provider_seeding import seed_providers_from_nsn_catalog
+from app.services.nsn_catalog.provider_seeding import seed_providers_from_nsn_award_evidence, seed_providers_from_nsn_catalog
 from app.services.research.usaspending_research_service import search_usaspending_for_nsn
 
 
@@ -31,6 +31,7 @@ def refresh_nsn_intelligence(
 
     usaspending = None
     provider_seed = None
+    award_provider_seed = None
     if run_usaspending:
         usaspending = search_usaspending_for_nsn(db, target.nsn, limit=limit)
         award_persistence = persist_nsn_award_evidence(db, target.nsn, usaspending)
@@ -38,6 +39,12 @@ def refresh_nsn_intelligence(
         award_persistence = None
     if seed_providers:
         provider_seed = seed_providers_from_nsn_catalog(
+            db,
+            target.nsn,
+            organization_id=organization_id,
+            limit=limit,
+        )
+        award_provider_seed = seed_providers_from_nsn_award_evidence(
             db,
             target.nsn,
             organization_id=organization_id,
@@ -60,6 +67,7 @@ def refresh_nsn_intelligence(
         "usaspending": _trim_usaspending(usaspending) if usaspending else None,
         "award_persistence": award_persistence,
         "provider_seed": provider_seed,
+        "award_provider_seed": award_provider_seed,
     }
     confidence = {
         "catalog_identity": (catalog_summary.get("confidence") or {}).get("identity"),
@@ -68,6 +76,8 @@ def refresh_nsn_intelligence(
         "nsn_awards_created": (award_persistence or {}).get("created", 0) if award_persistence else 0,
         "nsn_awards_updated": (award_persistence or {}).get("updated", 0) if award_persistence else 0,
         "history_match_source": (usaspending or {}).get("history_match_source") if usaspending else None,
+        "award_providers_inserted": (award_provider_seed or {}).get("inserted", 0) if award_provider_seed else 0,
+        "award_providers_updated": (award_provider_seed or {}).get("updated", 0) if award_provider_seed else 0,
     }
     snapshot = NsnIntelligenceSnapshot(
         nsn=target.nsn,

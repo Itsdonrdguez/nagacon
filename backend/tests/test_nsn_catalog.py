@@ -8,6 +8,7 @@ from app.services.nsn_catalog.publog_importer import parse_publog_csv, parse_pub
 from app.services.nsn_catalog.provider_seeding import (
     catalog_reference_confidence,
     catalog_reference_role,
+    provider_payload_from_award_evidence,
     provider_payload_from_reference,
 )
 from app.services.nsn_catalog.vendor_recommendations import build_vendor_recommendations
@@ -132,6 +133,35 @@ def test_provider_payload_from_catalog_reference_labels_oem_candidate():
     assert payload.item.source == "PUB_LOG"
     assert payload.item.confidence == 95.0
     assert "PN-123" in payload.item.notes
+
+
+def test_provider_payload_from_award_evidence_labels_confirmed_awardee():
+    award = SimpleNamespace(
+        recipient_name="Acme Defense LLC",
+        recipient_cage="1ABC2",
+        recipient_uei="UEI123",
+        source_system="USAspending",
+        nsn="4110-01-534-2682",
+        fsc="4110",
+        psc_code="4110",
+        award_id="AWD-123",
+        piid="PIID-456",
+        award_date="2025-01-01",
+        award_amount=12500,
+        match_confidence="high",
+        match_reasons=["part_number_match:PN-123", "catalog_manufacturer_match:acme defense"],
+    )
+
+    payload = provider_payload_from_award_evidence(award, item_name="REFRIGERATION UNIT")
+
+    assert payload is not None
+    assert payload.company_name == "Acme Defense LLC"
+    assert payload.cage == "1ABC2"
+    assert payload.item is not None
+    assert payload.item.relationship_type == "Confirmed Awardee"
+    assert payload.item.source == "USAspending"
+    assert payload.item.confidence == 95.0
+    assert "Award ID: AWD-123" in (payload.item.notes or "")
 
 
 def test_catalog_reference_role_keeps_weak_reference_distinct():
@@ -396,12 +426,23 @@ def test_refresh_nsn_intelligence_stores_snapshot(monkeypatch):
             "next_actions": ["Import or refresh PUB LOG catalog data for this NSN."],
         },
     )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_catalog",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 1, "updated": 0},
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_award_evidence",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 2, "updated": 1},
+    )
 
-    result = refresh_nsn_intelligence(FakeDB(), "4110015342682", run_usaspending=True)
+    result = refresh_nsn_intelligence(FakeDB(), "4110015342682", run_usaspending=True, seed_providers=True)
 
     assert result["status"] == "ok"
     assert result["snapshot_id"] == 42
     assert result["nsn"] == "4110-01-534-2682"
     assert result["summary"]["usaspending"]["awards_found"] == 0
+    assert result["summary"]["provider_seed"]["inserted"] == 1
+    assert result["summary"]["award_provider_seed"]["inserted"] == 2
+    assert result["confidence"]["award_providers_inserted"] == 2
     assert snapshots[0].compact_nsn == "4110015342682"
     assert snapshots[0].source_scope == "refresh"

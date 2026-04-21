@@ -315,6 +315,14 @@ export default function NSNIntelligence() {
                     </div>
                   </div>
                 ) : null}
+                {refreshMutation.data?.summary?.award_provider_seed ? (
+                  <div>
+                    <div className="row-title">Awardee provider seeding</div>
+                    <div className="row-subtitle">
+                      Inserted {numberLabel(refreshMutation.data.summary.award_provider_seed.inserted)} | Updated {numberLabel(refreshMutation.data.summary.award_provider_seed.updated)} | Checked {numberLabel(refreshMutation.data.summary.award_provider_seed.award_rows_checked)}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </Card>
           ) : null}

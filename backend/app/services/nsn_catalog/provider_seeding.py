@@ -4,7 +4,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models.nsn_catalog import NsnMaster, NsnReference
+from app.models.nsn_catalog import NsnAwardEvidence, NsnMaster, NsnReference
 from app.repositories.providers import ProviderRepository
 from app.schemas.provider import ProviderCreate, ProviderImportResult, ProviderItemCreate
 from app.services.nsn_catalog.normalizer import normalize_nsn
@@ -77,6 +77,45 @@ def provider_payload_from_reference(reference: NsnReference, item_name: str | No
     )
 
 
+def provider_payload_from_award_evidence(row: NsnAwardEvidence, item_name: str | None = None) -> ProviderCreate | None:
+    company_name = (row.recipient_name or "").strip()
+    if not company_name and row.recipient_cage:
+        company_name = f"CAGE {row.recipient_cage}"
+    if not company_name:
+        return None
+
+    role = "Confirmed Awardee" if (row.match_confidence or "").lower() == "high" else "Likely Awardee"
+    confidence = 95.0 if role == "Confirmed Awardee" else 82.0
+    notes = []
+    if row.award_id:
+        notes.append(f"Award ID: {row.award_id}")
+    if row.piid:
+        notes.append(f"PIID: {row.piid}")
+    if row.award_date:
+        notes.append(f"Award date: {row.award_date}")
+    if row.award_amount is not None:
+        notes.append(f"Award amount: {row.award_amount}")
+    if row.match_reasons:
+        notes.append(f"Match reasons: {', '.join(row.match_reasons[:6])}")
+
+    return ProviderCreate(
+        company_name=company_name,
+        cage=row.recipient_cage,
+        uei=row.recipient_uei,
+        notes=f"Seeded from {row.source_system} NSN award evidence.",
+        item=ProviderItemCreate(
+            nsn=row.nsn,
+            fsc=row.fsc or row.psc_code,
+            nomenclature=item_name,
+            relationship_type=role,
+            source=row.source_system or "USAspending",
+            source_url=row.award_id or row.piid,
+            confidence=confidence,
+            notes="; ".join(notes) if notes else None,
+        ),
+    )
+
+
 def seed_providers_from_nsn_catalog(
     db: Session,
     nsn: str,
@@ -139,5 +178,70 @@ def seed_providers_from_nsn_catalog(
         "status": "ok",
         "nsn": target.nsn,
         "references_checked": len(references),
+        "seeded": seeded,
+    }
+
+
+def seed_providers_from_nsn_award_evidence(
+    db: Session,
+    nsn: str,
+    *,
+    organization_id: int | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    target = normalize_nsn(nsn)
+    if not target:
+        return {
+            "status": "invalid_nsn",
+            "inserted": 0,
+            "updated": 0,
+            "skipped": 0,
+            "errors": ["NSN must contain exactly 13 digits."],
+        }
+
+    master = db.query(NsnMaster).filter(NsnMaster.compact_nsn == target.compact).first()
+    item_name = getattr(master, "item_name", None)
+    rows = (
+        db.query(NsnAwardEvidence)
+        .filter(NsnAwardEvidence.compact_nsn == target.compact)
+        .filter(NsnAwardEvidence.match_confidence.in_(["high", "medium"]))
+        .order_by(NsnAwardEvidence.match_score.desc().nullslast(), NsnAwardEvidence.award_date.desc().nullslast())
+        .limit(max(min(limit, 1000), 1))
+        .all()
+    )
+
+    repo = ProviderRepository(db, organization_id=organization_id)
+    result = ProviderImportResult()
+    seeded: list[dict[str, Any]] = []
+    for row in rows:
+        payload = provider_payload_from_award_evidence(row, item_name=item_name)
+        if not payload:
+            result.skipped += 1
+            continue
+        try:
+            existing = repo._find_provider(company_name=payload.company_name, cage=payload.cage, uei=payload.uei)
+            provider = repo.create(payload)
+            if existing:
+                result.updated += 1
+            else:
+                result.inserted += 1
+            seeded.append(
+                {
+                    "provider_id": provider.id,
+                    "company_name": provider.company_name,
+                    "cage": provider.cage,
+                    "relationship_type": payload.item.relationship_type if payload.item else None,
+                    "source": payload.item.source if payload.item else None,
+                    "confidence": payload.item.confidence if payload.item else None,
+                }
+            )
+        except Exception as exc:
+            db.rollback()
+            result.errors.append(f"{row.recipient_cage or row.recipient_name or row.id}: {exc}")
+
+    return result.model_dump() | {
+        "status": "ok",
+        "nsn": target.nsn,
+        "award_rows_checked": len(rows),
         "seeded": seeded,
     }

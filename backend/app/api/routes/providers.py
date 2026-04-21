@@ -60,6 +60,18 @@ def list_providers(
     }
 
 
+@router.get("/{provider_id}")
+def get_provider_detail(
+    provider_id: int,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    detail = _repo(db, current_org).get_detail(provider_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return detail
+
+
 @router.post("", response_model=ProviderOut)
 def create_provider(
     payload: ProviderCreate,

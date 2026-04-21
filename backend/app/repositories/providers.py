@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
+from app.models.award_history import AwardHistory
+from app.models.nsn_catalog import NsnReference, NsnAwardEvidence
 from app.schemas.provider import ProviderCreate, ProviderImportResult, ProviderItemCreate, ProviderUpdate
 from app.services.org_service import ensure_default_organization
 from app.services.providers.identity_resolver import resolve_provider_identity
@@ -225,6 +227,135 @@ class ProviderRepository:
         self.db.commit()
         self.db.refresh(provider)
         return provider
+
+    def get_detail(self, provider_id: int) -> dict[str, Any] | None:
+        provider = (
+            self._scoped_query()
+            .options(selectinload(Provider.items))
+            .filter(Provider.id == provider_id)
+            .first()
+        )
+        if not provider:
+            return None
+
+        items = sorted(provider.items or [], key=lambda item: (item.nsn or "", item.relationship_type or "", item.source or ""))
+        nsns = [item.nsn for item in items if item.nsn]
+        cage = _normalize_cage(provider.cage)
+        company = _clean(provider.company_name, 240)
+
+        award_query = self.db.query(AwardHistory)
+        if cage or company:
+            filters = []
+            if cage:
+                filters.append(func.upper(AwardHistory.recipient_cage) == cage)
+            if company:
+                filters.append(func.lower(AwardHistory.recipient_name) == company.lower())
+            award_query = award_query.filter(or_(*filters))
+        else:
+            award_query = award_query.filter(AwardHistory.id == -1)
+        awards = award_query.order_by(AwardHistory.award_date.desc().nullslast()).limit(50).all()
+
+        nsn_award_query = self.db.query(NsnAwardEvidence)
+        if cage or company:
+            filters = []
+            if cage:
+                filters.append(func.upper(NsnAwardEvidence.recipient_cage) == cage)
+            if company:
+                filters.append(func.lower(NsnAwardEvidence.recipient_name) == company.lower())
+            nsn_award_query = nsn_award_query.filter(or_(*filters))
+        else:
+            nsn_award_query = nsn_award_query.filter(NsnAwardEvidence.id == -1)
+        nsn_awards = nsn_award_query.order_by(NsnAwardEvidence.award_date.desc().nullslast()).limit(50).all()
+
+        reference_query = self.db.query(NsnReference)
+        if nsns:
+            reference_query = reference_query.filter(NsnReference.nsn.in_(nsns))
+        if cage:
+            reference_query = reference_query.filter(NsnReference.cage == cage)
+        references = reference_query.order_by(NsnReference.updated_at.desc()).limit(100).all()
+
+        return {
+            "provider": {
+                "id": provider.id,
+                "company_name": provider.company_name,
+                "canonical_name": provider.canonical_name,
+                "cage": provider.cage,
+                "uei": provider.uei,
+                "website": provider.website,
+                "contact_name": provider.contact_name,
+                "email": provider.email,
+                "phone": provider.phone,
+                "notes": provider.notes,
+                "status": provider.status,
+                "identity_source": provider.identity_source,
+                "identity_confidence": provider.identity_confidence,
+                "aliases": provider.aliases or [],
+                "created_at": provider.created_at.isoformat() if provider.created_at else None,
+                "updated_at": provider.updated_at.isoformat() if provider.updated_at else None,
+            },
+            "items": [
+                {
+                    "provider_item_id": item.id,
+                    "nsn": item.nsn,
+                    "fsc": item.fsc,
+                    "nomenclature": item.nomenclature,
+                    "relationship_type": item.relationship_type,
+                    "source": item.source,
+                    "source_url": item.source_url,
+                    "confidence": item.confidence,
+                    "notes": item.notes,
+                }
+                for item in items
+            ],
+            "award_history": [
+                {
+                    "source_system": row.source_system,
+                    "award_id": row.award_id,
+                    "piid": row.piid,
+                    "nsn": row.nsn,
+                    "award_date": row.award_date,
+                    "award_amount": row.award_amount,
+                    "awarding_agency": row.awarding_agency,
+                    "description": row.description,
+                    "match_confidence": row.match_confidence,
+                }
+                for row in awards
+            ],
+            "nsn_award_evidence": [
+                {
+                    "source_system": row.source_system,
+                    "award_id": row.award_id,
+                    "piid": row.piid,
+                    "nsn": row.nsn,
+                    "award_date": row.award_date,
+                    "award_amount": row.award_amount,
+                    "awarding_agency": row.awarding_agency,
+                    "description": row.description,
+                    "match_confidence": row.match_confidence,
+                    "match_reasons": row.match_reasons,
+                }
+                for row in nsn_awards
+            ],
+            "catalog_references": [
+                {
+                    "nsn": row.nsn,
+                    "part_number": row.part_number,
+                    "reference_type": row.reference_type,
+                    "relationship_type": row.relationship_type,
+                    "source_name": row.source_name,
+                    "source_version": row.source_version,
+                    "confidence": row.confidence,
+                }
+                for row in references
+            ],
+            "summary": {
+                "item_count": len(items),
+                "award_history_count": len(awards),
+                "nsn_award_evidence_count": len(nsn_awards),
+                "catalog_reference_count": len(references),
+                "nsn_count": len(_unique(nsns)),
+            },
+        }
 
     def list_rows(
         self,

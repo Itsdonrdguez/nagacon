@@ -147,6 +147,7 @@ export default function NSNIntelligence() {
   const snapshotUsaspending = snapshot?.usaspending || null
   const sourceFreshness = data?.source_freshness || {}
   const cageProfiles = data?.cage_profiles || []
+  const alternateGraph = data?.alternate_graph || {}
   const buildJob = buildJobQuery.data
   const buildJobDone = buildJob?.status === 'success'
   const buildJobFailed = buildJob?.status === 'failed'
@@ -351,6 +352,31 @@ export default function NSNIntelligence() {
           </Card>
 
           <div className="nsn-two-column">
+            <Card title="Alternate Part Graph">
+              {(alternateGraph.part_numbers?.length || alternateGraph.related_nodes?.length || alternateGraph.cages?.length) ? (
+                <div className="simple-list">
+                  <div className="simple-list-row">
+                    <div className="row-title">Connected Part Numbers</div>
+                    <div className="row-subtitle">{numberLabel(alternateGraph.part_numbers?.length || 0)} linked part numbers</div>
+                  </div>
+                  {(alternateGraph.part_numbers || []).slice(0, 6).map((row, index) => (
+                    <div className="simple-list-row" key={`${row.part_number}-${row.cage}-${index}`}>
+                      <div className="row-title">{row.part_number || 'Unknown part'}{row.company_name ? ` | ${row.company_name}` : ''}</div>
+                      <div className="row-subtitle">{row.cage || 'No CAGE'} | {row.relationship_type || 'reference'} | {row.source || 'PUB LOG'}</div>
+                    </div>
+                  ))}
+                  {(alternateGraph.related_nodes || []).slice(0, 6).map((row, index) => (
+                    <div className="simple-list-row" key={`${row.related_value}-${row.relationship_type}-${index}`}>
+                      <div className="row-title">{row.related_value || 'Related item'} </div>
+                      <div className="row-subtitle">{row.relationship_type || 'related'}{row.notes ? ` | ${row.notes}` : ''}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState title="No alternate graph yet" subtitle="Expand PUB LOG coverage to surface more part links and related item concepts." />
+              )}
+            </Card>
+
             <Card title="Catalog References">
               {references.length ? (
                 <Table>
@@ -359,6 +385,7 @@ export default function NSNIntelligence() {
                       <TableHead>CAGE</TableHead>
                       <TableHead>Company</TableHead>
                       <TableHead>Part</TableHead>
+                      <TableHead>Role</TableHead>
                       <TableHead>Source</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -368,6 +395,7 @@ export default function NSNIntelligence() {
                         <TableCell>{row.cage || 'Unknown'}</TableCell>
                         <TableCell>{row.company_name || 'Unknown'}</TableCell>
                         <TableCell>{row.part_number || 'Unknown'}</TableCell>
+                        <TableCell>{row.relationship_type || row.reference_type || 'Reference'}</TableCell>
                         <TableCell>{row.source_name || 'Catalog'}</TableCell>
                       </TableRow>
                     ))}
@@ -384,6 +412,21 @@ export default function NSNIntelligence() {
           </div>
 
           <div className="nsn-two-column">
+            <Card title="Characteristics">
+              {(data.evidence || []).filter((row) => row.claim_type === 'characteristic').length ? (
+                <div className="simple-list">
+                  {(data.evidence || []).filter((row) => row.claim_type === 'characteristic').slice(0, 8).map((row, index) => (
+                    <div className="simple-list-row" key={`${row.claim_value}-${index}`}>
+                      <div className="row-title">{row.claim_value || 'Characteristic'}</div>
+                      <div className="row-subtitle">{row.evidence_text || row.source_name || 'PUB LOG characteristic'}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="row-subtitle">No characteristics loaded yet for this NSN.</div>
+              )}
+            </Card>
+
             <Card title="Source Freshness">
               <div className="simple-list">
                 <div className="simple-list-row">

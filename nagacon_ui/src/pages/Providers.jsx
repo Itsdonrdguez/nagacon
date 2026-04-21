@@ -60,6 +60,7 @@ export default function Providers() {
   const [submittedFilters, setSubmittedFilters] = useState(filters)
   const [form, setForm] = useState(EMPTY_FORM)
   const [csvContent, setCsvContent] = useState('')
+  const [selectedProviderId, setSelectedProviderId] = useState(null)
 
   const providersQuery = useQuery({
     queryKey: ['providers', submittedFilters],
@@ -74,6 +75,14 @@ export default function Providers() {
           limit: 100,
         },
       })
+      return res.data
+    },
+  })
+  const providerDetailQuery = useQuery({
+    queryKey: ['provider-detail', selectedProviderId],
+    enabled: Boolean(selectedProviderId),
+    queryFn: async () => {
+      const res = await api.get(`/api/providers/${selectedProviderId}`)
       return res.data
     },
   })
@@ -144,6 +153,7 @@ export default function Providers() {
   const rows = providersQuery.data?.items || []
   const total = providersQuery.data?.total || 0
   const exportProvidersUrl = `${api.defaults.baseURL}/api/export/providers.csv`
+  const providerDetail = providerDetailQuery.data
 
   const sourceCounts = useMemo(() => {
     const counts = {}
@@ -342,15 +352,16 @@ export default function Providers() {
                 <TableRow>
                   <TableHead>Provider</TableHead>
                   <TableHead>NSN / Item</TableHead>
-                  <TableHead>Type</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead>Website</TableHead>
-                  <TableHead>Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {rows.map((row) => (
-                  <TableRow key={row.provider_id}>
+                    <TableHead>Type</TableHead>
+                    <TableHead>Source</TableHead>
+                    <TableHead>Website</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Profile</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((row) => (
+                    <TableRow key={row.provider_id}>
                     <TableCell>
                       <div className="row-title">{row.company_name}</div>
                       <div className="row-subtitle">
@@ -395,6 +406,11 @@ export default function Providers() {
                       ) : '-'}
                     </TableCell>
                     <TableCell><StatusPill status={row.status || 'active'} /></TableCell>
+                    <TableCell>
+                      <Button size="sm" variant="secondary" onClick={() => setSelectedProviderId(row.provider_id)}>
+                        View
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -402,6 +418,101 @@ export default function Providers() {
           </>
         )}
       </Card>
+
+      {selectedProviderId ? (
+        <Card title="Provider Profile">
+          {providerDetailQuery.isLoading ? (
+            <LoadingState label="Loading provider profile..." />
+          ) : providerDetailQuery.error ? (
+            <EmptyState
+              title="Provider profile unavailable"
+              subtitle={providerDetailQuery.error.message || 'Could not load provider profile.'}
+              action={<Button onClick={() => providerDetailQuery.refetch()}>Retry</Button>}
+            />
+          ) : providerDetail ? (
+            <div className="data-health-stack">
+              <div className="source-freshness-row">
+                <div>
+                  <div className="row-title">{providerDetail.provider.company_name}</div>
+                  <div className="row-subtitle">
+                    {providerDetail.provider.cage ? `CAGE ${providerDetail.provider.cage}` : 'No CAGE'}
+                    {providerDetail.provider.website ? ` | ${providerDetail.provider.website}` : ''}
+                    {providerDetail.provider.email ? ` | ${providerDetail.provider.email}` : ''}
+                  </div>
+                </div>
+                <Badge label={providerDetail.provider.status || 'active'} variant="info" />
+              </div>
+
+              <div className="data-health-metrics">
+                <div className="data-health-metric"><span>Item Links</span><strong>{providerDetail.summary?.item_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Award History</span><strong>{providerDetail.summary?.award_history_count || 0}</strong></div>
+                <div className="data-health-metric"><span>NSN Award Evidence</span><strong>{providerDetail.summary?.nsn_award_evidence_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Catalog References</span><strong>{providerDetail.summary?.catalog_reference_count || 0}</strong></div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">Linked Items</div>
+                  {(providerDetail.items || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.items.slice(0, 8).map((item) => (
+                        <div className="simple-list-row" key={item.provider_item_id || `${item.nsn}-${item.relationship_type}`}>
+                          <div className="row-title">{item.nomenclature || item.nsn || 'Item'}</div>
+                          <div className="row-subtitle">{item.nsn || 'No NSN'}{item.fsc ? ` | FSC ${item.fsc}` : ''} | {item.relationship_type || 'Unknown'} | {item.source || 'Manual'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No linked items.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Award History</div>
+                  {(providerDetail.award_history || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.award_history.slice(0, 8).map((award, index) => (
+                        <div className="simple-list-row" key={`${award.award_id}-${index}`}>
+                          <div className="row-title">{award.nsn || award.award_id || 'Award'}</div>
+                          <div className="row-subtitle">{award.awarding_agency || 'Unknown agency'} | {award.award_date || 'No date'} | {award.award_amount || 'No amount'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No award history linked yet.</div>}
+                </div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">NSN Award Evidence</div>
+                  {(providerDetail.nsn_award_evidence || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.nsn_award_evidence.slice(0, 8).map((award, index) => (
+                        <div className="simple-list-row" key={`${award.award_id}-${index}`}>
+                          <div className="row-title">{award.nsn || award.award_id || 'Evidence row'}</div>
+                          <div className="row-subtitle">{award.match_confidence || 'unknown'}{award.match_reasons?.length ? ` | ${award.match_reasons.slice(0, 2).join(', ')}` : ''}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No standalone NSN award evidence yet.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Catalog References</div>
+                  {(providerDetail.catalog_references || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.catalog_references.slice(0, 8).map((reference, index) => (
+                        <div className="simple-list-row" key={`${reference.nsn}-${reference.part_number}-${index}`}>
+                          <div className="row-title">{reference.part_number || reference.nsn || 'Reference'}</div>
+                          <div className="row-subtitle">{reference.nsn || 'No NSN'} | {reference.relationship_type || reference.reference_type || 'Reference'} | {reference.source_name || 'PUB LOG'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No catalog references linked yet.</div>}
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </Card>
+      ) : null}
     </div>
   )
 }

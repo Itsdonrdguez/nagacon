@@ -12,6 +12,7 @@ from app.api import work_queue as work_queue_api
 from app.api.routes import company as company_api
 from app.api.routes import nsn as nsn_api
 from app.api.routes import pipeline as pipeline_api
+from app.api.routes import providers as providers_api
 from app.core import security as security_core
 from app.schemas.company import CompanyProfileCreate
 from app.utils.enums import PipelineStatus
@@ -744,6 +745,31 @@ def test_publog_sync_job_route_queues_background_job(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["kind"] == "publog_sync"
+
+
+def test_provider_detail_route_returns_profile(client, monkeypatch):
+    class FakeProviderRepo:
+        def __init__(self, db, organization_id=None):
+            self.db = db
+            self.organization_id = organization_id
+
+        def get_detail(self, provider_id):
+            assert provider_id == 7
+            return {
+                "provider": {"id": 7, "company_name": "Acme Defense", "cage": "1ABC2", "status": "active"},
+                "items": [{"provider_item_id": 1, "nsn": "4110-01-534-2682"}],
+                "award_history": [{"award_id": "AWD-1"}],
+                "nsn_award_evidence": [],
+                "catalog_references": [],
+                "summary": {"item_count": 1},
+            }
+
+    monkeypatch.setattr(providers_api, "ProviderRepository", FakeProviderRepo)
+
+    response = client.get("/api/providers/7")
+
+    assert response.status_code == 200
+    assert response.json()["provider"]["company_name"] == "Acme Defense"
 
 
 def test_saas_readiness_route_returns_org_scope_audit(client, monkeypatch):

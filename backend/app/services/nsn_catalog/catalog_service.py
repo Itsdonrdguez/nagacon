@@ -81,6 +81,7 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
     nsn_awards = summarize_nsn_award_evidence(db, target.nsn)
     pricing = _price_summary(db, target)
     identity_confidence = _identity_confidence(master, references)
+    alternate_graph = _alternate_graph(target, references, interchangeability, evidence, providers, vendor_recommendations)
 
     return {
         "status": "ok",
@@ -122,6 +123,7 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
         "award_history": awards,
         "nsn_award_evidence": nsn_awards,
         "pricing": pricing,
+        "alternate_graph": alternate_graph,
         "source_freshness": _source_freshness(master, references, evidence, snapshot),
         "evidence": [
             _model_dict(row, [
@@ -395,3 +397,72 @@ def _next_actions(
     if not actions:
         actions.append("Review evidence and confidence before using the vendor shortlist for bid outreach.")
     return actions
+
+
+def _alternate_graph(
+    target: NormalizedNsn,
+    references: list[NsnReference],
+    interchangeability: list[NsnInterchangeability],
+    evidence: list[NsnEvidence],
+    providers: list[dict[str, Any]],
+    vendor_recommendations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    part_numbers = []
+    cages = []
+    related_nodes = []
+    for row in references:
+        if row.part_number:
+            part_numbers.append({
+                "part_number": row.part_number,
+                "cage": row.cage,
+                "company_name": row.company_name,
+                "source": row.source_name,
+                "relationship_type": row.relationship_type,
+            })
+        if row.cage:
+            cages.append({
+                "cage": row.cage,
+                "company_name": row.company_name,
+                "source": row.source_name,
+            })
+    for row in interchangeability:
+        related_nodes.append({
+            "node_type": "nsn" if not str(row.related_nsn or "").startswith("INC-") else "related_inc",
+            "related_value": row.related_nsn,
+            "related_compact": row.related_compact_nsn,
+            "relationship_type": row.relationship_type,
+            "notes": row.notes,
+            "source": row.source_name,
+            "confidence": row.confidence,
+        })
+    for row in evidence:
+        if row.claim_type == "related_item_concept":
+            related_nodes.append({
+                "node_type": "related_item_concept",
+                "related_value": row.claim_value,
+                "related_compact": None,
+                "relationship_type": "related_item_concept",
+                "notes": row.evidence_text,
+                "source": row.source_name,
+                "confidence": row.confidence,
+            })
+    return {
+        "root_nsn": target.nsn,
+        "part_numbers": _dedupe_dicts(part_numbers, ["part_number", "cage", "source"]),
+        "cages": _dedupe_dicts(cages, ["cage", "source"]),
+        "related_nodes": _dedupe_dicts(related_nodes, ["related_value", "relationship_type", "source"]),
+        "provider_count": len(providers),
+        "vendor_candidate_count": len(vendor_recommendations),
+    }
+
+
+def _dedupe_dicts(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        token = "|".join(str(row.get(key) or "") for key in keys)
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(row)
+    return out

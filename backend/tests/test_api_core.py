@@ -13,6 +13,7 @@ from app.api.routes import company as company_api
 from app.api.routes import nsn as nsn_api
 from app.api.routes import pipeline as pipeline_api
 from app.api.routes import providers as providers_api
+from app.repositories import providers as providers_repository
 from app.core import security as security_core
 from app.schemas.company import CompanyProfileCreate
 from app.utils.enums import PipelineStatus
@@ -770,6 +771,20 @@ def test_provider_detail_route_returns_profile(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["provider"]["company_name"] == "Acme Defense"
+
+
+def test_provider_award_match_reasons_accept_alias_and_normalized_name():
+    reasons = providers_repository._award_match_reasons(
+        recipient_name="Acme Defense LLC",
+        recipient_cage="1ABC2",
+        cage="1ABC2",
+        exact_name_variants=["Acme Defense", "Acme Defense LLC"],
+        normalized_name_keys={"acme defense"},
+    )
+
+    assert "cage" in reasons
+    assert "exact_name" in reasons
+    assert "normalized_name" in reasons
 
 
 def test_saas_readiness_route_returns_org_scope_audit(client, monkeypatch):

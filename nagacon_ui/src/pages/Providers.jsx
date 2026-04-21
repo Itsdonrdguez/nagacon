@@ -35,6 +35,12 @@ const EMPTY_FORM = {
   notes: '',
 }
 
+function money(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 'Not available'
+  return numeric.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
+}
+
 function providerPayload(form) {
   return {
     company_name: form.company_name.trim(),
@@ -439,6 +445,11 @@ export default function Providers() {
                     {providerDetail.provider.website ? ` | ${providerDetail.provider.website}` : ''}
                     {providerDetail.provider.email ? ` | ${providerDetail.provider.email}` : ''}
                   </div>
+                  <div className="row-subtitle">
+                    {providerDetail.provider.canonical_name ? `Canonical ${providerDetail.provider.canonical_name}` : 'Canonical name not set'}
+                    {providerDetail.provider.identity_source ? ` | ${providerDetail.provider.identity_source}` : ''}
+                    {providerDetail.provider.identity_confidence ? ` | ${providerDetail.provider.identity_confidence}%` : ''}
+                  </div>
                 </div>
                 <Badge label={providerDetail.provider.status || 'active'} variant="info" />
               </div>
@@ -448,6 +459,28 @@ export default function Providers() {
                 <div className="data-health-metric"><span>Award History</span><strong>{providerDetail.summary?.award_history_count || 0}</strong></div>
                 <div className="data-health-metric"><span>NSN Award Evidence</span><strong>{providerDetail.summary?.nsn_award_evidence_count || 0}</strong></div>
                 <div className="data-health-metric"><span>Catalog References</span><strong>{providerDetail.summary?.catalog_reference_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Agencies</span><strong>{providerDetail.summary?.agency_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Matched Names</span><strong>{providerDetail.summary?.matched_name_count || 0}</strong></div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">Identity</div>
+                  <div className="row-subtitle">Name variants used for matching</div>
+                  {(providerDetail.provider.name_variants || []).length ? (
+                    <div className="badge-stack">
+                      {providerDetail.provider.name_variants.map((value) => <Badge key={value} label={value} variant="info" />)}
+                    </div>
+                  ) : <div className="row-subtitle">No alternate names yet.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Award Rollup</div>
+                  <div className="row-subtitle">Award history {money(providerDetail.award_rollups?.total_award_amount)}</div>
+                  <div className="row-subtitle">NSN award evidence {money(providerDetail.award_rollups?.total_nsn_award_amount)}</div>
+                  <div className="row-subtitle">Latest award {providerDetail.award_rollups?.latest_award_date || 'Not available'}</div>
+                  <div className="row-subtitle">Latest NSN evidence {providerDetail.award_rollups?.latest_nsn_award_date || 'Not available'}</div>
+                </div>
               </div>
 
               <div className="provider-grid">
@@ -472,7 +505,10 @@ export default function Providers() {
                       {providerDetail.award_history.slice(0, 8).map((award, index) => (
                         <div className="simple-list-row" key={`${award.award_id}-${index}`}>
                           <div className="row-title">{award.nsn || award.award_id || 'Award'}</div>
-                          <div className="row-subtitle">{award.awarding_agency || 'Unknown agency'} | {award.award_date || 'No date'} | {award.award_amount || 'No amount'}</div>
+                          <div className="row-subtitle">
+                            {award.awarding_agency || 'Unknown agency'} | {award.award_date || 'No date'} | {money(award.award_amount)}
+                            {award.match_reasons?.length ? ` | matched by ${award.match_reasons.join(', ')}` : ''}
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -507,6 +543,36 @@ export default function Providers() {
                       ))}
                     </div>
                   ) : <div className="row-subtitle">No catalog references linked yet.</div>}
+                </div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">Top Agencies</div>
+                  {(providerDetail.award_rollups?.top_agencies || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.award_rollups.top_agencies.map((row) => (
+                        <div className="simple-list-row" key={row.name}>
+                          <div className="row-title">{row.name}</div>
+                          <div className="row-subtitle">{row.count} linked awards</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No agency rollup yet.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Linked NSNs</div>
+                  {(providerDetail.award_rollups?.top_nsns || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.award_rollups.top_nsns.map((row) => (
+                        <div className="simple-list-row" key={row.name}>
+                          <div className="row-title">{row.name}</div>
+                          <div className="row-subtitle">{row.count} award links</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No linked NSN rollup yet.</div>}
                 </div>
               </div>
             </div>

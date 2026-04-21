@@ -75,6 +75,85 @@ def _unique(values: list[Any]) -> list[Any]:
     return result
 
 
+def _company_key(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", str(value or "").lower())
+    tokens = [
+        token
+        for token in re.split(r"\s+", text)
+        if token
+        and token
+        not in {
+            "inc",
+            "incorporated",
+            "llc",
+            "ltd",
+            "corp",
+            "corporation",
+            "company",
+            "co",
+            "the",
+            "lp",
+            "pllc",
+            "limited",
+        }
+    ]
+    return " ".join(tokens[:12]).strip()
+
+
+def _provider_name_variants(provider: Provider) -> list[str]:
+    values = [
+        _clean(provider.company_name, 240),
+        _clean(provider.canonical_name, 300),
+        *[_clean(value, 300) for value in list(provider.aliases or [])],
+    ]
+    return _unique([value for value in values if value])
+
+
+def _award_match_reasons(
+    *,
+    recipient_name: str | None,
+    recipient_cage: str | None,
+    cage: str | None,
+    exact_name_variants: list[str],
+    normalized_name_keys: set[str],
+) -> list[str]:
+    reasons: list[str] = []
+    clean_name = _clean(recipient_name, 300)
+    if cage and _normalize_cage(recipient_cage) == cage:
+        reasons.append("cage")
+    if clean_name and clean_name.lower() in {value.lower() for value in exact_name_variants}:
+        reasons.append("exact_name")
+    company_key = _company_key(clean_name)
+    if company_key and company_key in normalized_name_keys:
+        reasons.append("normalized_name")
+    return _unique(reasons)
+
+
+def _top_counts(values: list[str | None], limit: int = 10) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = (value or "").strip()
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"name": name, "count": count}
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    ]
+
+
+def _sum_amount(rows: list[dict[str, Any]]) -> float | None:
+    amounts = [float(row["award_amount"]) for row in rows if row.get("award_amount") is not None]
+    if not amounts:
+        return None
+    return round(sum(amounts), 2)
+
+
+def _latest_date(rows: list[dict[str, Any]]) -> str | None:
+    values = [str(row.get("award_date") or "").strip() for row in rows if str(row.get("award_date") or "").strip()]
+    return max(values) if values else None
+
+
 class ProviderRepository:
     def __init__(self, db: Session, organization_id: int | None = None):
         self.db = db
@@ -241,31 +320,32 @@ class ProviderRepository:
         items = sorted(provider.items or [], key=lambda item: (item.nsn or "", item.relationship_type or "", item.source or ""))
         nsns = [item.nsn for item in items if item.nsn]
         cage = _normalize_cage(provider.cage)
-        company = _clean(provider.company_name, 240)
+        exact_name_variants = _provider_name_variants(provider)
+        normalized_name_keys = {key for key in [_company_key(value) for value in exact_name_variants] if key}
 
         award_query = self.db.query(AwardHistory)
-        if cage or company:
+        if cage or exact_name_variants:
             filters = []
             if cage:
                 filters.append(func.upper(AwardHistory.recipient_cage) == cage)
-            if company:
-                filters.append(func.lower(AwardHistory.recipient_name) == company.lower())
+            if exact_name_variants:
+                filters.append(func.lower(AwardHistory.recipient_name).in_([value.lower() for value in exact_name_variants]))
             award_query = award_query.filter(or_(*filters))
         else:
             award_query = award_query.filter(AwardHistory.id == -1)
-        awards = award_query.order_by(AwardHistory.award_date.desc().nullslast()).limit(50).all()
+        awards = award_query.order_by(AwardHistory.award_date.desc().nullslast()).limit(150).all()
 
         nsn_award_query = self.db.query(NsnAwardEvidence)
-        if cage or company:
+        if cage or exact_name_variants:
             filters = []
             if cage:
                 filters.append(func.upper(NsnAwardEvidence.recipient_cage) == cage)
-            if company:
-                filters.append(func.lower(NsnAwardEvidence.recipient_name) == company.lower())
+            if exact_name_variants:
+                filters.append(func.lower(NsnAwardEvidence.recipient_name).in_([value.lower() for value in exact_name_variants]))
             nsn_award_query = nsn_award_query.filter(or_(*filters))
         else:
             nsn_award_query = nsn_award_query.filter(NsnAwardEvidence.id == -1)
-        nsn_awards = nsn_award_query.order_by(NsnAwardEvidence.award_date.desc().nullslast()).limit(50).all()
+        nsn_awards = nsn_award_query.order_by(NsnAwardEvidence.award_date.desc().nullslast()).limit(150).all()
 
         reference_query = self.db.query(NsnReference)
         if nsns:
@@ -273,6 +353,81 @@ class ProviderRepository:
         if cage:
             reference_query = reference_query.filter(NsnReference.cage == cage)
         references = reference_query.order_by(NsnReference.updated_at.desc()).limit(100).all()
+
+        award_rows = []
+        for row in awards:
+            match_reasons = _award_match_reasons(
+                recipient_name=row.recipient_name,
+                recipient_cage=row.recipient_cage,
+                cage=cage,
+                exact_name_variants=exact_name_variants,
+                normalized_name_keys=normalized_name_keys,
+            )
+            if not match_reasons:
+                continue
+            award_rows.append(
+                {
+                    "source_system": row.source_system,
+                    "award_id": row.award_id,
+                    "piid": row.piid,
+                    "nsn": row.nsn,
+                    "award_date": row.award_date,
+                    "award_amount": row.award_amount,
+                    "awarding_agency": row.awarding_agency,
+                    "description": row.description,
+                    "match_confidence": row.match_confidence,
+                    "match_reasons": match_reasons,
+                    "recipient_name": row.recipient_name,
+                    "recipient_cage": row.recipient_cage,
+                }
+            )
+
+        nsn_award_rows = []
+        for row in nsn_awards:
+            match_reasons = _award_match_reasons(
+                recipient_name=row.recipient_name,
+                recipient_cage=row.recipient_cage,
+                cage=cage,
+                exact_name_variants=exact_name_variants,
+                normalized_name_keys=normalized_name_keys,
+            )
+            if not match_reasons:
+                continue
+            nsn_award_rows.append(
+                {
+                    "source_system": row.source_system,
+                    "award_id": row.award_id,
+                    "piid": row.piid,
+                    "nsn": row.nsn,
+                    "award_date": row.award_date,
+                    "award_amount": row.award_amount,
+                    "awarding_agency": row.awarding_agency,
+                    "description": row.description,
+                    "match_confidence": row.match_confidence,
+                    "match_reasons": _unique(match_reasons + list(row.match_reasons or [])),
+                    "recipient_name": row.recipient_name,
+                    "recipient_cage": row.recipient_cage,
+                }
+            )
+
+        all_award_rows = award_rows + nsn_award_rows
+        agencies = _top_counts([row.get("awarding_agency") for row in all_award_rows], limit=8)
+        linked_nsn_counts = _top_counts([row.get("nsn") for row in all_award_rows], limit=10)
+        matched_names = _top_counts([row.get("recipient_name") for row in all_award_rows], limit=10)
+        confidence_counts = _top_counts([row.get("match_confidence") for row in all_award_rows], limit=5)
+        source_counts = _top_counts([row.get("source_system") for row in all_award_rows], limit=5)
+
+        award_rollups = {
+            "total_award_amount": _sum_amount(award_rows),
+            "total_nsn_award_amount": _sum_amount(nsn_award_rows),
+            "latest_award_date": _latest_date(award_rows),
+            "latest_nsn_award_date": _latest_date(nsn_award_rows),
+            "top_agencies": agencies,
+            "top_nsns": linked_nsn_counts,
+            "matched_names": matched_names,
+            "match_confidence_counts": confidence_counts,
+            "source_counts": source_counts,
+        }
 
         return {
             "provider": {
@@ -290,6 +445,7 @@ class ProviderRepository:
                 "identity_source": provider.identity_source,
                 "identity_confidence": provider.identity_confidence,
                 "aliases": provider.aliases or [],
+                "name_variants": exact_name_variants,
                 "created_at": provider.created_at.isoformat() if provider.created_at else None,
                 "updated_at": provider.updated_at.isoformat() if provider.updated_at else None,
             },
@@ -307,35 +463,8 @@ class ProviderRepository:
                 }
                 for item in items
             ],
-            "award_history": [
-                {
-                    "source_system": row.source_system,
-                    "award_id": row.award_id,
-                    "piid": row.piid,
-                    "nsn": row.nsn,
-                    "award_date": row.award_date,
-                    "award_amount": row.award_amount,
-                    "awarding_agency": row.awarding_agency,
-                    "description": row.description,
-                    "match_confidence": row.match_confidence,
-                }
-                for row in awards
-            ],
-            "nsn_award_evidence": [
-                {
-                    "source_system": row.source_system,
-                    "award_id": row.award_id,
-                    "piid": row.piid,
-                    "nsn": row.nsn,
-                    "award_date": row.award_date,
-                    "award_amount": row.award_amount,
-                    "awarding_agency": row.awarding_agency,
-                    "description": row.description,
-                    "match_confidence": row.match_confidence,
-                    "match_reasons": row.match_reasons,
-                }
-                for row in nsn_awards
-            ],
+            "award_history": award_rows[:50],
+            "nsn_award_evidence": nsn_award_rows[:50],
             "catalog_references": [
                 {
                     "nsn": row.nsn,
@@ -348,12 +477,15 @@ class ProviderRepository:
                 }
                 for row in references
             ],
+            "award_rollups": award_rollups,
             "summary": {
                 "item_count": len(items),
-                "award_history_count": len(awards),
-                "nsn_award_evidence_count": len(nsn_awards),
+                "award_history_count": len(award_rows),
+                "nsn_award_evidence_count": len(nsn_award_rows),
                 "catalog_reference_count": len(references),
                 "nsn_count": len(_unique(nsns)),
+                "agency_count": len(agencies),
+                "matched_name_count": len(matched_names),
             },
         }
 
@@ -377,6 +509,7 @@ class ProviderRepository:
             query = query.filter(
                 or_(
                     Provider.company_name.ilike(pattern),
+                    Provider.canonical_name.ilike(pattern),
                     Provider.cage.ilike(pattern),
                     Provider.uei.ilike(pattern),
                     ProviderItem.nomenclature.ilike(pattern),

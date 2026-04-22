@@ -71,6 +71,7 @@ export default function Providers() {
   const [form, setForm] = useState(EMPTY_FORM)
   const [csvContent, setCsvContent] = useState('')
   const [selectedProviderId, setSelectedProviderId] = useState(null)
+  const [backfillJobId, setBackfillJobId] = useState(null)
 
   const providersQuery = useQuery({
     queryKey: ['providers', submittedFilters],
@@ -93,6 +94,18 @@ export default function Providers() {
     enabled: Boolean(selectedProviderId),
     queryFn: async () => {
       const res = await api.get(`/api/providers/${selectedProviderId}`)
+      return res.data
+    },
+  })
+  const backfillJobQuery = useQuery({
+    queryKey: ['provider-backfill-job', backfillJobId],
+    enabled: Boolean(backfillJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${backfillJobId}`)
       return res.data
     },
   })
@@ -157,6 +170,17 @@ export default function Providers() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providers'] })
+    },
+  })
+  const backfillMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/providers/backfill/job', null, {
+        params: { limit: 250, enrich_websites: true },
+      })
+      return res.data
+    },
+    onSuccess: (job) => {
+      setBackfillJobId(job.id)
     },
   })
 
@@ -297,6 +321,9 @@ export default function Providers() {
               <Button variant="secondary" loading={contactDiscoveryMutation.isPending} onClick={() => contactDiscoveryMutation.mutate()}>
                 Discover Contacts
               </Button>
+              <Button variant="secondary" loading={backfillMutation.isPending} onClick={() => backfillMutation.mutate()}>
+                Run Provider Backfill
+              </Button>
             </div>
             {importMutation.data ? (
               <div className="settings-summary-box">
@@ -336,6 +363,25 @@ export default function Providers() {
                 <div className="row-title">Latest Contact Discovery</div>
                 <div className="row-subtitle">Checked {contactDiscoveryMutation.data.checked || 0}, updated {contactDiscoveryMutation.data.updated || 0}</div>
                 {(contactDiscoveryMutation.data.errors || []).slice(0, 3).map((error, index) => <div key={index} className="form-error">{error}</div>)}
+              </div>
+            ) : null}
+            {backfillJobQuery.data ? (
+              <div className="settings-summary-box">
+                <div className="row-title">Provider Backfill Job</div>
+                <div className="row-subtitle">
+                  {backfillJobQuery.data.status}
+                  {backfillJobQuery.data.progress?.current_label ? ` | ${backfillJobQuery.data.progress.current_label}` : ''}
+                  {backfillJobQuery.data.progress?.percent !== undefined ? ` | ${backfillJobQuery.data.progress.percent}%` : ''}
+                </div>
+                {backfillJobQuery.data.result ? (
+                  <div className="row-subtitle">
+                    Resolved {backfillJobQuery.data.result.identities_resolved || 0}
+                    {' | '}
+                    Award evidence inserted {backfillJobQuery.data.result.nsn_award_provider_seed?.inserted || 0}
+                    {' | '}
+                    Award history inserted {backfillJobQuery.data.result.award_history_provider_seed?.inserted || 0}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>

@@ -23,6 +23,7 @@ from app.services.providers.pdf_cage_extractor import (
 )
 from app.services.providers.contact_discovery import discover_provider_contacts
 from app.services.providers.identity_resolver import resolve_provider_identities
+from app.services.search_jobs import start_search_job
 
 router = APIRouter(prefix="/api/providers", tags=["providers"])
 
@@ -174,6 +175,22 @@ def resolve_identities(
         db,
         organization_id=getattr(current_org, "id", None),
         limit=limit,
+    )
+
+
+@router.post("/backfill/job")
+def start_provider_backfill_job(
+    limit: int = 250,
+    enrich_websites: bool = True,
+    current_org=Depends(get_current_organization),
+):
+    return start_search_job(
+        "provider_backfill",
+        {
+            "organization_id": getattr(current_org, "id", None),
+            "limit": max(min(limit, 1000), 1),
+            "enrich_websites": enrich_websites,
+        },
     )
 
 

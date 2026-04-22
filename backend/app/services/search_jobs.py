@@ -15,6 +15,7 @@ from app.services.dibbs.pdf_bulk_export import export_dibbs_pdfs_for_fscs
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.publog_sync import sync_publog_package
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
+from app.services.providers.provider_backfill import run_provider_backfill
 
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
@@ -231,6 +232,14 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 opportunity_id,
                 organization_id=payload.get("organization_id"),
                 force=bool(payload.get("force", False)),
+                progress_callback=lambda event: _append_progress(job_id, event),
+            )
+        elif kind == "provider_backfill":
+            result = run_provider_backfill(
+                db,
+                organization_id=payload.get("organization_id"),
+                limit=int(payload.get("limit") or 250),
+                enrich_websites=bool(payload.get("enrich_websites", True)),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         else:

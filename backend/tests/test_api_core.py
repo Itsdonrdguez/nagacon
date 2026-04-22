@@ -773,6 +773,23 @@ def test_provider_detail_route_returns_profile(client, monkeypatch):
     assert response.json()["provider"]["company_name"] == "Acme Defense"
 
 
+def test_provider_backfill_job_route_returns_job(client, monkeypatch):
+    def fake_start_search_job(kind, payload):
+        assert kind == "provider_backfill"
+        assert payload["organization_id"] == 1
+        assert payload["limit"] == 25
+        return {"id": "provider-backfill-1", "kind": kind, "status": "queued", "payload": payload}
+
+    monkeypatch.setattr(providers_api, "start_search_job", fake_start_search_job)
+
+    response = client.post("/api/providers/backfill/job", params={"limit": 25, "enrich_websites": False})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "provider_backfill"
+    assert payload["payload"]["enrich_websites"] is False
+
+
 def test_provider_award_match_reasons_accept_alias_and_normalized_name():
     reasons = providers_repository._award_match_reasons(
         recipient_name="Acme Defense LLC",

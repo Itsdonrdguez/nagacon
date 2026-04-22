@@ -41,6 +41,10 @@ function money(value) {
   return numeric.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
 }
 
+function providerLabel(provider) {
+  return provider?.display_name || provider?.canonical_name || provider?.company_name || 'Unresolved supplier'
+}
+
 function providerPayload(form) {
   return {
     company_name: form.company_name.trim(),
@@ -369,7 +373,7 @@ export default function Providers() {
                   {rows.map((row) => (
                     <TableRow key={row.provider_id}>
                     <TableCell>
-                      <div className="row-title">{row.company_name}</div>
+                      <div className="row-title">{providerLabel(row)}</div>
                       <div className="row-subtitle">
                         {row.cage ? `CAGE ${row.cage}` : 'CAGE not set'}
                         {row.email ? ` | ${row.email}` : ''}
@@ -439,7 +443,7 @@ export default function Providers() {
             <div className="data-health-stack">
               <div className="source-freshness-row">
                 <div>
-                  <div className="row-title">{providerDetail.provider.company_name}</div>
+                  <div className="row-title">{providerLabel(providerDetail.provider)}</div>
                   <div className="row-subtitle">
                     {providerDetail.provider.cage ? `CAGE ${providerDetail.provider.cage}` : 'No CAGE'}
                     {providerDetail.provider.website ? ` | ${providerDetail.provider.website}` : ''}

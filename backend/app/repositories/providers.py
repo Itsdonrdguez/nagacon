@@ -100,6 +100,30 @@ def _company_key(value: Any) -> str:
     return " ".join(tokens[:12]).strip()
 
 
+def _is_placeholder_company_name(value: Any) -> bool:
+    text = _clean(value, 300)
+    if not text:
+        return True
+    upper = text.upper()
+    if upper.startswith("CAGE "):
+        return True
+    if upper in {"UNKNOWN PROVIDER", "SOLICITATION", "SOLICITATIONS", "APPROVED SOURCE DATA", "FEEDBACK"}:
+        return True
+    return False
+
+
+def _display_company_name(provider: Provider) -> str:
+    canonical = _clean(getattr(provider, "canonical_name", None), 300)
+    company_name = _clean(getattr(provider, "company_name", None), 300)
+    if canonical and not _is_placeholder_company_name(canonical):
+        return canonical
+    if company_name and not _is_placeholder_company_name(company_name):
+        return company_name
+    if provider.cage:
+        return f"Unresolved supplier ({provider.cage})"
+    return "Unresolved supplier"
+
+
 def _provider_name_variants(provider: Provider) -> list[str]:
     values = [
         _clean(provider.company_name, 240),
@@ -433,6 +457,7 @@ class ProviderRepository:
             "provider": {
                 "id": provider.id,
                 "company_name": provider.company_name,
+                "display_name": _display_company_name(provider),
                 "canonical_name": provider.canonical_name,
                 "cage": provider.cage,
                 "uei": provider.uei,
@@ -562,6 +587,7 @@ class ProviderRepository:
             "provider_id": provider.id,
             "provider_item_id": primary.id if primary else None,
             "company_name": provider.company_name,
+            "display_name": _display_company_name(provider),
             "canonical_name": provider.canonical_name,
             "identity_source": provider.identity_source,
             "identity_confidence": provider.identity_confidence,

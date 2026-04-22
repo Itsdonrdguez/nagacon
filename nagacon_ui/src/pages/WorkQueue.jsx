@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { Badge, Button, Card, EmptyState, LoadingState } from '../components/ui'
@@ -45,6 +45,7 @@ const compactMeta = (parts) => parts.filter(Boolean).join(' | ')
 
 export default function WorkQueue() {
   const [filter, setFilter] = useState('all')
+  const [backgroundJobId, setBackgroundJobId] = useState(null)
   const queryClient = useQueryClient()
   const workQueueQuery = useQuery({
     queryKey: ['work-queue-today'],
@@ -58,6 +59,18 @@ export default function WorkQueue() {
   const data = workQueueQuery.data || {}
   const items = data.items || []
   const summary = data.summary || {}
+  const backgroundJobQuery = useQuery({
+    queryKey: ['work-queue-background-job', backgroundJobId],
+    enabled: Boolean(backgroundJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${backgroundJobId}`)
+      return res.data
+    },
+  })
   const refreshQueue = () => {
     queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
   }
@@ -85,14 +98,46 @@ export default function WorkQueue() {
     },
     onSuccess: refreshQueue,
   })
+  const queueBackgroundMutation = useMutation({
+    mutationFn: async (item) => {
+      const opportunityId = item.opportunity?.id
+      if (item.type === 'AWARDEE_ENRICHMENT_READY') {
+        const res = await api.post(`/api/opportunities/${opportunityId}/awardee-enrichment-job`, null, {
+          params: { force: true },
+        })
+        return res.data
+      }
+      if (item.type === 'NSN_INTELLIGENCE_REFRESH' && item.meta?.nsn) {
+        const cleanNsn = String(item.meta.nsn || '').replace(/\D+/g, '')
+        const res = await api.post(`/api/nsn/${cleanNsn}/build-job`, null, {
+          params: {
+            run_usaspending: true,
+            seed_providers: true,
+            limit: 50,
+          },
+        })
+        return res.data
+      }
+      throw new Error('No background job available for this work item.')
+    },
+    onSuccess: (job) => {
+      setBackgroundJobId(job.id)
+    },
+  })
   const visibleItems = items.filter((item) => {
     if (filter === 'all') return true
     return item.priority === filter || item.type === filter
   })
+  useEffect(() => {
+    if (backgroundJobQuery.data?.status === 'success') {
+      refreshQueue()
+    }
+  }, [backgroundJobQuery.data?.status])
   const actionLoading = (item) => {
     if (item.type === 'MISSING_PART_FINDER') return runPartFinderMutation.isPending
     if (item.type === 'MISSING_VENDOR_LEADS') return syncVendorLeadsMutation.isPending
     if (item.type === 'QUOTE_FOLLOW_UP_DUE') return logFollowUpMutation.isPending
+    if (item.type === 'AWARDEE_ENRICHMENT_READY' || item.type === 'NSN_INTELLIGENCE_REFRESH') return queueBackgroundMutation.isPending
     return false
   }
   const runItemAction = (item) => {
@@ -108,12 +153,16 @@ export default function WorkQueue() {
         quoteId: item.meta.quote_id,
         companyName: item.meta.company_name || item.meta.cage,
       })
+    } else if (item.type === 'AWARDEE_ENRICHMENT_READY' || item.type === 'NSN_INTELLIGENCE_REFRESH') {
+      queueBackgroundMutation.mutate(item)
     }
   }
   const directActionLabel = (item) => {
     if (item.type === 'MISSING_PART_FINDER') return 'Run Part Finder'
     if (item.type === 'MISSING_VENDOR_LEADS') return 'Sync Leads'
     if (item.type === 'QUOTE_FOLLOW_UP_DUE') return 'Log Follow-up'
+    if (item.type === 'AWARDEE_ENRICHMENT_READY') return 'Queue Award Check'
+    if (item.type === 'NSN_INTELLIGENCE_REFRESH') return 'Queue NSN Build'
     return ''
   }
 
@@ -194,6 +243,16 @@ export default function WorkQueue() {
       </Card>
 
       <Card title="Work Items">
+        {backgroundJobQuery.data ? (
+          <div className="settings-summary-box">
+            <div className="row-title">Background collection job</div>
+            <div className="row-subtitle">
+              {backgroundJobQuery.data.kind} | {backgroundJobQuery.data.status}
+              {backgroundJobQuery.data.progress?.current_label ? ` | ${backgroundJobQuery.data.progress.current_label}` : ''}
+              {backgroundJobQuery.data.progress?.percent !== undefined ? ` | ${backgroundJobQuery.data.progress.percent}%` : ''}
+            </div>
+          </div>
+        ) : null}
         {visibleItems.length === 0 ? (
           <EmptyState
             title="No work items match this filter"

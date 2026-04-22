@@ -76,6 +76,7 @@ class ProviderRowOut(BaseModel):
     provider_id: int
     provider_item_id: Optional[int] = None
     company_name: str
+    display_name: Optional[str] = None
     cage: Optional[str] = None
     uei: Optional[str] = None
     website: Optional[str] = None

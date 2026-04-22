@@ -33,6 +33,15 @@ BLOCKED_CAGE_TOKENS = {
     "PHONE",
     "TABLE",
 }
+BLOCKED_COMPANY_TOKENS = {
+    "SOLICITATIONS",
+    "SOLICITATION",
+    "POLICY STATEMENTS",
+    "POLICY STATEMENTS FEEDBACK",
+    "FEEDBACK",
+    "APPROVED SOURCE DATA",
+    "TECHNICAL DOCUMENTS",
+}
 
 
 def _clean(value: Any, max_len: int | None = None) -> str | None:
@@ -237,6 +246,22 @@ def _normalize_website(value: str | None) -> str | None:
         return None
     if not re.match(r"^https?://", text, flags=re.IGNORECASE):
         text = f"https://{text}"
+    return text
+
+
+def _normalize_company_name(value: str | None, *, cage: str | None = None) -> str | None:
+    text = _clean(value, 240)
+    if not text:
+        return None
+    compact = re.sub(r"\s+", " ", text).strip().upper()
+    if compact in BLOCKED_COMPANY_TOKENS:
+        return None
+    if cage and compact == f"CAGE {cage}".upper():
+        return None
+    if re.fullmatch(r"(SOLICITATION|SOLICITATIONS)(\s+[A-Z0-9#-]+)?", compact):
+        return None
+    if len(compact) <= 3:
+        return None
     return text
 
 
@@ -487,14 +512,14 @@ def extract_providers_from_dibbs_pdfs(
                 continue
             seen_cage_item.add(key)
 
-            company_name = row.get("company_name")
+            company_name = _normalize_company_name(row.get("company_name"), cage=cage)
             sam_website = None
             if sam_api_key:
                 sam_row = _lookup_sam_entity(cage, sam_api_key)
                 if sam_row.get("error"):
                     result.errors.append(f"{path.name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
                     sam_row = {}
-                sam_name = sam_row.get("company_name")
+                sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
                 sam_website = sam_row.get("website")
                 if sam_name:
                     company_name = sam_name
@@ -686,14 +711,14 @@ def extract_providers_from_opportunity_pdfs(
                 continue
             seen_cage_item.add(key)
 
-            company_name = row.get("company_name")
+            company_name = _normalize_company_name(row.get("company_name"), cage=cage)
             sam_website = None
             if sam_api_key:
                 sam_row = _lookup_sam_entity(cage, sam_api_key)
                 if sam_row.get("error"):
                     result.errors.append(f"{file_record.filename or path.name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
                     sam_row = {}
-                sam_name = sam_row.get("company_name")
+                sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
                 sam_website = sam_row.get("website")
                 if sam_name:
                     company_name = sam_name

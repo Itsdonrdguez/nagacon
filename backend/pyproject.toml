@@ -18,5 +18,16 @@ dependencies = [
   "pdfplumber>=0.11",
 ]
 
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["tests*", "experiments*", "audit_reports*", "exports*", "publog_work*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

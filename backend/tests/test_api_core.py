@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.api import opportunities as opportunities_api
@@ -9,10 +10,12 @@ from app.api import saas_readiness as saas_readiness_api
 from app.api import source_freshness as source_freshness_api
 from app.api import workspace as workspace_api
 from app.api import work_queue as work_queue_api
+from app.api import files as files_api
 from app.api.routes import company as company_api
 from app.api.routes import nsn as nsn_api
 from app.api.routes import pipeline as pipeline_api
 from app.api.routes import providers as providers_api
+from app.api.routes import auth as auth_api
 from app.repositories import providers as providers_repository
 from app.core import security as security_core
 from app.schemas.company import CompanyProfileCreate
@@ -537,15 +540,17 @@ def test_provider_settings_blank_secret_fields_are_not_saved(client, monkeypatch
 
     monkeypatch.setattr("app.api.routes.settings.ensure_default_organization", lambda db: default_org)
 
-    def fake_upsert(db, setting_key, setting_value, organization_id=None):
+    def fake_upsert(db, setting_key, setting_value, organization_id=None, user_id=None):
         saved_keys.append((setting_key, setting_value))
         return SimpleNamespace(id=5)
 
     monkeypatch.setattr("app.api.routes.settings.upsert_setting", fake_upsert)
     monkeypatch.setattr(
         "app.api.routes.settings.get_provider_settings",
-        lambda db: {
+        lambda db, user_id=None: {
             "organization": {"id": 9, "name": "Default Organization", "slug": "default"},
+            "scope": "user",
+            "user_id": user_id,
             "sam_api_key": "",
             "openai_api_key": "",
             "openai_model": "gpt-4o-mini",
@@ -585,13 +590,93 @@ def test_current_organization_route_returns_default_org(client, monkeypatch):
     assert payload["slug"] == "default"
 
 
-def test_auth_me_returns_current_user_and_org(client):
+def test_auth_me_returns_session_user_and_org(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_api,
+        "get_user_by_session_token",
+        lambda db, token: SimpleNamespace(
+            id=1,
+            email="owner@nagacon.local",
+            full_name="Default Owner",
+            role="OWNER",
+            is_active=True,
+            organization_id=1,
+        ) if token == "session-1" else None,
+    )
+
+    client.cookies.set("nagacon_session", "session-1")
     response = client.get("/api/auth/me")
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["authenticated"] is True
     assert payload["user"]["email"] == "owner@nagacon.local"
     assert payload["organization"]["slug"] == "default"
+
+
+def test_auth_me_returns_unauthenticated_without_session(client, monkeypatch):
+    monkeypatch.setattr(auth_api, "get_user_by_session_token", lambda db, token: None)
+
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["authenticated"] is False
+    assert payload["user"] is None
+
+
+def test_auth_signup_sets_session_cookie(client, monkeypatch):
+    fake_user = SimpleNamespace(id=8, email="new@nagacon.test", full_name="New User", role="OWNER", is_active=True)
+    monkeypatch.setattr(auth_api, "create_user_account", lambda db, email, password, full_name=None: fake_user)
+    monkeypatch.setattr(auth_api, "start_user_session", lambda db, user: ("token-123", None))
+
+    response = client.post("/api/auth/signup", json={"email": "new@nagacon.test", "password": "password123", "full_name": "New User"})
+
+    assert response.status_code == 200
+    assert response.json()["authenticated"] is True
+    assert "nagacon_session=" in response.headers.get("set-cookie", "")
+
+
+def test_auth_login_rejects_invalid_credentials(client, monkeypatch):
+    monkeypatch.setattr(auth_api, "authenticate_user", lambda db, identifier, password: None)
+
+    response = client.post("/api/auth/login", json={"email": "missing@nagacon.test", "password": "badpass"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid username/email or password"
+
+
+def test_auth_login_accepts_identifier_field(client, monkeypatch):
+    fake_user = SimpleNamespace(id=1, email="admin@nagacon.local", full_name="Admin", role="OWNER", is_active=True)
+    seen = {}
+
+    def fake_authenticate_user(db, identifier, password):
+        seen["identifier"] = identifier
+        seen["password"] = password
+        return fake_user
+
+    monkeypatch.setattr(auth_api, "authenticate_user", fake_authenticate_user)
+    monkeypatch.setattr(auth_api, "start_user_session", lambda db, user: ("token-123", None))
+
+    response = client.post("/api/auth/login", json={"identifier": "admin", "password": "admin"})
+
+    assert response.status_code == 200
+    assert seen == {"identifier": "admin", "password": "admin"}
+    assert response.json()["user"]["email"] == "admin@nagacon.local"
+
+
+def test_auth_logout_clears_cookie(client, monkeypatch):
+    fake_user = SimpleNamespace(id=1)
+    cleared = []
+    monkeypatch.setattr(auth_api, "get_user_by_session_token", lambda db, token: fake_user if token == "token-123" else None)
+    monkeypatch.setattr(auth_api, "clear_user_session", lambda db, user: cleared.append(user.id))
+    client.cookies.set("nagacon_session", "token-123")
+
+    response = client.post("/api/auth/logout")
+
+    assert response.status_code == 200
+    assert cleared == [1]
+    assert "nagacon_session=" in response.headers.get("set-cookie", "")
 
 
 def test_work_queue_today_returns_daily_actions(client, monkeypatch):
@@ -634,6 +719,70 @@ def test_work_queue_today_returns_daily_actions(client, monkeypatch):
     payload = response.json()
     assert payload["total"] == 1
     assert payload["items"][0]["type"] == "QUOTE_FOLLOW_UP_DUE"
+
+
+def test_work_queue_queue_today_returns_background_summary(client, monkeypatch):
+    def fake_queue_daily_work(db, organization_id=None, limit=200):
+        assert organization_id == 1
+        assert limit == 75
+        return {
+            "status": "ok",
+            "organization_id": 1,
+            "generated_at": "2026-04-21T12:00:00",
+            "scanned_items": 10,
+            "queueable_items": 3,
+            "queued_count": 2,
+            "skipped_duplicate_count": 1,
+            "queued_jobs": [
+                {"item_id": "a", "kind": "awardee_enrichment", "target": 7, "job_id": "job-a", "status": "queued"},
+                {"item_id": "b", "kind": "nsn_build", "target": "4110015342682", "job_id": "job-b", "status": "queued"},
+            ],
+            "skipped_duplicates": [
+                {"item_id": "c", "kind": "nsn_build", "target": "3110012739414"},
+            ],
+        }
+
+    monkeypatch.setattr(work_queue_api, "queue_daily_work", fake_queue_daily_work)
+
+    response = client.post("/api/work-queue/queue-today", params={"limit": 75})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["queued_count"] == 2
+    assert payload["skipped_duplicate_count"] == 1
+    assert payload["queued_jobs"][0]["kind"] == "awardee_enrichment"
+
+
+def test_work_queue_queue_history_returns_recent_runs(client, monkeypatch):
+    def fake_list_daily_queue_runs(db, organization_id=None, limit=10):
+        assert organization_id == 1
+        assert limit == 5
+        return {
+            "items": [
+                {
+                    "id": "batch-1",
+                    "status": "success",
+                    "created_at": "2026-04-21T12:00:00",
+                    "completed_at": "2026-04-21T12:00:03",
+                    "queued_count": 4,
+                    "skipped_duplicate_count": 2,
+                    "queueable_items": 6,
+                    "scanned_items": 15,
+                    "queued_jobs": [{"job_id": "job-1"}],
+                }
+            ],
+            "total": 1,
+            "organization_id": 1,
+        }
+
+    monkeypatch.setattr(work_queue_api, "list_daily_queue_runs", fake_list_daily_queue_runs)
+
+    response = client.get("/api/work-queue/queue-history", params={"limit": 5})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["queued_count"] == 4
 
 
 def test_notifications_route_returns_work_queue_alerts(client, monkeypatch):
@@ -840,6 +989,119 @@ def test_opportunity_read_extracts_requested_quantity_from_dibbs_search_row():
     assert payload["requested_quantity_display"] == "Qty: 8"
 
 
+def test_preferred_dibbs_detail_pdf_url_uses_search_row_pdf_url():
+    from types import SimpleNamespace
+
+    from app.services.pdf_service import _preferred_dibbs_detail_pdf_url
+
+    opp = SimpleNamespace(
+        solicitation_number="6515-01-555-0446",
+        raw_payload={
+            "dibbs_search_row": {
+                "nsn": "6515015550446",
+                "pdf_url": "https://dibbs2.bsm.dla.mil/Downloads/RFQ/Q/SPE2DS26T008Q.PDF",
+            }
+        },
+    )
+
+    assert _preferred_dibbs_detail_pdf_url(opp) == "https://dibbs2.bsm.dla.mil/Downloads/RFQ/Q/SPE2DS26T008Q.PDF"
+
+
+def test_collect_dibbs_file_candidates_includes_search_row_pdf_url():
+    from types import SimpleNamespace
+
+    from app.services.pdf_service import _collect_dibbs_file_candidates
+
+    opp = SimpleNamespace(
+        raw_payload={
+            "dibbs_search_row": {
+                "nsn": "6515015550446",
+                "pdf_url": "https://dibbs2.bsm.dla.mil/Downloads/RFQ/Q/SPE2DS26T008Q.PDF",
+            }
+        }
+    )
+
+    candidates = _collect_dibbs_file_candidates(opp)
+
+    assert candidates == [
+        {
+            "url": "https://dibbs2.bsm.dla.mil/Downloads/RFQ/Q/SPE2DS26T008Q.PDF",
+            "label": "6515015550446",
+        }
+    ]
+
+
+def test_dibbs_maintenance_text_detection():
+    from app.services.pdf_service import _looks_like_dibbs_maintenance_text
+
+    assert _looks_like_dibbs_maintenance_text("DIBBS is temporarily unavailable due to scheduled maintenance.")
+    assert _looks_like_dibbs_maintenance_text("The system is under maintenance. Please try again later.")
+    assert _looks_like_dibbs_maintenance_text("Service unavailable")
+    assert _looks_like_dibbs_maintenance_text("Normal solicitation detail page") is False
+
+
+def test_should_create_fallback_snapshot_only_when_no_downloaded_files():
+    from app.services.pdf_service import _should_create_fallback_snapshot
+
+    assert _should_create_fallback_snapshot(True, []) is True
+    assert _should_create_fallback_snapshot(False, []) is False
+    assert _should_create_fallback_snapshot(True, [{"filename": "official.pdf"}]) is False
+
+
+def test_save_downloaded_file_repairs_stale_existing_record(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.services import pdf_service
+
+    existing = SimpleNamespace(
+        file_type="PDF_FALLBACK_SNAPSHOT",
+        filename="test.pdf",
+        source_url="https://old.example/test.pdf",
+        file_path="s3://nagacon/missing/test.pdf",
+    )
+    added = []
+    commits = []
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return existing
+
+    class FakeDB:
+        def query(self, model):
+            return FakeQuery()
+
+        def add(self, item):
+            added.append(item)
+
+        def commit(self):
+            commits.append(True)
+
+    monkeypatch.setattr(pdf_service, "file_exists", lambda ref: False)
+    monkeypatch.setattr(pdf_service, "store_bytes", lambda path, data, content_type=None: "s3://nagacon/repaired/test.pdf")
+
+    opp = SimpleNamespace(id=1, organization_id=1)
+    created, filename = pdf_service._save_downloaded_file(
+        FakeDB(),
+        opp,
+        Path("exports"),
+        "test.pdf",
+        "https://new.example/test.pdf",
+        b"%PDF-new",
+        "DIBBS_ATTACHMENT",
+    )
+
+    assert created == 1
+    assert filename == "test.pdf"
+    assert existing.file_type == "DIBBS_ATTACHMENT"
+    assert existing.source_url == "https://new.example/test.pdf"
+    assert existing.file_path == "s3://nagacon/repaired/test.pdf"
+    assert added == [existing]
+    assert commits == [True]
+
+
 def test_opportunity_read_extracts_requested_quantity_from_dibbs_detail():
     from app.schemas.opportunity import OpportunityRead
 
@@ -862,3 +1124,199 @@ def test_opportunity_read_extracts_requested_quantity_from_dibbs_detail():
 
     assert payload["requested_quantity"] == "12"
     assert payload["requested_quantity_display"] == "Qty: 12"
+
+
+def test_opportunity_read_marks_archived_lifecycle_after_30_days():
+    from datetime import timedelta
+
+    from app.schemas.opportunity import OpportunityRead
+
+    payload = OpportunityRead.model_validate(
+        {
+            "id": 9,
+            "source": "DIBBS",
+            "solicitation_number": "SOL-9",
+            "title": "Legacy Part",
+            "due_at": datetime.utcnow() - timedelta(days=31),
+        }
+    ).model_dump()
+
+    assert payload["opportunity_lifecycle"] == "ARCHIVED"
+    assert payload["workflow_label"] == "Archive"
+    assert payload["award_intelligence_status"] == "ARCHIVED"
+
+
+def test_file_retention_marks_archived_complete_pdf_as_prune_eligible():
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from app.services.file_retention import classify_opportunity_file_retention
+
+    opportunity = SimpleNamespace(due_at=datetime.utcnow() - timedelta(days=45))
+    file_record = SimpleNamespace(
+        file_type="DIBBS_ATTACHMENT",
+        file_path="s3://nagacon/test.pdf",
+        extracted_text="parsed text",
+        parsed_metadata={"document_type": "SOLICITATION", "_pipeline": {"review_required": False}},
+    )
+
+    decision = classify_opportunity_file_retention(file_record, opportunity)
+
+    assert decision.storage_class == "core"
+    assert decision.retention_status == "eligible_for_prune"
+    assert decision.prune_eligible is True
+
+
+def test_files_prune_candidates_returns_only_eligible_items(client, monkeypatch):
+    opportunity = SimpleNamespace(id=5, due_at=datetime.utcnow())
+    keep_file = SimpleNamespace(id=1, opportunity_id=5, filename="keep.pdf", file_type="DIBBS_ATTACHMENT", file_path="s3://nagacon/keep.pdf", parsed_metadata={}, extracted_text=None)
+    prune_file = SimpleNamespace(id=2, opportunity_id=5, filename="prune.pdf", file_type="DIBBS_ATTACHMENT", file_path="s3://nagacon/prune.pdf", parsed_metadata={}, extracted_text="ok")
+
+    class FakeQuery:
+        def __init__(self, result):
+            self.result = result
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return self.result
+
+        def first(self):
+            if isinstance(self.result, list):
+                return self.result[0] if self.result else None
+            return self.result
+
+    monkeypatch.setattr(files_api, "_scoped_opportunity_query", lambda db, opportunity_id, org_id: FakeQuery(opportunity))
+    monkeypatch.setattr(files_api, "_scoped_file_query", lambda db, org_id: FakeQuery([keep_file, prune_file]))
+    monkeypatch.setattr(
+        files_api,
+        "classify_opportunity_file_retention",
+        lambda file_record, opp: SimpleNamespace(
+            storage_class="core",
+            retention_status="eligible_for_prune" if file_record.id == 2 else "retain",
+            reason="archived_and_extracted" if file_record.id == 2 else "active_or_recently_closed",
+            prune_eligible=file_record.id == 2,
+        ),
+    )
+
+    response = client.get("/api/files/prune-candidates", params={"opportunity_id": 5})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["items"][0]["id"] == 2
+
+
+def test_files_prune_marks_only_eligible_files(client, monkeypatch):
+    opportunity = SimpleNamespace(id=7, due_at=datetime.utcnow())
+    keep_file = SimpleNamespace(id=1, opportunity_id=7, filename="keep.pdf", file_type="DIBBS_ATTACHMENT", file_path="s3://nagacon/keep.pdf", parsed_metadata={}, extracted_text=None)
+    prune_file = SimpleNamespace(id=2, opportunity_id=7, filename="prune.pdf", file_type="DIBBS_ATTACHMENT", file_path="s3://nagacon/prune.pdf", parsed_metadata={}, extracted_text="ok")
+    commits = []
+
+    class FakeQuery:
+        def __init__(self, result):
+            self.result = result
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return self.result
+
+        def first(self):
+            if isinstance(self.result, list):
+                return self.result[0] if self.result else None
+            return self.result
+
+    class FakeDB:
+        def add(self, item):
+            return None
+
+        def commit(self):
+            commits.append(True)
+
+    def override_get_db():
+        yield FakeDB()
+
+    client.app.dependency_overrides[files_api.get_db] = override_get_db
+    monkeypatch.setattr(files_api, "_scoped_opportunity_query", lambda db, opportunity_id, org_id: FakeQuery(opportunity))
+    monkeypatch.setattr(files_api, "_scoped_file_query", lambda db, org_id: FakeQuery([keep_file, prune_file]))
+    monkeypatch.setattr(
+        files_api,
+        "classify_opportunity_file_retention",
+        lambda file_record, opp: SimpleNamespace(
+            storage_class="core",
+            retention_status="eligible_for_prune" if file_record.id == 2 else "retain",
+            reason="archived_and_extracted" if file_record.id == 2 else "active_or_recently_closed",
+            prune_eligible=file_record.id == 2,
+        ),
+    )
+    monkeypatch.setattr(files_api, "delete_reference", lambda ref: ref == "s3://nagacon/prune.pdf")
+
+    response = client.post("/api/files/prune", params={"opportunity_id": 7})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["pruned_count"] == 1
+    assert payload["skipped_count"] == 1
+    assert prune_file.file_path == "pruned://opportunity-file/2"
+    assert prune_file.parsed_metadata["_retention"]["deleted_from_storage"] is True
+    assert commits == [True]
+    client.app.dependency_overrides.pop(files_api.get_db, None)
+
+
+def test_download_file_returns_storage_response_without_exists_precheck(client, monkeypatch):
+    file_record = SimpleNamespace(
+        id=34,
+        opportunity_id=1116,
+        file_path="s3://nagacon/6515-01-685-4670/documents/6515-01-685-4670_fallback_snapshot.pdf",
+        filename="6515-01-685-4670_fallback_snapshot.pdf",
+    )
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return file_record
+
+    monkeypatch.setattr(files_api, "_scoped_file_query", lambda db, org_id: FakeQuery())
+    monkeypatch.setattr(files_api, "build_storage_download_response", lambda ref, filename=None: {"ok": True, "ref": ref, "filename": filename})
+    monkeypatch.setattr(files_api, "file_exists", lambda ref: False)
+
+    response = client.get("/api/files/download/34")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["ref"] == file_record.file_path
+
+
+def test_storage_local_references_still_work_when_backend_is_s3(monkeypatch):
+    import tempfile
+    from pathlib import Path
+
+    from app.services import storage as storage_service
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp.write(b"%PDF-legacy")
+    temp.flush()
+    temp.close()
+    local_file = Path(temp.name)
+
+    monkeypatch.setattr(storage_service.settings, "STORAGE_BACKEND", "s3", raising=False)
+    monkeypatch.setattr(storage_service.settings, "S3_BUCKET", "", raising=False)
+
+    try:
+        assert storage_service.file_exists(str(local_file)) is True
+
+        with storage_service.local_temp_path(str(local_file), suffix=".pdf") as resolved:
+            assert resolved.read_bytes() == b"%PDF-legacy"
+    finally:
+        local_file.unlink(missing_ok=True)

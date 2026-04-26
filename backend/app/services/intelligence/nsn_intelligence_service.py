@@ -596,6 +596,7 @@ def run_nsn_intelligence(
     *,
     seed_awardees: bool = True,
     create_summary_artifact: bool = True,
+    user_id: int | None = None,
 ) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp) or {}
     target = build_nsn_research_target(db, opp)
@@ -604,9 +605,10 @@ def run_nsn_intelligence(
         opp,
         parsed=parsed,
         organization_id=getattr(opp, "organization_id", None),
+        user_id=user_id,
     )
     research = search_usaspending_for_opportunity(opp, db=db)
-    sam_validation = search_sam_contract_awards_for_target(db, target, limit=25)
+    sam_validation = search_sam_contract_awards_for_target(db, target, limit=25, user_id=user_id)
     award_history = persist_award_history(db, opp, target, research, sam_validation)
     seeded = (
         seed_usaspending_vendors_into_leads(db, opp, research, seed_mode="product_only")

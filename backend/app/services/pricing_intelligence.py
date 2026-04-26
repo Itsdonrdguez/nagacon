@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+from pathlib import Path
 from statistics import mean
 from typing import Any
 
@@ -14,6 +15,7 @@ from app.repositories.providers import ProviderRepository
 from app.schemas.provider import ProviderCreate, ProviderItemCreate
 from app.services.provider_settings_service import get_effective_openai_api_key, get_effective_openai_model
 from app.services.providers.pdf_cage_extractor import _lookup_sam_entity
+from app.services.storage import local_temp_path
 
 
 PRICE_SECTION_PATTERN = re.compile(
@@ -387,7 +389,11 @@ def extract_price_history_for_opportunity(db: Session, opp: Opportunity) -> dict
         if not str(file_record.filename or "").lower().endswith(".pdf"):
             continue
         scanned_files += 1
-        text = file_record.extracted_text or _extract_text_with_pdfplumber(file_record.file_path)
+        if file_record.extracted_text:
+            text = file_record.extracted_text
+        else:
+            with local_temp_path(file_record.file_path, suffix=Path(file_record.filename or file_record.file_path).suffix) as local_path:
+                text = _extract_text_with_pdfplumber(str(local_path))
         if not text:
             continue
         blocks = _candidate_blocks(text)

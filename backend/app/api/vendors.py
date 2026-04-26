@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.opportunity import Opportunity
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
@@ -144,7 +144,12 @@ def get_leads(
 
 
 @router.post("/leads/sync")
-def sync_leads(req: SeedRequest, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def sync_leads(
+    req: SeedRequest,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     org_id = getattr(current_org, "id", None)
     opp = db.query(Opportunity).filter(Opportunity.id == req.opportunity_id)
     if org_id is not None:
@@ -154,7 +159,13 @@ def sync_leads(req: SeedRequest, db: Session = Depends(get_db), current_org=Depe
         raise HTTPException(status_code=404, detail="Opportunity not found")
     parsed = ensure_parsed(db, opp)
     out = sync_vendor_leads_from_parsed(db, opp)
-    provider_sync = seed_vendor_leads_from_providers(db, opp, parsed=parsed, organization_id=org_id)
+    provider_sync = seed_vendor_leads_from_providers(
+        db,
+        opp,
+        parsed=parsed,
+        organization_id=org_id,
+        user_id=getattr(current_user, "id", None),
+    )
     out["cage_count"] = len(parsed.get("cage_codes") or [])
     out["text_source"] = parsed.get("text_source") or {}
     out["provider_sync"] = provider_sync
@@ -190,7 +201,12 @@ def get_quote_follow_up_summary(opportunity_id: int, db: Session = Depends(get_d
 
 
 @router.post("/quotes/seed")
-def seed_quotes(req: SeedRequest, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def seed_quotes(
+    req: SeedRequest,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     org_id = getattr(current_org, "id", None)
     opp = db.query(Opportunity).filter(Opportunity.id == req.opportunity_id)
     if org_id is not None:
@@ -199,7 +215,13 @@ def seed_quotes(req: SeedRequest, db: Session = Depends(get_db), current_org=Dep
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     parsed = ensure_parsed(db, opp)
-    provider_sync = seed_vendor_leads_from_providers(db, opp, parsed=parsed, organization_id=org_id)
+    provider_sync = seed_vendor_leads_from_providers(
+        db,
+        opp,
+        parsed=parsed,
+        organization_id=org_id,
+        user_id=getattr(current_user, "id", None),
+    )
     out = seed_quotes_from_parsed(db, opp)
     out["provider_sync"] = provider_sync
     out["text_source"] = parsed.get("text_source") or {}

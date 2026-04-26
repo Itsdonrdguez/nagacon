@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field, computed_field
 
 from app.utils.enums import OpportunityStatus
+from app.utils.opportunity_lifecycle import ARCHIVE_CUTOFF_DAYS, derive_opportunity_lifecycle
 from app.utils.solicitation_status import derive_solicitation_status
 from app.utils.title_normalizer import normalize_source_title
 
@@ -105,6 +106,11 @@ class OpportunityRead(OpportunityBase):
 
     @computed_field
     @property
+    def opportunity_lifecycle(self) -> str:
+        return derive_opportunity_lifecycle(self.due_at)
+
+    @computed_field
+    @property
     def bid_eligible(self) -> bool:
         return self.solicitation_status != "CLOSED"
 
@@ -116,6 +122,8 @@ class OpportunityRead(OpportunityBase):
     @computed_field
     @property
     def workflow_label(self) -> str:
+        if self.opportunity_lifecycle == "ARCHIVED":
+            return "Archive"
         if self.solicitation_status == "CLOSED":
             return "Closed / Intelligence"
         if self.solicitation_status == "DUE_SOON":
@@ -125,6 +133,8 @@ class OpportunityRead(OpportunityBase):
     @computed_field
     @property
     def primary_action_label(self) -> str:
+        if self.opportunity_lifecycle == "ARCHIVED":
+            return "Open Archive"
         return "Analyze Intelligence" if self.solicitation_status == "CLOSED" else "Work Opportunity"
 
     @computed_field
@@ -146,6 +156,8 @@ class OpportunityRead(OpportunityBase):
     def award_intelligence_status(self) -> str:
         if self.solicitation_status != "CLOSED":
             return "ACTIVE_RFQ"
+        if self.opportunity_lifecycle == "ARCHIVED":
+            return "ARCHIVED"
         days = self.days_since_close or 0
         if days < 90:
             return "AWAITING_USASPENDING"
@@ -155,6 +167,18 @@ class OpportunityRead(OpportunityBase):
     @property
     def award_follow_up_eligible(self) -> bool:
         return self.award_intelligence_status == "READY_FOR_USASPENDING_CHECK"
+
+    @computed_field
+    @property
+    def archive_cutoff_days(self) -> int:
+        return ARCHIVE_CUTOFF_DAYS
+
+    @computed_field
+    @property
+    def archive_after(self) -> datetime | None:
+        if not self.due_at:
+            return None
+        return self.due_at + timedelta(days=ARCHIVE_CUTOFF_DAYS)
 
     @computed_field
     @property

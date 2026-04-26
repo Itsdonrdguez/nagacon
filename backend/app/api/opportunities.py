@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.repositories.opportunities import OpportunityRepository
 from app.schemas.opportunity import IngestResult, OpportunityCreate, OpportunityRead, OpportunityUpdate, RawOpportunity
 from app.services.search_jobs import start_search_job
@@ -86,6 +86,7 @@ def start_awardee_enrichment_job(
     force: bool = False,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     org_id = getattr(current_org, "id", None)
     opp = _opportunity_repo(db, org_id).get(opportunity_id)
@@ -96,6 +97,7 @@ def start_awardee_enrichment_job(
         {
             "opportunity_id": opportunity_id,
             "organization_id": org_id,
+            "user_id": getattr(current_user, "id", None),
             "force": force,
         },
     )

@@ -280,8 +280,8 @@ def _normalize_award(row: dict[str, Any], label: str, target: dict[str, Any]) ->
     return score_row
 
 
-def search_sam_contract_awards_for_target(db: Session, target: dict[str, Any], *, limit: int = 25) -> dict[str, Any]:
-    api_key = get_effective_sam_api_key(db)
+def search_sam_contract_awards_for_target(db: Session, target: dict[str, Any], *, limit: int = 25, user_id: int | None = None) -> dict[str, Any]:
+    api_key = get_effective_sam_api_key(db, user_id=user_id)
     if not api_key:
         return {
             "enabled": False,

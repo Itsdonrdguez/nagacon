@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
+from app.services.storage import local_temp_path
 
 
 PDF_PRIORITY = ["PDF_OFFICIAL", "PDF_FALLBACK_SNAPSHOT"]
@@ -260,7 +261,11 @@ def get_best_opportunity_text(db: Session, opp: Opportunity) -> dict[str, Any]:
     for file_type in PDF_PRIORITY:
         matches = [f for f in file_rows if f.file_type == file_type]
         for f in matches:
-            text = _read_pdf_text(f.file_path)
+            if not f.file_path:
+                continue
+            suffix = Path(f.filename or f.file_path).suffix
+            with local_temp_path(f.file_path, suffix=suffix) as local_path:
+                text = _read_pdf_text(local_path)
             if text:
                 return {
                     "text": text,

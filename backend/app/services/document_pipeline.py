@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 import re
 from typing import Any
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.services.document_parser import parse_opportunity_file
+from app.services.storage import local_temp_path
 from app.services.workspace_service import (
     create_artifact,
     ensure_parsed,
@@ -218,7 +220,8 @@ def process_opportunity_file(db: Session, file_id: int, force: bool = False) -> 
     db.refresh(file_record)
 
     try:
-        parsed = parse_opportunity_file(file_record.file_path)
+        with local_temp_path(file_record.file_path, suffix=Path(file_record.filename or file_record.file_path).suffix) as local_path:
+            parsed = parse_opportunity_file(str(local_path))
         extracted_text = _safe_text(parsed.get("text"))
         pipeline_stages = dict((file_record.parsed_metadata or {}).get("_pipeline", {}).get("stages") or {})
         pipeline_stages["extract_agent"] = "completed" if extracted_text else "failed"

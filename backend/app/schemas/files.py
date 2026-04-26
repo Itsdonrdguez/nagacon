@@ -17,6 +17,10 @@ class OpportunityFileOut(BaseModel):
     processing_status: str | None = None
     document_type: str | None = None
     review_required: bool = False
+    storage_class: str | None = None
+    retention_status: str | None = None
+    retention_reason: str | None = None
+    prune_eligible: bool = False
 
     class Config:
         from_attributes = True
@@ -37,6 +41,10 @@ class OpportunityFileInsightsOut(BaseModel):
     processing_status: str | None = None
     document_type: str | None = None
     review_required: bool = False
+    storage_class: str | None = None
+    retention_status: str | None = None
+    retention_reason: str | None = None
+    prune_eligible: bool = False
 
     class Config:
         from_attributes = True

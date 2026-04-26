@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.models.opportunity import Opportunity
 from app.schemas.opportunity import OpportunityCreate, OpportunityUpdate
 from app.utils.exceptions import DuplicateRecordError
+from app.utils.opportunity_lifecycle import ARCHIVE_CUTOFF_DAYS
 
 
 class OpportunityRepository:
@@ -144,6 +145,7 @@ class OpportunityRepository:
             from datetime import datetime, timedelta
 
             now = datetime.utcnow()
+            archive_cutoff = now - timedelta(days=ARCHIVE_CUTOFF_DAYS)
             if due_window == "7d":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at >= now, Opportunity.due_at <= now + timedelta(days=7))
             elif due_window == "30d":
@@ -152,6 +154,10 @@ class OpportunityRepository:
                 query = query.filter(or_(Opportunity.due_at.is_(None), Opportunity.due_at >= now))
             elif due_window == "closed":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
+            elif due_window == "recently_closed":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now, Opportunity.due_at >= archive_cutoff)
+            elif due_window == "archived":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < archive_cutoff)
             elif due_window == "intelligence":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
             elif due_window == "award_followup":
@@ -196,6 +202,8 @@ class OpportunityRepository:
                 {"value": "7d", "label": "Closing Soon"},
                 {"value": "30d", "label": "Due in 30 Days"},
                 {"value": "closed", "label": "Closed / Intelligence"},
+                {"value": "recently_closed", "label": "Recently Closed"},
+                {"value": "archived", "label": "Archived"},
                 {"value": "award_followup", "label": "Award Follow-Up Due"},
                 {"value": "all", "label": "All Records"},
             ],

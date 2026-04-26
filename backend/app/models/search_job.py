@@ -12,6 +12,7 @@ class SearchJob(Base):
 
     id = Column(String(80), primary_key=True, index=True)
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     kind = Column(String(80), nullable=False, index=True)
     status = Column(String(40), nullable=False, default="queued", index=True)
     payload = Column(JSONB, nullable=True)

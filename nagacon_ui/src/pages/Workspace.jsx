@@ -426,6 +426,10 @@ export default function Workspace() {
   })
   const activeIntakeJob = intakeJobQuery.data
   const isIntakeRunning = activeIntakeJob && !['success', 'failed'].includes(activeIntakeJob.status)
+  const intakeDownloadStep = activeIntakeJob?.result?.steps?.find((step) => step?.name === 'download_documents')?.output || null
+  const dibbsSourceUnavailable = intakeDownloadStep?.source_unavailable?.source === 'DIBBS'
+    ? intakeDownloadStep.source_unavailable
+    : null
 
   const runIntakeMutation = useMutation({
     mutationFn: async () => {
@@ -690,6 +694,10 @@ export default function Workspace() {
   const data = workspaceQuery.data
   const opp = data?.opportunity || {}
   const files = filesQuery.data || []
+  const hasRealDocuments = files.some((file) => String(file?.file_type || '').toUpperCase() !== 'PDF_FALLBACK_SNAPSHOT')
+  const visibleFiles = hasRealDocuments
+    ? files.filter((file) => String(file?.file_type || '').toUpperCase() !== 'PDF_FALLBACK_SNAPSHOT')
+    : files
   const parsedSummary = data?.parsed_summary || {}
   const normalizedFacts = data?.normalized_facts || {}
   const normalizedPoc = normalizedFacts.poc || {}
@@ -840,7 +848,7 @@ export default function Workspace() {
   const recommendedQuote = quoteComparison.find((quote) => quote.normalized_status === 'RECEIVED' && quote.hasPrice) || quoteComparison[0] || null
   const selectedQuote = quoteComparison.find((quote) => String(quote.id) === String(submissionForm.planned_vendor_quote_id || '')) || null
   const packageVendor = selectedQuote || recommendedQuote || null
-  const packageDocuments = [...files]
+  const packageDocuments = [...visibleFiles]
     .sort((a, b) => {
       const aSnapshotPenalty = String(a.file_type || '').toUpperCase() === 'PDF_FALLBACK_SNAPSHOT' ? 1 : 0
       const bSnapshotPenalty = String(b.file_type || '').toUpperCase() === 'PDF_FALLBACK_SNAPSHOT' ? 1 : 0
@@ -1199,17 +1207,17 @@ export default function Workspace() {
   }, [submission?.id, submission?.status, submission?.submitted_at, submission?.submitted_unit_price, submission?.submitted_vendor_cage, submission?.submitted_vendor_name, submission?.planned_vendor_quote_id, submission?.planned_vendor_cage, submission?.planned_vendor_name, submission?.awarded_at, submission?.award_amount, submission?.winning_vendor_cage, submission?.winning_vendor_name, submission?.outcome_summary, submission?.notes])
 
   useEffect(() => {
-    if (!filesQuery.data || filesQuery.data.length === 0) {
+    if (!visibleFiles || visibleFiles.length === 0) {
       if (selectedFileId !== null) {
         setSelectedFileId(null)
       }
       return
     }
-    const hasSelectedFile = filesQuery.data.some((file) => file.id === selectedFileId)
+    const hasSelectedFile = visibleFiles.some((file) => file.id === selectedFileId)
     if (!hasSelectedFile) {
-      setSelectedFileId(filesQuery.data[0].id)
+      setSelectedFileId(visibleFiles[0].id)
     }
-  }, [filesQuery.data, selectedFileId])
+  }, [visibleFiles, selectedFileId])
 
   if (workspaceQuery.isLoading) {
     return (
@@ -1254,6 +1262,7 @@ export default function Workspace() {
   const fileInsights = fileInsightsQuery.data || null
   const solicitationStatus = opp.solicitation_status || 'OPEN'
   const isClosedSolicitation = solicitationStatus === 'CLOSED'
+  const isArchivedOpportunity = opp.opportunity_lifecycle === 'ARCHIVED'
   const documentFields = opp.document_fields || {}
   const documentSummary = opp.document_summary || {}
   const summaryOverviewText =
@@ -1365,17 +1374,27 @@ export default function Workspace() {
             <div className="row-subtitle">
               {(activeIntakeJob.progress?.completed_steps || 0)} of {(activeIntakeJob.progress?.total_steps || 0)} step{(activeIntakeJob.progress?.total_steps || 0) === 1 ? '' : 's'} complete.
             </div>
+            {dibbsSourceUnavailable ? (
+              <div className="workspace-mode-banner" style={{ marginTop: 12 }}>
+                <div className="row-title">DIBBS temporarily unavailable</div>
+                <div className="panel-subtitle">
+                  {dibbsSourceUnavailable.message || 'DIBBS appears to be under maintenance. Retry the official PDF download later.'}
+                </div>
+              </div>
+            ) : null}
           </div>
         ) : null}
 
-        {isClosedSolicitation ? (
-          <div className="workspace-mode-banner">
-            <div className="row-title">Closed solicitation - research only</div>
-            <div className="panel-subtitle">
-              {data.ui_hints?.closed_message || 'This workspace remains available for research, artifacts, and vendor intelligence.'}
+          {isClosedSolicitation ? (
+            <div className="workspace-mode-banner">
+              <div className="row-title">{isArchivedOpportunity ? 'Archived solicitation - archive view' : 'Closed solicitation - research only'}</div>
+              <div className="panel-subtitle">
+                {isArchivedOpportunity
+                  ? 'This archive keeps the source link, documents, and extracted intelligence without active queue work.'
+                  : (data.ui_hints?.closed_message || 'This workspace remains available for research, artifacts, and vendor intelligence.')}
+              </div>
             </div>
-          </div>
-        ) : null}
+          ) : null}
 
           <div className="summary-brief-layout">
             <div className="artifact-note-box summary-overview-box">
@@ -2145,11 +2164,19 @@ export default function Workspace() {
               <div className="row-subtitle">
                 {(activeIntakeJob.progress?.completed_steps || 0)} of {(activeIntakeJob.progress?.total_steps || 0)} step{(activeIntakeJob.progress?.total_steps || 0) === 1 ? '' : 's'} complete.
               </div>
+              {dibbsSourceUnavailable ? (
+                <div className="workspace-mode-banner" style={{ marginTop: 12 }}>
+                  <div className="row-title">DIBBS temporarily unavailable</div>
+                  <div className="panel-subtitle">
+                    {dibbsSourceUnavailable.message || 'DIBBS appears to be under maintenance. Retry the official PDF download later.'}
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
           {filesQuery.isLoading ? (
             <LoadingState label="Loading documents..." />
-          ) : files.length === 0 ? (
+          ) : visibleFiles.length === 0 ? (
             <EmptyState
               title="No documents yet"
               subtitle={data.ui_hints?.empty_artifacts_message || 'Use Download Documents to fetch files for this opportunity.'}
@@ -2164,7 +2191,7 @@ export default function Workspace() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {files.map((file) => (
+                {visibleFiles.map((file) => (
                   <TableRow key={file.id}>
                     <TableCell>
                       <button
@@ -2286,21 +2313,23 @@ export default function Workspace() {
         {!pipeline ? (
           <EmptyState
             title="No pipeline record yet"
-            subtitle={
-              isClosedSolicitation
-                ? 'This closed solicitation can still be researched, but new active pipeline tracking is disabled.'
-                : 'Create a workspace record to start tracking Bid / Not Bid decisions.'
-            }
-            action={
-              <Button
-                loading={ensurePipelineMutation.isPending}
-                disabled={isClosedSolicitation}
-                onClick={() => ensurePipelineMutation.mutate()}
-              >
-                Create Workspace Record
-              </Button>
-            }
-          />
+              subtitle={
+                isArchivedOpportunity
+                  ? 'This archived solicitation stays searchable for sourcing, pricing, documents, and extracted intelligence.'
+                  : isClosedSolicitation
+                  ? 'This closed solicitation can still be researched, but new active pipeline tracking is disabled.'
+                  : 'Create a workspace record to start tracking Bid / Not Bid decisions.'
+              }
+              action={isArchivedOpportunity ? null : (
+                <Button
+                  loading={ensurePipelineMutation.isPending}
+                  disabled={isClosedSolicitation}
+                  onClick={() => ensurePipelineMutation.mutate()}
+                >
+                  Create Workspace Record
+                </Button>
+              )}
+            />
         ) : (
           <div className="workspace-action-column">
             <div><strong>Status:</strong> <StatusPill status={pipeline.decision_status} /></div>

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
 from app.models.bid_submission import BidSubmission
@@ -11,11 +13,16 @@ from app.models.opportunity import Opportunity
 from app.models.search_job import SearchJob
 from app.models.vendor import VendorLead, VendorQuote
 from app.models.workspace import WorkspaceArtifact
+from app.services.search_jobs import record_search_job, start_search_job
+from app.utils.opportunity_lifecycle import is_archived_opportunity
 
 
 HIGH = "HIGH"
 MEDIUM = "MEDIUM"
 LOW = "LOW"
+QUEUEABLE_TYPES = {"AWARDEE_ENRICHMENT_READY", "NSN_INTELLIGENCE_REFRESH"}
+QUEUEABLE_JOB_KINDS = {"awardee_enrichment", "nsn_build"}
+COMPLETED_QUEUE_COOLDOWN_HOURS = 12
 
 
 def _scope_org(query, model, organization_id: int | None):
@@ -82,6 +89,36 @@ def _item(
     }
 
 
+def _normalize_nsn(value: Any) -> str | None:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits or None
+
+
+def _stable_json(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    except Exception:
+        return str(value)
+
+
+def _opportunity_fingerprint(opp: Opportunity, nsn: str | None = None) -> str:
+    payload = {
+        "id": opp.id,
+        "source": opp.source,
+        "solicitation_number": opp.solicitation_number,
+        "title": getattr(opp, "display_title", None) or opp.title,
+        "agency": opp.agency,
+        "due_at": opp.due_at.isoformat() if opp.due_at else None,
+        "status": opp.status,
+        "fsc": getattr(opp, "fsc", None),
+        "set_aside": getattr(opp, "set_aside", None),
+        "nsn": nsn or _extract_nsn(opp),
+        "parsed_json": getattr(opp, "parsed_json", None) or {},
+        "raw_payload": getattr(opp, "raw_payload", None) or {},
+    }
+    return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
 def _count_by_opportunity(db: Session, model, organization_id: int | None, artifact_type: str | None = None) -> dict[int, int]:
     query = db.query(model.opportunity_id, func.count(model.id))
     query = _scope_org(query, model, organization_id)
@@ -91,8 +128,118 @@ def _count_by_opportunity(db: Session, model, organization_id: int | None, artif
     return {int(opp_id): int(count) for opp_id, count in rows}
 
 
-def build_daily_work_queue(db: Session, organization_id: int | None = None, limit: int = 200, now: datetime | None = None) -> dict[str, Any]:
+def _active_queueable_jobs(
+    db: Session,
+    organization_id: int | None,
+    user_id: int | None = None,
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    query = db.query(SearchJob).filter(
+        SearchJob.status.in_(("queued", "running")),
+        SearchJob.kind.in_(("awardee_enrichment", "nsn_build")),
+    )
+    query = _scope_org(query, SearchJob, organization_id)
+    if user_id is not None:
+        query = query.filter(SearchJob.user_id == user_id)
+    rows = query.all()
+    active: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        active[_job_signature(row.kind, payload)] = {
+            "job_id": row.id,
+            "kind": row.kind,
+            "status": row.status,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "progress": dict(row.progress or {}),
+        }
+    return active
+
+
+def _recent_completed_queueable_jobs(
+    db: Session,
+    organization_id: int | None,
+    user_id: int | None = None,
+    *,
+    now: datetime,
+    cooldown_hours: int = COMPLETED_QUEUE_COOLDOWN_HOURS,
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    cutoff = now - timedelta(hours=cooldown_hours)
+    query = db.query(SearchJob).filter(
+        SearchJob.status == "success",
+        SearchJob.kind.in_(tuple(QUEUEABLE_JOB_KINDS)),
+        SearchJob.completed_at.is_not(None),
+        SearchJob.completed_at >= cutoff,
+    )
+    query = _scope_org(query, SearchJob, organization_id)
+    if user_id is not None:
+        query = query.filter(SearchJob.user_id == user_id)
+    rows = query.order_by(SearchJob.completed_at.desc(), SearchJob.created_at.desc()).all()
+    recent: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        signature = _job_signature(row.kind, payload)
+        if signature in recent:
+            continue
+        recent[signature] = {
+            "job_id": row.id,
+            "kind": row.kind,
+            "status": row.status,
+            "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "result": row.result if isinstance(row.result, dict) else {},
+            "payload": payload,
+        }
+    return recent
+
+
+def _recent_failed_queueable_jobs(
+    db: Session,
+    organization_id: int | None,
+    user_id: int | None = None,
+    *,
+    now: datetime,
+    cooldown_hours: int = COMPLETED_QUEUE_COOLDOWN_HOURS,
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    cutoff = now - timedelta(hours=cooldown_hours)
+    query = db.query(SearchJob).filter(
+        SearchJob.status == "failed",
+        SearchJob.kind.in_(tuple(QUEUEABLE_JOB_KINDS)),
+        SearchJob.completed_at.is_not(None),
+        SearchJob.completed_at >= cutoff,
+    )
+    query = _scope_org(query, SearchJob, organization_id)
+    if user_id is not None:
+        query = query.filter(SearchJob.user_id == user_id)
+    rows = query.order_by(SearchJob.completed_at.desc(), SearchJob.created_at.desc()).all()
+    recent: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        signature = _job_signature(row.kind, payload)
+        if signature in recent:
+            continue
+        recent[signature] = {
+            "job_id": row.id,
+            "kind": row.kind,
+            "status": row.status,
+            "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "error": row.error,
+            "payload": payload,
+        }
+    return recent
+
+
+def build_daily_work_queue(
+    db: Session,
+    organization_id: int | None = None,
+    user_id: int | None = None,
+    limit: int = 200,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     current_time = now or datetime.utcnow()
+    active_queueable_jobs = _active_queueable_jobs(db, organization_id, user_id=user_id)
+    recent_completed_jobs = _recent_completed_queueable_jobs(db, organization_id, user_id=user_id, now=current_time)
+    recent_failed_jobs = _recent_failed_queueable_jobs(db, organization_id, user_id=user_id, now=current_time)
 
     opp_query = db.query(Opportunity)
     opp_query = _scope_org(opp_query, Opportunity, organization_id)
@@ -120,19 +267,10 @@ def build_daily_work_queue(db: Session, organization_id: int | None = None, limi
     quote_query = _scope_org(quote_query, VendorQuote, organization_id)
     quotes = quote_query.all()
 
-    recent_awardee_jobs_query = db.query(SearchJob).filter(SearchJob.kind == "awardee_enrichment")
-    recent_awardee_jobs_query = _scope_org(recent_awardee_jobs_query, SearchJob, organization_id)
-    recent_awardee_jobs = recent_awardee_jobs_query.all()
-    awardee_job_opp_ids = set()
-    for job in recent_awardee_jobs:
-        if not isinstance(job.payload, dict) or not (job.payload or {}).get("opportunity_id"):
-            continue
-        try:
-            awardee_job_opp_ids.add(int((job.payload or {}).get("opportunity_id")))
-        except (TypeError, ValueError):
-            continue
-
     items: list[dict[str, Any]] = []
+    in_progress_items: list[dict[str, Any]] = []
+    recent_completed_items: list[dict[str, Any]] = []
+    recent_failed_items: list[dict[str, Any]] = []
 
     for quote in quotes:
         opp = opp_by_id.get(quote.opportunity_id)
@@ -161,6 +299,8 @@ def build_daily_work_queue(db: Session, organization_id: int | None = None, limi
             ))
 
     for opp in opportunities:
+        if is_archived_opportunity(getattr(opp, "due_at", None), now=current_time):
+            continue
         days_left = _days_until(opp.due_at, current_time)
         is_open = days_left is None or days_left >= 0
         if days_left is not None and 0 <= days_left <= 7:
@@ -209,38 +349,286 @@ def build_daily_work_queue(db: Session, organization_id: int | None = None, limi
             ))
 
         submission = submissions.get(opp.id)
-        if days_left is not None and days_left < 0 and opp.id not in awardee_job_opp_ids:
-            items.append(_item(
+        if days_left is not None and days_left < 0:
+            candidate = _item(
                 "AWARDEE_ENRICHMENT_READY",
                 LOW,
                 opp,
                 "Check awardee enrichment",
                 "Solicitation is closed. Use it to improve awardee and vendor intelligence.",
                 action_label="Open Closed Intelligence",
-                meta={"submission_status": getattr(submission, "status", None), "days_since_close": abs(days_left)},
-            ))
+                meta={
+                    "submission_status": getattr(submission, "status", None),
+                    "days_since_close": abs(days_left),
+                    "opportunity_fingerprint": _opportunity_fingerprint(opp, nsn),
+                },
+            )
+            spec = _queue_job_spec(candidate, organization_id)
+            signature = _job_signature(spec["kind"], spec["payload"]) if spec else None
+            if signature and signature in active_queueable_jobs:
+                in_progress_items.append(
+                    {
+                        **candidate,
+                        "queue_state": active_queueable_jobs[signature],
+                    }
+                )
+            elif (
+                signature
+                and signature in recent_completed_jobs
+                and recent_completed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
+            ):
+                recent_completed_items.append(
+                    {
+                        **candidate,
+                        "queue_state": recent_completed_jobs[signature],
+                    }
+                )
+            elif (
+                signature
+                and signature in recent_failed_jobs
+                and recent_failed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
+            ):
+                recent_failed_items.append(
+                    {
+                        **candidate,
+                        "queue_state": recent_failed_jobs[signature],
+                    }
+                )
+            else:
+                items.append(candidate)
 
         if nsn and nsn_artifact_counts.get(opp.id, 0) == 0:
-            items.append(_item(
+            candidate = _item(
                 "NSN_INTELLIGENCE_REFRESH",
                 LOW,
                 opp,
                 "Refresh NSN intelligence",
                 f"NSN {nsn} has no saved intelligence artifact yet.",
                 action_label="Open NSN Intelligence",
-                meta={"nsn": nsn},
-            ))
+                meta={"nsn": nsn, "opportunity_fingerprint": _opportunity_fingerprint(opp, nsn)},
+            )
+            spec = _queue_job_spec(candidate, organization_id)
+            signature = _job_signature(spec["kind"], spec["payload"]) if spec else None
+            if signature and signature in active_queueable_jobs:
+                in_progress_items.append(
+                    {
+                        **candidate,
+                        "queue_state": active_queueable_jobs[signature],
+                    }
+                )
+            elif (
+                signature
+                and signature in recent_completed_jobs
+                and recent_completed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
+            ):
+                recent_completed_items.append(
+                    {
+                        **candidate,
+                        "queue_state": recent_completed_jobs[signature],
+                    }
+                )
+            elif (
+                signature
+                and signature in recent_failed_jobs
+                and recent_failed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
+            ):
+                recent_failed_items.append(
+                    {
+                        **candidate,
+                        "queue_state": recent_failed_jobs[signature],
+                    }
+                )
+            else:
+                items.append(candidate)
 
     priority_order = {HIGH: 0, MEDIUM: 1, LOW: 2}
     items.sort(key=lambda item: (priority_order.get(item["priority"], 9), item.get("due_at") or "9999", item["type"]))
+    in_progress_items.sort(key=lambda item: (item.get("queue_state", {}).get("status") != "running", item["type"], item["title"]))
+    recent_completed_items.sort(key=lambda item: (item.get("queue_state", {}).get("completed_at") or "", item["type"], item["title"]), reverse=True)
+    recent_failed_items.sort(key=lambda item: (item.get("queue_state", {}).get("completed_at") or "", item["type"], item["title"]), reverse=True)
     summary: dict[str, int] = {}
     for item in items:
         summary[item["type"]] = summary.get(item["type"], 0) + 1
         summary[item["priority"]] = summary.get(item["priority"], 0) + 1
+    in_progress_summary: dict[str, int] = {}
+    for item in in_progress_items:
+        in_progress_summary[item["type"]] = in_progress_summary.get(item["type"], 0) + 1
+        queue_status = str((item.get("queue_state") or {}).get("status") or "").upper()
+        if queue_status:
+            in_progress_summary[queue_status] = in_progress_summary.get(queue_status, 0) + 1
+    recent_completed_summary: dict[str, int] = {}
+    for item in recent_completed_items:
+        recent_completed_summary[item["type"]] = recent_completed_summary.get(item["type"], 0) + 1
+        recent_completed_summary["SUCCESS"] = recent_completed_summary.get("SUCCESS", 0) + 1
+    recent_failed_summary: dict[str, int] = {}
+    for item in recent_failed_items:
+        recent_failed_summary[item["type"]] = recent_failed_summary.get(item["type"], 0) + 1
+        recent_failed_summary["FAILED"] = recent_failed_summary.get("FAILED", 0) + 1
+    collection_summary = {
+        "queued": in_progress_summary.get("QUEUED", 0),
+        "running": in_progress_summary.get("RUNNING", 0),
+        "completed": recent_completed_summary.get("SUCCESS", 0),
+        "failed": recent_failed_summary.get("FAILED", 0),
+    }
+    collection_summary["tracked_total"] = sum(collection_summary.values())
 
     return {
         "items": items,
+        "in_progress_items": in_progress_items,
+        "recent_completed_items": recent_completed_items,
+        "recent_failed_items": recent_failed_items,
         "summary": summary,
+        "in_progress_summary": in_progress_summary,
+        "recent_completed_summary": recent_completed_summary,
+        "recent_failed_summary": recent_failed_summary,
+        "collection_summary": collection_summary,
         "total": len(items),
+        "in_progress_total": len(in_progress_items),
+        "recent_completed_total": len(recent_completed_items),
+        "recent_failed_total": len(recent_failed_items),
+        "cooldown_hours": COMPLETED_QUEUE_COOLDOWN_HOURS,
         "generated_at": current_time.isoformat(),
+    }
+
+
+def _queue_job_spec(item: dict[str, Any], organization_id: int | None) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "").upper()
+    opportunity = item.get("opportunity") or {}
+    opportunity_id = opportunity.get("id")
+    if item_type == "AWARDEE_ENRICHMENT_READY" and opportunity_id:
+        fingerprint = (item.get("meta") or {}).get("opportunity_fingerprint")
+        payload = {
+            "opportunity_id": int(opportunity_id),
+            "organization_id": organization_id,
+            "force": True,
+            "opportunity_fingerprint": fingerprint,
+        }
+        return {"kind": "awardee_enrichment", "payload": payload}
+    if item_type == "NSN_INTELLIGENCE_REFRESH":
+        nsn = _normalize_nsn((item.get("meta") or {}).get("nsn"))
+        if not nsn:
+            return None
+        fingerprint = (item.get("meta") or {}).get("opportunity_fingerprint")
+        payload = {
+            "nsn": nsn,
+            "run_usaspending": True,
+            "seed_providers": True,
+            "limit": 50,
+            "organization_id": organization_id,
+            "opportunity_fingerprint": fingerprint,
+        }
+        return {"kind": "nsn_build", "payload": payload}
+    return None
+
+
+def _job_signature(kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+    if kind == "awardee_enrichment":
+        return (kind, payload.get("organization_id"), payload.get("opportunity_id"))
+    if kind == "nsn_build":
+        return (kind, payload.get("organization_id"), _normalize_nsn(payload.get("nsn")))
+    return (kind, payload.get("organization_id"), tuple(sorted((payload or {}).items())))
+
+
+def _active_job_signatures(db: Session, organization_id: int | None) -> set[tuple[Any, ...]]:
+    query = db.query(SearchJob).filter(SearchJob.status.in_(("queued", "running")))
+    query = _scope_org(query, SearchJob, organization_id)
+    rows = query.all()
+    signatures: set[tuple[Any, ...]] = set()
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        signatures.add(_job_signature(row.kind, payload))
+    return signatures
+
+
+def queue_daily_work(db: Session, organization_id: int | None = None, user_id: int | None = None, limit: int = 200) -> dict[str, Any]:
+    queue = build_daily_work_queue(db, organization_id=organization_id, user_id=user_id, limit=limit)
+    items = list(queue.get("items") or [])
+    active_signatures = _active_job_signatures(db, organization_id)
+    queued_jobs: list[dict[str, Any]] = []
+    skipped_duplicates: list[dict[str, Any]] = []
+
+    for item in items:
+        if item.get("type") not in QUEUEABLE_TYPES:
+            continue
+        spec = _queue_job_spec(item, organization_id)
+        if not spec:
+            continue
+        signature = _job_signature(spec["kind"], spec["payload"])
+        if signature in active_signatures:
+            skipped_duplicates.append(
+                {
+                    "item_id": item.get("id"),
+                    "type": item.get("type"),
+                    "kind": spec["kind"],
+                    "target": spec["payload"].get("opportunity_id") or spec["payload"].get("nsn"),
+                }
+            )
+            continue
+        spec["payload"]["user_id"] = user_id
+        job = start_search_job(spec["kind"], spec["payload"])
+        active_signatures.add(signature)
+        queued_jobs.append(
+            {
+                "item_id": item.get("id"),
+                "type": item.get("type"),
+                "kind": spec["kind"],
+                "target": spec["payload"].get("opportunity_id") or spec["payload"].get("nsn"),
+                "job_id": job.get("id"),
+                "status": job.get("status"),
+            }
+        )
+
+    result = {
+        "status": "ok",
+        "organization_id": organization_id,
+        "generated_at": queue.get("generated_at"),
+        "scanned_items": len(items),
+        "queueable_items": sum(1 for item in items if item.get("type") in QUEUEABLE_TYPES),
+        "queued_count": len(queued_jobs),
+        "skipped_duplicate_count": len(skipped_duplicates),
+        "queued_jobs": queued_jobs,
+        "skipped_duplicates": skipped_duplicates,
+    }
+    batch_job = record_search_job(
+        "work_queue_batch",
+        {
+            "organization_id": organization_id,
+            "user_id": user_id,
+            "limit": limit,
+        },
+        result=result,
+        progress={"completed_steps": result["queued_count"], "total_steps": result["queueable_items"], "percent": 100},
+    )
+    result["batch_job_id"] = batch_job.get("id")
+    return result
+
+
+def list_daily_queue_runs(db: Session, organization_id: int | None = None, user_id: int | None = None, limit: int = 10) -> dict[str, Any]:
+    query = db.query(SearchJob).filter(SearchJob.kind == "work_queue_batch")
+    query = _scope_org(query, SearchJob, organization_id)
+    if user_id is not None:
+        query = query.filter(SearchJob.user_id == user_id)
+    rows = query.order_by(desc(SearchJob.created_at), desc(SearchJob.id)).limit(limit).all()
+    runs: list[dict[str, Any]] = []
+    for row in rows:
+        result = row.result if isinstance(row.result, dict) else {}
+        runs.append(
+            {
+                "id": row.id,
+                "user_id": row.user_id,
+                "status": row.status,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                "queued_count": int(result.get("queued_count") or 0),
+                "skipped_duplicate_count": int(result.get("skipped_duplicate_count") or 0),
+                "queueable_items": int(result.get("queueable_items") or 0),
+                "scanned_items": int(result.get("scanned_items") or 0),
+                "queued_jobs": list(result.get("queued_jobs") or []),
+            }
+        )
+    return {
+        "items": runs,
+        "total": len(runs),
+        "organization_id": organization_id,
+        "user_id": user_id,
     }

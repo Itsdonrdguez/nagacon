@@ -470,12 +470,13 @@ def _load_submission_context(db: Session, opp: Opportunity) -> tuple[BidSubmissi
 def _openai_json_enrich(
     *,
     db: Session,
+    user_id: int | None = None,
     system_prompt: str,
     user_context: dict[str, Any],
     fallback_output: dict[str, Any],
     model_name: str | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
-    api_key = get_effective_openai_api_key(db) or getattr(settings, "OPENAI_API_KEY", None)
+    api_key = get_effective_openai_api_key(db, user_id=user_id) or getattr(settings, "OPENAI_API_KEY", None)
     if not api_key:
         return fallback_output, "deterministic_fallback", _fallback_meta("missing_openai_key", "Add a valid OpenAI API key in Settings.")
 
@@ -490,7 +491,7 @@ def _openai_json_enrich(
         f"Context:\n{json.dumps(user_context, indent=2, default=_json_default)}\n\n"
         f"Fallback JSON shape:\n{json.dumps(fallback_output, indent=2, default=_json_default)}"
     )
-    model = model_name or get_effective_openai_model(db) or getattr(settings, "OPENAI_PROPOSAL_MODEL", "gpt-4o-mini")
+    model = model_name or get_effective_openai_model(db, user_id=user_id) or getattr(settings, "OPENAI_PROPOSAL_MODEL", "gpt-4o-mini")
 
     try:
         client = OpenAI(
@@ -527,7 +528,7 @@ def _openai_json_enrich(
         return fallback_output, "deterministic_fallback", _fallback_meta("openai_unknown_error", str(exc))
 
 
-def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
+def _run_opportunity_analyst(db: Session, opp: Opportunity, *, user_id: int | None = None) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp)
     profile = build_research_profile(opp, parsed)
     submission, planned_quote = _load_submission_context(db, opp)
@@ -595,6 +596,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
     }
     output, model_name, provider_meta = _openai_json_enrich(
         db=db,
+        user_id=user_id,
         system_prompt=(
             "You are an opportunity analyst for a government contracting workspace. "
             "Produce a concise, evidence-based analysis with clear risks, gaps, bid posture, and next actions."
@@ -634,7 +636,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
     return {"output": output, "artifact": _artifact_payload(artifact), "model_name": model_name, **provider_meta}
 
 
-def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
+def _run_compliance_document_agent(db: Session, opp: Opportunity, *, user_id: int | None = None) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp)
     files = (
         db.query(OpportunityFile)
@@ -730,6 +732,7 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, A
     }
     output, model_name, provider_meta = _openai_json_enrich(
         db=db,
+        user_id=user_id,
         system_prompt=(
             "You are a compliance and document review analyst for government solicitations. "
             "Use only the provided PDF-derived document text and document insights. "
@@ -791,7 +794,7 @@ def _run_vendor_research_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
     return {"output": output, "artifact": _artifact_payload(artifact)}
 
 
-def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
+def _run_email_outreach_agent(db: Session, opp: Opportunity, *, user_id: int | None = None) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp)
     submission, planned_quote = _load_submission_context(db, opp)
     leads = (
@@ -928,6 +931,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
     }
     output, model_name, provider_meta = _openai_json_enrich(
         db=db,
+        user_id=user_id,
         system_prompt=(
             "You are a vendor outreach specialist for government contracting. "
             "Create a practical outreach recommendation with a professional quote-request subject, body, target vendor suggestion, follow-up plan, and explicit requested quote items. "
@@ -1000,16 +1004,16 @@ def _run_proposal_workspace_agent(db: Session, opp: Opportunity) -> dict[str, An
     return {"output": execution_plan, "artifact": _artifact_payload(artifact)}
 
 
-def run_workspace_agent(agent_key: str, opp: Opportunity, db: Session) -> dict[str, Any]:
+def run_workspace_agent(agent_key: str, opp: Opportunity, db: Session, *, user_id: int | None = None) -> dict[str, Any]:
     key = _safe_text(agent_key).lower()
     if key == "opportunity_analyst":
-        return _run_opportunity_analyst(db, opp)
+        return _run_opportunity_analyst(db, opp, user_id=user_id)
     if key == "compliance_document":
-        return _run_compliance_document_agent(db, opp)
+        return _run_compliance_document_agent(db, opp, user_id=user_id)
     if key == "vendor_research":
         return _run_vendor_research_agent(db, opp)
     if key == "email_outreach":
-        return _run_email_outreach_agent(db, opp)
+        return _run_email_outreach_agent(db, opp, user_id=user_id)
     if key == "proposal_workspace":
         return _run_proposal_workspace_agent(db, opp)
     raise ValueError(f"Unsupported workspace agent: {agent_key}")

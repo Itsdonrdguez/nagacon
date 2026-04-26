@@ -44,6 +44,7 @@ const formatAwardDate = (value) => {
 
 const opportunitySignalLabel = (opp) => {
   if (opp?.requested_quantity_display) return opp.requested_quantity_display
+  if (opp?.opportunity_lifecycle === 'ARCHIVED') return 'Archive record'
   if (opp?.award_intelligence_status === 'ACTIVE_RFQ') return null
   const status = opp?.award_intelligence_status
   if (status === 'READY_FOR_USASPENDING_CHECK') return 'Award follow-up due'
@@ -167,6 +168,8 @@ export default function Opportunities() {
         { value: '7d', label: 'Closing Soon' },
         { value: '30d', label: 'Due in 30 Days' },
         { value: 'closed', label: 'Closed / Intelligence' },
+        { value: 'recently_closed', label: 'Recently Closed' },
+        { value: 'archived', label: 'Archived' },
         { value: 'award_followup', label: 'Award Follow-Up Due' },
         { value: 'all', label: 'All Records' },
       ]
@@ -409,17 +412,21 @@ export default function Opportunities() {
                   </TableCell>
                   <TableCell>
                     <div className="table-action-stack">
-                      <Link className="action-btn-small" to={`/workspace/${opp.id}`}>Open</Link>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        loading={createPipelineMutation.isPending}
-                        disabled={opp.bid_eligible === false}
-                        onClick={() => createPipelineMutation.mutate(opp.id)}
-                      >
-                        {opp.bid_eligible === false ? 'Research Only' : 'Create Workspace'}
-                      </Button>
-                      {opp.solicitation_status === 'CLOSED' ? (
+                      <Link className="action-btn-small" to={`/workspace/${opp.id}`}>
+                        {opp.opportunity_lifecycle === 'ARCHIVED' ? 'Open Archive' : 'Open'}
+                      </Link>
+                      {opp.opportunity_lifecycle !== 'ARCHIVED' ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={createPipelineMutation.isPending}
+                          disabled={opp.bid_eligible === false}
+                          onClick={() => createPipelineMutation.mutate(opp.id)}
+                        >
+                          {opp.bid_eligible === false ? 'Research Only' : 'Create Workspace'}
+                        </Button>
+                      ) : null}
+                      {opp.solicitation_status === 'CLOSED' && opp.opportunity_lifecycle !== 'ARCHIVED' ? (
                         <Button
                           size="sm"
                           variant={opp.award_follow_up_eligible ? 'primary' : 'secondary'}
@@ -429,8 +436,15 @@ export default function Opportunities() {
                           {opp.award_follow_up_eligible ? 'Run Award Follow-Up' : 'Refresh Award Leads'}
                         </Button>
                       ) : null}
+                      {opp.opportunity_lifecycle === 'ARCHIVED' && opp.url ? (
+                        <a className="btn btn-secondary btn-sm" href={opp.url} target="_blank" rel="noreferrer">
+                          Source Link
+                        </a>
+                      ) : null}
                     </div>
-                    {opp.bid_eligible === false ? (
+                    {opp.opportunity_lifecycle === 'ARCHIVED' ? (
+                      <div className="row-subtitle">Archive view keeps the source link, documents, and extracted intelligence without active queue actions.</div>
+                    ) : opp.bid_eligible === false ? (
                       <div className="row-subtitle">Use for pricing, sourcing, and future RFQs.</div>
                     ) : null}
                   </TableCell>

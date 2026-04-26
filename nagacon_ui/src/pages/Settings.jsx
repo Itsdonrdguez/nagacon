@@ -116,8 +116,11 @@ export default function Settings() {
         </Card>
       ) : null}
 
-      <Card title="Provider Settings">
+      <Card title="Personal Provider Settings">
         <div className="company-form">
+          <div className="panel-subtitle">
+            These credentials are intended to belong to the signed-in user, so each operator can use their own OpenAI, SAM, and outbound email configuration.
+          </div>
           <div className="settings-status-grid">
             <div className="settings-summary-box">
               <div className="row-title">SAM</div>
@@ -177,9 +180,9 @@ export default function Settings() {
               loading={saveProviderMutation.isPending}
               onClick={() => saveProviderMutation.mutate(providerForm)}
             >
-              Save Provider Settings
+              Save Personal Provider Settings
             </Button>
-            {saveProviderMutation.data ? <span className="form-success">Provider settings saved.</span> : null}
+            {saveProviderMutation.data ? <span className="form-success">Personal provider settings saved.</span> : null}
             {saveProviderMutation.error ? <span className="form-error">{saveProviderMutation.error.message || 'Failed to save provider settings.'}</span> : null}
           </div>
           <div className="panel-subtitle">

@@ -235,6 +235,7 @@ def run_company_profile_ingest(
     quick: bool = False,
     update_last_run: bool = True,
     progress_callback=None,
+    user_id: int | None = None,
 ) -> dict[str, Any]:
     plan = build_company_ingest_plan(profile)
     plan = _build_effective_plan(plan, quick=quick)
@@ -297,7 +298,7 @@ def run_company_profile_ingest(
     sam_raw: list[RawOpportunity] = []
     sam_results: list[dict[str, Any]] = []
     sam_errors: list[str] = []
-    sam_api_key = get_effective_sam_api_key(db)
+    sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
     for query in plan["sam"]["queries"]:
         try:
             effective_query = dict(query)

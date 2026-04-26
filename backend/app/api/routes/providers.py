@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.repositories.providers import ProviderRepository
 from app.models.opportunity import Opportunity
 from app.schemas.provider import (
@@ -119,10 +119,12 @@ def extract_from_dibbs_pdfs(
     limit: int | None = None,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     return extract_providers_from_dibbs_pdfs(
         db,
         organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
         enrich_with_sam=enrich_with_sam,
         limit=limit,
     )
@@ -144,10 +146,12 @@ def enrich_sam_websites(
     limit: int = 250,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     return enrich_provider_websites_from_sam(
         db,
         organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
         limit=limit,
     )
 
@@ -183,11 +187,13 @@ def start_provider_backfill_job(
     limit: int = 250,
     enrich_websites: bool = True,
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     return start_search_job(
         "provider_backfill",
         {
             "organization_id": getattr(current_org, "id", None),
+            "user_id": getattr(current_user, "id", None),
             "limit": max(min(limit, 1000), 1),
             "enrich_websites": enrich_websites,
         },
@@ -200,6 +206,7 @@ def extract_from_opportunity_pdfs(
     enrich_with_sam: bool = True,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     org_id = getattr(current_org, "id", None)
     query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
@@ -213,4 +220,5 @@ def extract_from_opportunity_pdfs(
         opp,
         enrich_with_sam=enrich_with_sam,
         organization_id=org_id,
+        user_id=getattr(current_user, "id", None),
     )

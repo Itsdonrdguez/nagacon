@@ -21,6 +21,7 @@ def run_provider_backfill(
     organization_id: int | None = None,
     limit: int = 250,
     enrich_websites: bool = True,
+    user_id: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     repo = ProviderRepository(db, organization_id=organization_id)
@@ -44,7 +45,7 @@ def run_provider_backfill(
 
     _emit(progress_callback, "providers", "Enriching provider websites and identities", 4, total_steps)
     website_result = (
-        enrich_provider_websites_from_sam(db, organization_id=organization_id, limit=limit)
+        enrich_provider_websites_from_sam(db, organization_id=organization_id, user_id=user_id, limit=limit)
         if enrich_websites
         else {"checked": 0, "updated": 0, "missing_api_key": False, "errors": []}
     )

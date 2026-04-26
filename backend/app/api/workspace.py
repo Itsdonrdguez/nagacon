@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.bid_submission import BidSubmission
 from app.models.opportunity import Opportunity
 from app.models.opportunity import OpportunityAnalysis
@@ -28,6 +28,7 @@ from app.services.vendor_email_automation import generate_quote_request_email
 from app.services.vendor_email_automation import send_email_message
 from app.services.vendors.discovery import discover_vendors_for_opportunity
 from app.services.workspace_service import build_normalized_facts, build_research_profile, create_artifact, ensure_parsed, generate_checklist, generate_quote_email, generate_research_brief, generate_submission_package, generate_vendor_shortlist, get_best_processed_document_data
+from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
 from app.utils.solicitation_status import derive_solicitation_status
 from app.utils.title_normalizer import build_summary_text
 
@@ -178,6 +179,13 @@ def _update_agent_run_safe(db: Session, repo: AgentRunRepository | None, run_id:
             _safe_session_call(db, "rollback")
 
 
+def _run_workspace_agent_for_user(agent_key: str, opp: Opportunity, db: Session, user_id: int | None):
+    try:
+        return run_workspace_agent(agent_key, opp, db, user_id=user_id)
+    except TypeError:
+        return run_workspace_agent(agent_key, opp, db)
+
+
 @router.get("/summary")
 def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     org_id = getattr(current_org, "id", None)
@@ -273,6 +281,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
         "raw_payload": getattr(opp, "raw_payload", None),
         "workspace_url": getattr(opp, "workspace_url", None),
         "solicitation_status": derive_solicitation_status(getattr(opp, "due_at", None)),
+        "opportunity_lifecycle": derive_opportunity_lifecycle(getattr(opp, "due_at", None)),
         "intake_pipeline": intake_pipeline,
     }
     is_closed = opportunity_payload["solicitation_status"] == "CLOSED"
@@ -537,7 +546,12 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
 
 
 @router.post("/agents/run")
-def run_workspace_agent_route(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def run_workspace_agent_route(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     opp_id = payload.get("opportunity_id")
     agent_key = payload.get("agent_key")
     opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
@@ -546,7 +560,7 @@ def run_workspace_agent_route(payload: dict, db: Session = Depends(get_db), curr
 
     repo, run = _create_agent_run_safe(db, opp.id, agent_key)
     try:
-        result = run_workspace_agent(agent_key, opp, db)
+        result = _run_workspace_agent_for_user(agent_key, opp, db, getattr(current_user, "id", None))
         _update_agent_run_safe(
             db,
             repo,
@@ -573,7 +587,12 @@ def run_workspace_agent_route(payload: dict, db: Session = Depends(get_db), curr
 
 
 @router.post("/agents/run-phase")
-def run_workspace_agent_phase(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def run_workspace_agent_phase(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     opp_id = payload.get("opportunity_id")
     phase = payload.get("phase")
     opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
@@ -584,7 +603,7 @@ def run_workspace_agent_phase(payload: dict, db: Session = Depends(get_db), curr
     for agent_key in PHASE_AGENT_MAP[phase]:
         repo, run = _create_agent_run_safe(db, opp.id, agent_key, extra_input={"phase": phase})
         try:
-            result = run_workspace_agent(agent_key, opp, db)
+            result = _run_workspace_agent_for_user(agent_key, opp, db, getattr(current_user, "id", None))
             _update_agent_run_safe(
                 db,
                 repo,
@@ -623,7 +642,12 @@ def run_workspace_agent_phase(payload: dict, db: Session = Depends(get_db), curr
 
 
 @router.post("/parse")
-def workspace_parse(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def workspace_parse(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     opp_id = payload.get("opportunity_id")
     opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
     enrichment = None
@@ -648,6 +672,7 @@ def workspace_parse(payload: dict, db: Session = Depends(get_db), current_org=De
             opp,
             parsed=parsed,
             organization_id=getattr(current_org, "id", None),
+            user_id=getattr(current_user, "id", None),
         )
     except Exception:
         lead_sync = None
@@ -696,7 +721,12 @@ def generate_checklist_route(payload: GenerateIn, db: Session = Depends(get_db),
 
 
 @router.post("/generate/vendors")
-def generate_vendors(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def generate_vendors(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     opp_id = payload.get("opportunity_id")
     opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
     parsed = ensure_parsed(db, opp)
@@ -715,6 +745,7 @@ def generate_vendors(payload: dict, db: Session = Depends(get_db), current_org=D
         opp,
         enrich_with_sam=True,
         organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
     )
     lead_sync = sync_vendor_leads_from_parsed(db, opp)
     provider_sync = seed_vendor_leads_from_providers(
@@ -722,6 +753,7 @@ def generate_vendors(payload: dict, db: Session = Depends(get_db), current_org=D
         opp,
         parsed=parsed,
         organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
     )
     discovery = discover_vendors_for_opportunity(opp.id, db)
     artifact = generate_vendor_shortlist(db, opp)

@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_user
 from app.core.db import get_db
 from app.schemas.opportunity import RawOpportunity
 from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
@@ -209,10 +210,11 @@ def _ingest_many(
 def run_sam_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
     try:
         payload = dict(payload or {})
-        api_key = get_effective_sam_api_key(db)
+        api_key = get_effective_sam_api_key(db, user_id=getattr(current_user, "id", None))
         if api_key:
             payload["api_key"] = api_key
         raw_opps = fetch_sam_opportunities(payload)
@@ -320,6 +322,8 @@ def run_all_state_local(
 def run_multi_source_search(
     payload: dict,
     db: Session,
+    *,
+    user_id: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
@@ -337,7 +341,7 @@ def run_multi_source_search(
         "organizationName": (payload.get("sam_agency") or payload.get("organizationName") or "").strip() or None,
         "organizationCode": (payload.get("sam_agency_code") or payload.get("organizationCode") or "").strip() or None,
     }
-    sam_api_key = get_effective_sam_api_key(db)
+    sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
 
     sources = payload.get("sources") or ["SAM", "DIBBS"]
     sources = [str(source).upper() for source in sources]
@@ -593,5 +597,6 @@ def run_multi_source_search(
 def run_multi_source_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
-    return run_multi_source_search(payload, db)
+    return run_multi_source_search(payload, db, user_id=getattr(current_user, "id", None))

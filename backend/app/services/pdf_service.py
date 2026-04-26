@@ -18,6 +18,7 @@ from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.services.document_pipeline import process_opportunity_documents
 from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
+from app.services.storage import ensure_dir, file_exists, storage_root, store_bytes, store_text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -35,16 +36,11 @@ def _safe_filename(s: str) -> str:
     return s or "file"
 
 
-def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def _already_downloaded(db: Session, opportunity_id: int, filename: str) -> bool:
+def _existing_file_record(db: Session, opportunity_id: int, filename: str) -> OpportunityFile | None:
     return db.query(OpportunityFile).filter(
         OpportunityFile.opportunity_id == opportunity_id,
         OpportunityFile.filename == filename,
-    ).first() is not None
+    ).first()
 
 
 def _compact_solicitation(s: str | None) -> str | None:
@@ -80,6 +76,46 @@ def _looks_like_solicitation_content(page, opp: Opportunity) -> bool:
 def _looks_like_bad_snapshot_page(page) -> bool:
     url = (page.url or "").lower()
     return "chrome-error://chromewebdata/" in url or "acqdownloads" in url
+
+
+def _looks_like_dibbs_maintenance_text(text: str | None) -> bool:
+    sample = str(text or "").lower()
+    if not sample:
+        return False
+    phrases = [
+        "under maintenance",
+        "scheduled maintenance",
+        "temporarily unavailable",
+        "temporarily down",
+        "system maintenance",
+        "service unavailable",
+        "unavailable due to maintenance",
+        "site maintenance",
+    ]
+    return any(phrase in sample for phrase in phrases)
+
+
+def _decode_preview(data: bytes | None, limit: int = 2000) -> str:
+    if not data:
+        return ""
+    try:
+        return data[:limit].decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _dibbs_unavailability_payload(*, message: str, detail: str | None = None, final_url: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "source": "DIBBS",
+        "reason": "maintenance",
+        "retryable": True,
+        "message": message,
+    }
+    if detail:
+        payload["detail"] = detail
+    if final_url:
+        payload["final_url"] = final_url
+    return payload
 
 
 def _click_dibbs_ok_if_present(page) -> None:
@@ -159,37 +195,44 @@ def _save_downloaded_file(
     file_type: str,
 ) -> tuple[int, str]:
     filename = _safe_filename(filename)
-    if _already_downloaded(db, opp.id, filename):
+    existing = _existing_file_record(db, opp.id, filename)
+    if existing is not None and file_exists(existing.file_path):
         return 0, filename
     fp = out_dir / filename
-    fp.write_bytes(data)
-    db.add(
-        OpportunityFile(
-            organization_id=getattr(opp, "organization_id", None),
-            opportunity_id=opp.id,
-            file_type=file_type,
-            filename=filename,
-            source_url=source_url,
-            file_path=str(fp.resolve()),
-            created_at=datetime.utcnow(),
+    stored_ref = store_bytes(fp, data, content_type="application/pdf" if filename.lower().endswith(".pdf") else None)
+    if existing is not None:
+        existing.file_type = file_type
+        existing.source_url = source_url
+        existing.file_path = stored_ref
+        db.add(existing)
+    else:
+        db.add(
+            OpportunityFile(
+                organization_id=getattr(opp, "organization_id", None),
+                opportunity_id=opp.id,
+                file_type=file_type,
+                filename=filename,
+                source_url=source_url,
+                file_path=stored_ref,
+                created_at=datetime.utcnow(),
+            )
         )
-    )
     db.commit()
     return 1, filename
 
 
 def _write_debug_log(out_dir: Path, opp: Opportunity, payload: dict) -> str:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(out_dir)
     sol_clean = _safe_filename(opp.solicitation_number or f"opportunity_{opp.id}")
     path = out_dir / f"{sol_clean}_official_pdf_debug.json"
-    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    return str(path.resolve())
+    return store_text(path, json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
 def _create_snapshot_pdf(db: Session, opp: Opportunity, page, out_dir: Path) -> tuple[int, int, str | None]:
     sol_clean = _safe_filename(opp.solicitation_number or f"opportunity_{opp.id}")
     fname = f"{sol_clean}_fallback_snapshot.pdf"
-    if _already_downloaded(db, opp.id, fname):
+    existing = _existing_file_record(db, opp.id, fname)
+    if existing is not None and file_exists(existing.file_path):
         return 0, 1, None
     try:
         _stabilize_dibbs_page(page, opp)
@@ -204,18 +247,24 @@ def _create_snapshot_pdf(db: Session, opp: Opportunity, page, out_dir: Path) -> 
             prefer_css_page_size=True,
             margin={"top": "0.45in", "bottom": "0.45in", "left": "0.45in", "right": "0.45in"},
         )
-        fp.write_bytes(pdf_bytes)
-        db.add(
-            OpportunityFile(
-                organization_id=getattr(opp, "organization_id", None),
-                opportunity_id=opp.id,
-                file_type="PDF_FALLBACK_SNAPSHOT",
-                filename=fname,
-                source_url=page.url,
-                file_path=str(fp.resolve()),
-                created_at=datetime.utcnow(),
+        stored_ref = store_bytes(fp, pdf_bytes, content_type="application/pdf")
+        if existing is not None:
+            existing.file_type = "PDF_FALLBACK_SNAPSHOT"
+            existing.source_url = page.url
+            existing.file_path = stored_ref
+            db.add(existing)
+        else:
+            db.add(
+                OpportunityFile(
+                    organization_id=getattr(opp, "organization_id", None),
+                    opportunity_id=opp.id,
+                    file_type="PDF_FALLBACK_SNAPSHOT",
+                    filename=fname,
+                    source_url=page.url,
+                    file_path=stored_ref,
+                    created_at=datetime.utcnow(),
+                )
             )
-        )
         db.commit()
         return 1, 0, None
     except Exception as exc:
@@ -241,12 +290,14 @@ def _download_binary_via_requests(
     }
     if referer:
         headers["Referer"] = referer
+    cookie_payload = _cookie_dict_from_playwright(cookies or [])
+    cookie_payload.setdefault("DIBBSDoDWarning", "AGREE")
     try:
         try:
             response = requests.get(
                 url,
                 headers=headers,
-                cookies=_cookie_dict_from_playwright(cookies or []),
+                cookies=cookie_payload,
                 timeout=timeout_s,
                 allow_redirects=True,
             )
@@ -254,12 +305,13 @@ def _download_binary_via_requests(
             response = requests.get(
                 url,
                 headers=headers,
-                cookies=_cookie_dict_from_playwright(cookies or []),
+                cookies=cookie_payload,
                 timeout=timeout_s,
                 allow_redirects=True,
                 verify=False,
             )
         body = response.content or b""
+        preview = _decode_preview(body)
         return {
             "ok": response.ok and bool(body),
             "bytes": body,
@@ -271,6 +323,7 @@ def _download_binary_via_requests(
                 "headers": dict(response.headers),
                 "body_len": len(body),
                 "is_pdf": _sniff_pdf_bytes(body),
+                "preview_text": preview,
             },
         }
     except Exception as exc:
@@ -310,6 +363,20 @@ def _extract_urlish_candidates(value: Any, default_label: str | None = None) -> 
 def _collect_dibbs_file_candidates(opp: Opportunity, page=None) -> list[dict[str, str]]:
     raw_payload = dict(getattr(opp, "raw_payload", None) or {})
     candidates: list[dict[str, str]] = []
+
+    search_row = raw_payload.get("dibbs_search_row")
+    if isinstance(search_row, dict) and search_row.get("pdf_url"):
+        pdf_url = str(search_row.get("pdf_url"))
+        candidates.append(
+            {
+                "url": pdf_url,
+                "label": str(
+                    search_row.get("solicitation_number")
+                    or search_row.get("nsn")
+                    or Path(pdf_url).name
+                ),
+            }
+        )
 
     detail = raw_payload.get("dibbs_detail")
     if isinstance(detail, dict):
@@ -355,8 +422,18 @@ def _collect_dibbs_file_candidates(opp: Opportunity, page=None) -> list[dict[str
     return _dedupe_candidates(candidates)
 
 
+def _should_create_fallback_snapshot(always_snapshot: bool, downloaded_files: list[dict[str, str]]) -> bool:
+    return bool(always_snapshot) and not downloaded_files
+
+
 def _preferred_dibbs_detail_pdf_url(opp: Opportunity) -> str | None:
     raw_payload = dict(getattr(opp, "raw_payload", None) or {})
+
+    search_row = raw_payload.get("dibbs_search_row") or {}
+    if isinstance(search_row, dict):
+        pdf_url = search_row.get("pdf_url")
+        if isinstance(pdf_url, str) and pdf_url.startswith("http"):
+            return pdf_url
 
     selected = raw_payload.get("dibbs_selected_solicitation") or {}
     if isinstance(selected, dict):
@@ -491,9 +568,7 @@ def download_pdfs_for_opportunity(
     sol = opp.solicitation_number or f"opportunity_{opp.id}"
     sol_compact = _compact_solicitation(opp.solicitation_number) or ""
     folder = _safe_dirname(sol)
-    if base_dir is None:
-        base_dir = str(Path.cwd() / "exports")
-    out_dir = _ensure_dir(Path(base_dir) / folder / "documents")
+    out_dir = ensure_dir(storage_root(base_dir) / folder / "documents")
 
     created = 0
     skipped = 0
@@ -501,6 +576,7 @@ def download_pdfs_for_opportunity(
     official_pdf_saved = False
     official_pdf_filename = None
     official_pdf_error = None
+    source_unavailable = None
     debug_log_path = None
     downloaded_files: list[dict[str, str]] = []
     detail_url = None
@@ -584,11 +660,19 @@ def download_pdfs_for_opportunity(
             }
 
             for candidate in dibbs_candidates:
-                result = _download_binary_via_requests(candidate["url"], referer=page.url, cookies=cookies)
+                result = _download_binary_via_requests(candidate["url"], referer=opp.url, cookies=cookies)
                 if not result.get("ok"):
                     errors.append(f"{candidate['url']} -> {result.get('reason', 'download_failed')}")
                     continue
                 if not _sniff_pdf_bytes(result["bytes"]):
+                    preview_text = (((result.get("details") or {}).get("preview_text")) or "")
+                    if _looks_like_dibbs_maintenance_text(preview_text):
+                        source_unavailable = _dibbs_unavailability_payload(
+                            message="DIBBS is temporarily unavailable due to maintenance. We saved the fallback snapshot and you can retry the official PDF later.",
+                            detail="official_pdf_returned_maintenance_page",
+                            final_url=result.get("final_url") or candidate["url"],
+                        )
+                        official_pdf_error = "dibbs_maintenance"
                     errors.append(f"{candidate['url']} -> not_a_pdf")
                     continue
 
@@ -626,18 +710,32 @@ def download_pdfs_for_opportunity(
                 )
 
             if not downloaded_files:
-                official_pdf_error = "no_dibbs_pdfs_downloaded"
+                official_pdf_error = official_pdf_error or "no_dibbs_pdfs_downloaded"
 
             try:
                 debug_log_path = _write_debug_log(out_dir, opp, debug_payload)
             except Exception as exc:
                 errors.append(f"debug_log_write_failed -> {exc}")
 
-            if always_snapshot:
+            if _should_create_fallback_snapshot(always_snapshot, downloaded_files):
                 c, s, e = _create_snapshot_pdf(db, opp, page, out_dir)
                 created += c
                 skipped += s
                 snapshot = {"created": c, "skipped": s, "error": e, "url": page.url}
+                if source_unavailable is None and _looks_like_dibbs_maintenance_text(_page_text(page)):
+                    source_unavailable = _dibbs_unavailability_payload(
+                        message="DIBBS is temporarily unavailable due to maintenance. We kept the workspace snapshot and existing extracted data.",
+                        detail="snapshot_page_detected_maintenance",
+                        final_url=page.url,
+                    )
+                    official_pdf_error = "dibbs_maintenance"
+            elif always_snapshot:
+                snapshot = {
+                    "created": 0,
+                    "skipped": 1,
+                    "error": "official_pdf_already_downloaded",
+                    "url": page.url,
+                }
 
             context.close()
             browser.close()
@@ -651,6 +749,7 @@ def download_pdfs_for_opportunity(
         "official_pdf_saved": official_pdf_saved,
         "official_pdf_filename": official_pdf_filename,
         "official_pdf_error": official_pdf_error,
+        "source_unavailable": source_unavailable,
         "debug_log_path": debug_log_path,
         "snapshot": snapshot if always_snapshot else None,
         "downloaded_files": downloaded_files,

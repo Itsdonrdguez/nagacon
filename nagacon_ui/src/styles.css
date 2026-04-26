@@ -2,6 +2,30 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: linear-gradient(180deg, #f7f9fc 0%, #eef4fb 100%); color: #0f172a; }
 a { color: inherit; text-decoration: none; }
+.auth-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.auth-card {
+  width: min(100%, 480px);
+  border-radius: 16px;
+}
+.auth-brand {
+  font-size: 30px;
+  font-weight: 800;
+  color: #0f172a;
+}
+.auth-title {
+  margin-bottom: 0;
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
 .app-shell { display: flex; min-height: 100vh; }
 .sidebar { width: 260px; background: linear-gradient(180deg, #07152f, #0b254f); color: white; padding: 24px 16px; }
 .brand-title { font-size: 32px; font-weight: 800; }

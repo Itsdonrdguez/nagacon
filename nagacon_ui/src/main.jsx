@@ -8,6 +8,7 @@ import LoadingState from './components/ui/LoadingState/LoadingState'
 import './styles.css'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
+const Login = lazy(() => import('./pages/Login'))
 const WorkQueue = lazy(() => import('./pages/WorkQueue'))
 const Opportunities = lazy(() => import('./pages/Opportunities'))
 const Workspace = lazy(() => import('./pages/Workspace'))
@@ -46,6 +47,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
           <BrowserRouter>
             <Suspense fallback={<PageFallback />}>
               <Routes>
+                <Route path="/login" element={<Login />} />
                 <Route path="/" element={<App />}>
                   <Route index element={<Dashboard />} />
                   <Route path="work-queue" element={<WorkQueue />} />

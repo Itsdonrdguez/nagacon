@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.catalog_service import get_nsn_catalog_summary
 from app.services.nsn_catalog.publog_decomp import import_publog_nsn
@@ -48,9 +48,11 @@ def sync_publog(
 def sync_publog_job(
     payload: dict | None = Body(default=None),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     payload = dict(payload or {})
     payload.setdefault("organization_id", getattr(current_org, "id", None))
+    payload.setdefault("user_id", getattr(current_user, "id", None))
     payload["kind"] = "publog_sync"
     payload["target_limit"] = max(min(int(payload.get("target_limit") or 250), 1000), 1)
     return start_search_job("publog_sync", payload)
@@ -150,6 +152,7 @@ def build_nsn_job(
     seed_providers: bool = True,
     limit: int = 50,
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     return start_search_job(
         "nsn_build",
@@ -159,5 +162,6 @@ def build_nsn_job(
             "seed_providers": seed_providers,
             "limit": max(min(limit, 100), 1),
             "organization_id": getattr(current_org, "id", None),
+            "user_id": getattr(current_user, "id", None),
         },
     )

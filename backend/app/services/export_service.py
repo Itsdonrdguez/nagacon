@@ -14,6 +14,7 @@ from app.models.opportunity import Opportunity
 from app.models.workspace import WorkspaceArtifact
 from app.models.vendor import VendorQuote
 from app.models.opportunity_file import OpportunityFile
+from app.services.storage import local_temp_path
 
 
 def _safe_filename(s: str) -> str:
@@ -135,9 +136,12 @@ def build_bid_package_zip(db: Session, opportunity_id: int) -> tuple[str, bytes]
         # Attach PDFs if downloaded
         for f in files:
             try:
-                p = Path(f.file_path)
-                if p.exists() and p.is_file():
-                    write(f"pdfs/{f.filename}", p.read_bytes())
+                if not f.file_path:
+                    continue
+                suffix = Path(f.filename or f.file_path).suffix
+                with local_temp_path(f.file_path, suffix=suffix) as p:
+                    if p.exists() and p.is_file():
+                        write(f"pdfs/{f.filename}", p.read_bytes())
             except Exception:
                 continue
 

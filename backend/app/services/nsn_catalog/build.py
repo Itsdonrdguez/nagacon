@@ -18,6 +18,7 @@ def build_nsn_intelligence(
     run_usaspending: bool = True,
     limit: int = 50,
     organization_id: int | None = None,
+    user_id: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     target = normalize_nsn(nsn)
@@ -42,6 +43,7 @@ def build_nsn_intelligence(
         seed_providers=seed_providers,
         limit=limit,
         organization_id=organization_id,
+        user_id=user_id,
     )
     _emit(progress_callback, "providers", "Seeding organization provider candidates", 3, 4)
     summary = get_nsn_catalog_summary(db, target.nsn)

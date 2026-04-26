@@ -110,6 +110,7 @@ def run_opportunity_intake_pipeline(
     organization_id: int | None = None,
     download_documents: bool = True,
     run_usaspending: bool = True,
+    user_id: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
@@ -173,18 +174,22 @@ def run_opportunity_intake_pipeline(
             opp,
             enrich_with_sam=True,
             organization_id=organization_id,
+            user_id=user_id,
         ).model_dump(),
     )
 
     run_and_progress("sync_parsed_vendor_leads", lambda: sync_vendor_leads_from_parsed(db, opp))
     run_and_progress(
         "sync_provider_vendor_leads",
-        lambda: seed_vendor_leads_from_providers(db, opp, parsed=parsed, organization_id=organization_id),
+        lambda: seed_vendor_leads_from_providers(db, opp, parsed=parsed, organization_id=organization_id, user_id=user_id),
     )
     run_and_progress("extract_price_history", lambda: extract_price_history_for_opportunity(db, opp))
 
     if run_usaspending:
-        run_and_progress("nsn_intelligence", lambda: run_nsn_intelligence(db, opp, seed_awardees=True, create_summary_artifact=True))
+        run_and_progress(
+            "nsn_intelligence",
+            lambda: run_nsn_intelligence(db, opp, seed_awardees=True, create_summary_artifact=True, user_id=user_id),
+        )
 
     run_and_progress("generate_checklist", lambda: {"artifact_id": generate_checklist(db, opp).id})
     run_and_progress("generate_vendor_shortlist", lambda: {"artifact_id": generate_vendor_shortlist(db, opp).id})

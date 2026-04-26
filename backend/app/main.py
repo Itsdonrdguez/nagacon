@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+from app.core.config import settings
 
 from app.api.dibbs import router as dibbs_router
 from app.api.bid_submissions import router as submissions_router
@@ -52,6 +53,19 @@ LOCAL_CORS_ORIGINS = [
     "http://127.0.0.1:5174",
     "http://localhost:5174",
 ]
+
+
+def _cors_origins() -> list[str]:
+    configured: list[str] = []
+    for raw in [getattr(settings, "FRONTEND_ORIGIN", ""), getattr(settings, "CORS_ORIGINS", "")]:
+        for item in str(raw or "").split(","):
+            value = item.strip()
+            if value and value not in configured:
+                configured.append(value)
+    app_env = str(getattr(settings, "APP_ENV", "dev")).lower()
+    if app_env in {"prod", "production"}:
+        return configured or LOCAL_CORS_ORIGINS
+    return LOCAL_CORS_ORIGINS + [item for item in configured if item not in LOCAL_CORS_ORIGINS]
 
 CORE_ROUTERS = [
     health_router,
@@ -123,7 +137,7 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=LOCAL_CORS_ORIGINS,
+        allow_origins=_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

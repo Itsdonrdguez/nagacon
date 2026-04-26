@@ -1,9 +1,9 @@
 from types import SimpleNamespace
 
-from fastapi import Depends, Header
+from fastapi import Cookie, Depends, Header
 
 from app.core.db import SessionLocal
-from app.services.auth_service import get_or_create_user_by_email
+from app.services.auth_service import SESSION_COOKIE_NAME, get_or_create_user_by_email, get_user_by_session_token
 from app.services.org_service import ensure_default_organization
 
 def get_db():
@@ -17,7 +17,11 @@ def get_db():
 def get_current_user(
     db=Depends(get_db),
     x_user_email: str | None = Header(default=None, alias="X-User-Email"),
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ):
+    session_user = get_user_by_session_token(db, session_token)
+    if session_user:
+        return session_user
     user = get_or_create_user_by_email(db, x_user_email)
     if user:
         return user

@@ -48,6 +48,7 @@ def enrich_awardees_for_opportunity(
     *,
     organization_id: int | None = None,
     force: bool = False,
+    user_id: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
@@ -71,6 +72,7 @@ def enrich_awardees_for_opportunity(
             run_usaspending=bool(force or followup["follow_up_eligible"]),
             seed_providers=True,
             organization_id=getattr(opp, "organization_id", None),
+            user_id=user_id,
             limit=50,
             progress_callback=lambda event: _emit_nested(progress_callback, event, 2, 5),
         )
@@ -78,7 +80,7 @@ def enrich_awardees_for_opportunity(
 
     intelligence = None
     if force or followup["follow_up_eligible"]:
-        intelligence = run_nsn_intelligence(db, opp, seed_awardees=True, create_summary_artifact=True)
+        intelligence = run_nsn_intelligence(db, opp, seed_awardees=True, create_summary_artifact=True, user_id=user_id)
     _emit(progress_callback, "award_check", "Checked official award evidence when eligible", 3, 5)
 
     promoted = _promote_award_history_to_providers(db, opp)

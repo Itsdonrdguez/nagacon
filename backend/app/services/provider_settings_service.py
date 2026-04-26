@@ -12,14 +12,14 @@ def _org_id(db):
     return getattr(org, "id", None)
 
 
-def get_provider_settings(db) -> dict:
+def get_provider_settings(db, *, user_id: int | None = None) -> dict:
     org_id = _org_id(db)
-    sam_api_key = get_setting(db, "sam_api_key", default="", organization_id=org_id) or ""
-    openai_api_key = get_setting(db, "openai_api_key", default="", organization_id=org_id) or ""
-    openai_model = get_setting(db, "openai_model", default="gpt-4o-mini", organization_id=org_id) or "gpt-4o-mini"
-    smtp_host = get_setting(db, "smtp_host", default="", organization_id=org_id) or ""
-    smtp_port = get_setting(db, "smtp_port", default="", organization_id=org_id) or ""
-    smtp_from_email = get_setting(db, "smtp_from_email", default="", organization_id=org_id) or ""
+    sam_api_key = get_setting(db, "sam_api_key", default="", organization_id=org_id, user_id=user_id) or ""
+    openai_api_key = get_setting(db, "openai_api_key", default="", organization_id=org_id, user_id=user_id) or ""
+    openai_model = get_setting(db, "openai_model", default="gpt-4o-mini", organization_id=org_id, user_id=user_id) or "gpt-4o-mini"
+    smtp_host = get_setting(db, "smtp_host", default="", organization_id=org_id, user_id=user_id) or ""
+    smtp_port = get_setting(db, "smtp_port", default="", organization_id=org_id, user_id=user_id) or ""
+    smtp_from_email = get_setting(db, "smtp_from_email", default="", organization_id=org_id, user_id=user_id) or ""
 
     return {
         "organization": {
@@ -27,6 +27,8 @@ def get_provider_settings(db) -> dict:
             "name": getattr(ensure_default_organization(db), "name", None),
             "slug": getattr(ensure_default_organization(db), "slug", None),
         } if ensure_default_organization(db) else None,
+        "scope": "user" if user_id is not None else "organization",
+        "user_id": user_id,
         "sam_api_key": "",
         "openai_api_key": "",
         "openai_model": openai_model,
@@ -41,31 +43,55 @@ def get_provider_settings(db) -> dict:
     }
 
 
-def get_effective_sam_api_key(db) -> str | None:
+def get_effective_sam_api_key(db, *, user_id: int | None = None) -> str | None:
     org_id = _org_id(db)
+    if user_id is not None:
+        user_value = get_setting(db, "sam_api_key", default=None, organization_id=org_id, user_id=user_id)
+        if user_value:
+            return user_value
     return get_setting(db, "sam_api_key", default=getattr(settings, "SAM_API_KEY", None), organization_id=org_id)
 
 
-def get_effective_openai_api_key(db) -> str | None:
+def get_effective_openai_api_key(db, *, user_id: int | None = None) -> str | None:
     org_id = _org_id(db)
+    if user_id is not None:
+        user_value = get_setting(db, "openai_api_key", default=None, organization_id=org_id, user_id=user_id)
+        if user_value:
+            return user_value
     return get_setting(db, "openai_api_key", default=getattr(settings, "OPENAI_API_KEY", None), organization_id=org_id)
 
 
-def get_effective_openai_model(db) -> str:
+def get_effective_openai_model(db, *, user_id: int | None = None) -> str:
     org_id = _org_id(db)
+    if user_id is not None:
+        user_value = get_setting(db, "openai_model", default=None, organization_id=org_id, user_id=user_id)
+        if user_value:
+            return user_value
     return get_setting(db, "openai_model", default=getattr(settings, "OPENAI_PROPOSAL_MODEL", "gpt-4o-mini"), organization_id=org_id) or "gpt-4o-mini"
 
 
-def get_effective_smtp_host(db) -> str | None:
+def get_effective_smtp_host(db, *, user_id: int | None = None) -> str | None:
     org_id = _org_id(db)
+    if user_id is not None:
+        user_value = get_setting(db, "smtp_host", default=None, organization_id=org_id, user_id=user_id)
+        if user_value:
+            return user_value
     return get_setting(db, "smtp_host", default=getattr(settings, "SMTP_HOST", None), organization_id=org_id)
 
 
-def get_effective_smtp_port(db) -> str | None:
+def get_effective_smtp_port(db, *, user_id: int | None = None) -> str | None:
     org_id = _org_id(db)
+    if user_id is not None:
+        user_value = get_setting(db, "smtp_port", default=None, organization_id=org_id, user_id=user_id)
+        if user_value:
+            return user_value
     return get_setting(db, "smtp_port", default=str(getattr(settings, "SMTP_PORT", "")), organization_id=org_id)
 
 
-def get_effective_smtp_from_email(db) -> str | None:
+def get_effective_smtp_from_email(db, *, user_id: int | None = None) -> str | None:
     org_id = _org_id(db)
+    if user_id is not None:
+        user_value = get_setting(db, "smtp_from_email", default=None, organization_id=org_id, user_id=user_id)
+        if user_value:
+            return user_value
     return get_setting(db, "smtp_from_email", default=getattr(settings, "SMTP_FROM_EMAIL", None), organization_id=org_id)

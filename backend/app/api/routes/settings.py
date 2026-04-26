@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_user, get_db
 from app.services.app_settings_service import get_setting, upsert_setting
 from app.services.org_service import ensure_default_organization
 from app.services.provider_settings_service import get_provider_settings
@@ -69,20 +69,21 @@ def update_integration_settings(payload: dict, db: Session = Depends(get_db)):
 
 
 @router.get("/providers")
-def get_provider_settings_route(db: Session = Depends(get_db)):
-    return get_provider_settings(db)
+def get_provider_settings_route(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    return get_provider_settings(db, user_id=getattr(current_user, "id", None))
 
 
 @router.put("/providers")
-def update_provider_settings(payload: dict, db: Session = Depends(get_db)):
+def update_provider_settings(payload: dict, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     org = ensure_default_organization(db)
     org_id = getattr(org, "id", None)
+    user_id = getattr(current_user, "id", None)
 
     def save(key: str, value: str | None, *, preserve_blank: bool = False, clear_key: str | None = None):
         incoming = (value or "").strip()
         if preserve_blank and not incoming and not payload.get(clear_key or ""):
             return
-        upsert_setting(db, key, "" if payload.get(clear_key or "") else incoming, organization_id=org_id)
+        upsert_setting(db, key, "" if payload.get(clear_key or "") else incoming, organization_id=org_id, user_id=user_id)
 
     save("sam_api_key", payload.get("sam_api_key"), preserve_blank=True, clear_key="clear_sam_api_key")
     save("openai_api_key", payload.get("openai_api_key"), preserve_blank=True, clear_key="clear_openai_api_key")
@@ -91,6 +92,6 @@ def update_provider_settings(payload: dict, db: Session = Depends(get_db)):
     save("smtp_port", payload.get("smtp_port"))
     save("smtp_from_email", payload.get("smtp_from_email"))
 
-    result = get_provider_settings(db)
+    result = get_provider_settings(db, user_id=user_id)
     result["status"] = "saved"
     return result

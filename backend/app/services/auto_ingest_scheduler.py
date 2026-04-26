@@ -3,15 +3,14 @@ from __future__ import annotations
 import threading
 import time
 
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.repositories.company import CompanyRepository
 from app.services.company_profile_ingest import company_profile_due_for_auto_ingest, run_company_profile_ingest
 
 
-AUTO_INGEST_POLL_SECONDS = 900
-
-
 def _auto_ingest_loop(stop_event: threading.Event) -> None:
+    poll_seconds = max(60, int(getattr(settings, "AUTO_INGEST_POLL_SECONDS", 900) or 900))
     while not stop_event.is_set():
         db = SessionLocal()
         try:
@@ -22,10 +21,14 @@ def _auto_ingest_loop(stop_event: threading.Event) -> None:
             db.rollback()
         finally:
             db.close()
-        stop_event.wait(AUTO_INGEST_POLL_SECONDS)
+        stop_event.wait(poll_seconds)
 
 
 def start_auto_ingest_worker(app) -> None:
+    if not bool(getattr(settings, "AUTO_INGEST_ENABLED", True)):
+        return
+    if str(getattr(settings, "APP_ROLE", "web") or "web").lower() != "web":
+        return
     if getattr(app.state, "auto_ingest_thread", None):
         return
     stop_event = threading.Event()

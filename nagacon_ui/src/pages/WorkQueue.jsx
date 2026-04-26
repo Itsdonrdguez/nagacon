@@ -43,9 +43,12 @@ const formatDate = (value) => {
 
 const compactMeta = (parts) => parts.filter(Boolean).join(' | ')
 
+const queueStatusLabel = (value) => String(value || '').toUpperCase() || 'QUEUED'
+
 export default function WorkQueue() {
   const [filter, setFilter] = useState('all')
   const [backgroundJobId, setBackgroundJobId] = useState(null)
+  const [queueTodayResult, setQueueTodayResult] = useState(null)
   const queryClient = useQueryClient()
   const workQueueQuery = useQuery({
     queryKey: ['work-queue-today'],
@@ -58,7 +61,11 @@ export default function WorkQueue() {
 
   const data = workQueueQuery.data || {}
   const items = data.items || []
+  const inProgressItems = data.in_progress_items || []
+  const recentCompletedItems = data.recent_completed_items || []
+  const recentFailedItems = data.recent_failed_items || []
   const summary = data.summary || {}
+  const inProgressSummary = data.in_progress_summary || {}
   const backgroundJobQuery = useQuery({
     queryKey: ['work-queue-background-job', backgroundJobId],
     enabled: Boolean(backgroundJobId),
@@ -122,6 +129,22 @@ export default function WorkQueue() {
     },
     onSuccess: (job) => {
       setBackgroundJobId(job.id)
+    },
+  })
+  const queueTodayMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/work-queue/queue-today', null, {
+        params: { limit: 200 },
+      })
+      return res.data
+    },
+    onSuccess: (result) => {
+      setQueueTodayResult(result)
+      refreshQueue()
+      const firstJobId = result?.queued_jobs?.[0]?.job_id
+      if (firstJobId) {
+        setBackgroundJobId(firstJobId)
+      }
     },
   })
   const visibleItems = items.filter((item) => {
@@ -196,35 +219,15 @@ export default function WorkQueue() {
           <h1 className="page-title">Today</h1>
           <div className="page-subtitle">The highest-value actions across quotes, RFQs, vendor research, Part Finder, submissions, and closed solicitations.</div>
         </div>
+        <Button onClick={() => queueTodayMutation.mutate()} loading={queueTodayMutation.isPending}>
+          Queue Today's Work
+        </Button>
         <Button variant="secondary" onClick={() => workQueueQuery.refetch()}>
           Refresh
         </Button>
         <a className="btn btn-secondary btn-sm" href={`${api.defaults.baseURL}/api/export/work_queue.csv`}>
           Export CSV
         </a>
-      </div>
-
-      <div className="stats-grid">
-        <Card className="work-queue-stat">
-          <div className="stat-label">Total Actions</div>
-          <div className="stat-value">{data.total || 0}</div>
-          <div className="stat-subtitle">Generated {formatDate(data.generated_at)}</div>
-        </Card>
-        <Card className="work-queue-stat">
-          <div className="stat-label">High Priority</div>
-          <div className="stat-value">{summary.HIGH || 0}</div>
-          <div className="stat-subtitle">Follow these first</div>
-        </Card>
-        <Card className="work-queue-stat">
-          <div className="stat-label">Quote Follow-ups</div>
-          <div className="stat-value">{summary.QUOTE_FOLLOW_UP_DUE || 0}</div>
-          <div className="stat-subtitle">Vendor action needed</div>
-        </Card>
-        <Card className="work-queue-stat">
-          <div className="stat-label">Closing Soon</div>
-          <div className="stat-value">{summary.RFQ_CLOSING_SOON || 0}</div>
-          <div className="stat-subtitle">Deadline pressure</div>
-        </Card>
       </div>
 
       <Card title="Action Filters">
@@ -243,23 +246,129 @@ export default function WorkQueue() {
       </Card>
 
       <Card title="Work Items">
-        {backgroundJobQuery.data ? (
+        {queueTodayResult ? (
           <div className="settings-summary-box">
-            <div className="row-title">Background collection job</div>
+            <div className="row-title">Today's collection work queued</div>
             <div className="row-subtitle">
-              {backgroundJobQuery.data.kind} | {backgroundJobQuery.data.status}
-              {backgroundJobQuery.data.progress?.current_label ? ` | ${backgroundJobQuery.data.progress.current_label}` : ''}
-              {backgroundJobQuery.data.progress?.percent !== undefined ? ` | ${backgroundJobQuery.data.progress.percent}%` : ''}
+              Queued {queueTodayResult.queued_count || 0} job{(queueTodayResult.queued_count || 0) === 1 ? '' : 's'}
+              {` | `}
+              Skipped {queueTodayResult.skipped_duplicate_count || 0} duplicate{(queueTodayResult.skipped_duplicate_count || 0) === 1 ? '' : 's'}
+              {` | `}
+              From {queueTodayResult.queueable_items || 0} queueable item{(queueTodayResult.queueable_items || 0) === 1 ? '' : 's'}
             </div>
           </div>
         ) : null}
-        {visibleItems.length === 0 ? (
+        {visibleItems.length === 0 && inProgressItems.length === 0 && recentCompletedItems.length === 0 && recentFailedItems.length === 0 ? (
           <EmptyState
             title="No work items match this filter"
             subtitle="Try another filter or refresh the queue."
           />
         ) : (
           <div className="work-queue-list">
+            {inProgressItems.map((item) => {
+              const queueState = item.queue_state || {}
+              const status = queueStatusLabel(queueState.status)
+              const percent = queueState.progress?.percent
+              const isRunning = status === 'RUNNING'
+              return (
+                <div key={`progress-${item.id}`} className="work-queue-item work-queue-low">
+                  <div className="work-queue-item-main">
+                    <div className="work-queue-item-header">
+                      <Badge label={status} variant={isRunning ? 'warning' : 'info'} />
+                      <Badge label={TYPE_LABELS[item.type] || item.type} variant="info" />
+                      {isRunning && percent !== undefined ? <span className="row-subtitle">{percent}%</span> : null}
+                    </div>
+                    <div className="row-title">{item.title}</div>
+                    <div className="panel-subtitle">
+                      {item.subtitle}
+                      {isRunning && queueState.progress?.current_label ? ` | ${queueState.progress.current_label}` : ''}
+                      {!isRunning && queueState.created_at ? ` | queued ${formatDate(queueState.created_at)}` : ''}
+                    </div>
+                    <div className="row-subtitle">
+                      {compactMeta([
+                        item.opportunity?.source,
+                        item.opportunity?.solicitation_number,
+                        item.opportunity?.agency,
+                      ])}
+                    </div>
+                  </div>
+                  <div className="work-queue-actions">
+                    <Link className="btn btn-secondary btn-sm" to={item.action_url}>
+                      {item.action_label || 'Open Workspace'}
+                    </Link>
+                  </div>
+                </div>
+              )
+            })}
+            {recentCompletedItems.map((item) => {
+              const queueState = item.queue_state || {}
+              return (
+                <div key={`completed-${item.id}`} className="work-queue-item work-queue-low">
+                  <div className="work-queue-item-main">
+                    <div className="work-queue-item-header">
+                      <Badge label="COMPLETED" variant="success" />
+                      <Badge label={TYPE_LABELS[item.type] || item.type} variant="info" />
+                      {queueState.completed_at ? <span className="row-subtitle">{formatDate(queueState.completed_at)}</span> : null}
+                    </div>
+                    <div className="row-title">{item.title}</div>
+                    <div className="panel-subtitle">
+                      {item.subtitle}
+                      {' | recently completed; will return if the opportunity changes'}
+                    </div>
+                    <div className="row-subtitle">
+                      {compactMeta([
+                        item.opportunity?.source,
+                        item.opportunity?.solicitation_number,
+                        item.opportunity?.agency,
+                      ])}
+                    </div>
+                  </div>
+                  <div className="work-queue-actions">
+                    <Link className="btn btn-secondary btn-sm" to={item.action_url}>
+                      {item.action_label || 'Open Workspace'}
+                    </Link>
+                  </div>
+                </div>
+              )
+            })}
+            {recentFailedItems.map((item) => {
+              const queueState = item.queue_state || {}
+              return (
+                <div key={`failed-${item.id}`} className="work-queue-item work-queue-high">
+                  <div className="work-queue-item-main">
+                    <div className="work-queue-item-header">
+                      <Badge label="FAILED" variant="error" />
+                      <Badge label={TYPE_LABELS[item.type] || item.type} variant="info" />
+                      {queueState.completed_at ? <span className="row-subtitle">{formatDate(queueState.completed_at)}</span> : null}
+                    </div>
+                    <div className="row-title">{item.title}</div>
+                    <div className="panel-subtitle">
+                      {item.subtitle}
+                      {queueState.error ? ` | ${queueState.error}` : ' | collection job failed; retry when ready'}
+                    </div>
+                    <div className="row-subtitle">
+                      {compactMeta([
+                        item.opportunity?.source,
+                        item.opportunity?.solicitation_number,
+                        item.opportunity?.agency,
+                      ])}
+                    </div>
+                  </div>
+                  <div className="work-queue-actions">
+                    <Button
+                      size="sm"
+                      loading={queueBackgroundMutation.isPending}
+                      onClick={() => runItemAction(item)}
+                    >
+                      {directActionLabel(item) || 'Retry'}
+                    </Button>
+                    <Link className="btn btn-secondary btn-sm" to={item.action_url}>
+                      {item.action_label || 'Open Workspace'}
+                    </Link>
+                  </div>
+                </div>
+              )
+            })}
             {visibleItems.map((item) => (
               <div key={item.id} className={`work-queue-item work-queue-${String(item.priority || '').toLowerCase()}`}>
                 <div className="work-queue-item-main">

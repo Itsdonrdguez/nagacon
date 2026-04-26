@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from app.api.scrapers import run_multi_source_search
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models.search_job import SearchJob
 from app.repositories.company import CompanyRepository
@@ -19,6 +22,30 @@ from app.services.providers.provider_backfill import run_provider_backfill
 
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
+_executor: ThreadPoolExecutor | None = None
+
+
+def _runner_mode() -> str:
+    return str(getattr(settings, "SEARCH_JOB_RUNNER", "thread") or "thread").strip().lower()
+
+
+def uses_external_worker() -> bool:
+    return _runner_mode() in {"worker", "external_worker", "db_worker"}
+
+
+def _max_concurrency() -> int:
+    try:
+        return max(1, int(getattr(settings, "SEARCH_JOB_MAX_CONCURRENCY", 4) or 4))
+    except Exception:
+        return 4
+
+
+def _thread_executor() -> ThreadPoolExecutor:
+    global _executor
+    with _lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(max_workers=_max_concurrency(), thread_name_prefix="nagacon-search")
+        return _executor
 
 
 def _now() -> str:
@@ -52,6 +79,7 @@ def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": job["id"],
         "kind": job["kind"],
+        "user_id": job.get("user_id"),
         "status": job["status"],
         "progress": dict(job.get("progress") or {}),
         "payload": job.get("payload"),
@@ -67,6 +95,7 @@ def _db_snapshot(row: SearchJob) -> dict[str, Any]:
     return {
         "id": row.id,
         "kind": row.kind,
+        "user_id": row.user_id,
         "status": row.status,
         "progress": dict(row.progress or {}),
         "payload": row.payload,
@@ -85,6 +114,7 @@ def _persist_job(job: dict[str, Any]) -> None:
         if not row:
             row = SearchJob(id=job["id"], kind=job["kind"])
         row.organization_id = job.get("organization_id")
+        row.user_id = job.get("user_id")
         row.kind = job["kind"]
         row.status = job["status"]
         row.payload = _json_safe(job.get("payload"))
@@ -160,11 +190,13 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 quick=bool(payload.get("quick", True)),
                 update_last_run=not bool(payload.get("quick", True)),
                 progress_callback=lambda event: _append_progress(job_id, event),
+                user_id=payload.get("user_id"),
             )
         elif kind == "manual":
             result = run_multi_source_search(
                 payload.get("search") or {},
                 db,
+                user_id=payload.get("user_id"),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         elif kind == "dibbs_pdf_bulk_download":
@@ -195,6 +227,7 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 organization_id=payload.get("organization_id"),
                 download_documents=bool(payload.get("download_documents", True)),
                 run_usaspending=bool(payload.get("run_usaspending", True)),
+                user_id=payload.get("user_id"),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         elif kind == "nsn_build":
@@ -208,6 +241,7 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 run_usaspending=bool(payload.get("run_usaspending", True)),
                 limit=int(payload.get("limit") or 50),
                 organization_id=payload.get("organization_id"),
+                user_id=payload.get("user_id"),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         elif kind == "publog_sync":
@@ -232,6 +266,7 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 opportunity_id,
                 organization_id=payload.get("organization_id"),
                 force=bool(payload.get("force", False)),
+                user_id=payload.get("user_id"),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         elif kind == "provider_backfill":
@@ -240,6 +275,7 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
                 organization_id=payload.get("organization_id"),
                 limit=int(payload.get("limit") or 250),
                 enrich_websites=bool(payload.get("enrich_websites", True)),
+                user_id=payload.get("user_id"),
                 progress_callback=lambda event: _append_progress(job_id, event),
             )
         else:
@@ -257,6 +293,76 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
         db.close()
 
 
+def _queued_job_query(db):
+    return db.query(SearchJob).filter(SearchJob.status == "queued").order_by(SearchJob.created_at.asc(), SearchJob.id.asc())
+
+
+def claim_next_queued_job() -> dict[str, Any] | None:
+    db = SessionLocal()
+    try:
+        while True:
+            row = _queued_job_query(db).first()
+            if not row:
+                return None
+            started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            updated = (
+                db.query(SearchJob)
+                .filter(SearchJob.id == row.id, SearchJob.status == "queued")
+                .update(
+                    {
+                        SearchJob.status: "running",
+                        SearchJob.started_at: started_at,
+                        SearchJob.error: None,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                db.commit()
+                db.refresh(row)
+                snapshot = _db_snapshot(row)
+                with _lock:
+                    _jobs[row.id] = {
+                        "id": row.id,
+                        "kind": row.kind,
+                        "organization_id": row.organization_id,
+                        "user_id": row.user_id,
+                        "status": row.status,
+                        "progress": dict(row.progress or {"completed_steps": 0, "total_steps": 0, "percent": 0}),
+                        "payload": dict(row.payload or {}),
+                        "result": row.result,
+                        "error": row.error,
+                        "started_at": snapshot.get("started_at"),
+                        "completed_at": snapshot.get("completed_at"),
+                        "events": list(row.events or []),
+                    }
+                return snapshot
+            db.rollback()
+    finally:
+        db.close()
+
+
+def run_claimed_job(job_id: str) -> dict[str, Any] | None:
+    db = SessionLocal()
+    try:
+        row = db.get(SearchJob, job_id)
+        if not row:
+            return None
+        payload = dict(row.payload or {})
+        kind = row.kind
+    finally:
+        db.close()
+    _run_job(job_id, kind, payload)
+    return get_search_job(job_id)
+
+
+def run_one_queued_job() -> dict[str, Any] | None:
+    claimed = claim_next_queued_job()
+    if not claimed:
+        return None
+    return run_claimed_job(claimed["id"])
+
+
 def start_search_job(kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     payload = dict(payload or {})
@@ -264,6 +370,7 @@ def start_search_job(kind: str, payload: dict[str, Any] | None = None) -> dict[s
         "id": job_id,
         "kind": kind,
         "organization_id": payload.get("organization_id"),
+        "user_id": payload.get("user_id"),
         "status": "queued",
         "progress": {"completed_steps": 0, "total_steps": 0, "percent": 0},
         "payload": payload,
@@ -276,13 +383,40 @@ def start_search_job(kind: str, payload: dict[str, Any] | None = None) -> dict[s
     with _lock:
         _jobs[job_id] = job
     _persist_job(job)
-    thread = threading.Thread(
-        target=_run_job,
-        args=(job_id, kind, payload),
-        daemon=True,
-        name=f"nagacon-search-{job_id[:8]}",
-    )
-    thread.start()
+    if uses_external_worker():
+        return _snapshot(job)
+    _thread_executor().submit(_run_job, job_id, kind, payload)
+    return _snapshot(job)
+
+
+def record_search_job(
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    status: str = "success",
+    result: dict[str, Any] | None = None,
+    progress: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    payload = dict(payload or {})
+    job = {
+        "id": job_id,
+        "kind": kind,
+        "organization_id": payload.get("organization_id"),
+        "user_id": payload.get("user_id"),
+        "status": status,
+        "progress": dict(progress or {}),
+        "payload": payload,
+        "result": result,
+        "error": error,
+        "started_at": _now(),
+        "completed_at": _now(),
+        "events": [],
+    }
+    with _lock:
+        _jobs[job_id] = job
+    _persist_job(job)
     return _snapshot(job)
 
 
@@ -297,3 +431,18 @@ def get_search_job(job_id: str) -> dict[str, Any] | None:
         return _db_snapshot(row) if row else None
     finally:
         db.close()
+
+
+def worker_loop(*, poll_seconds: float | None = None, max_jobs: int | None = None) -> int:
+    delay = float(poll_seconds if poll_seconds is not None else getattr(settings, "SEARCH_JOB_POLL_SECONDS", 2.0))
+    processed = 0
+    while True:
+        result = run_one_queued_job()
+        if result:
+            processed += 1
+            if max_jobs is not None and processed >= max_jobs:
+                return processed
+            continue
+        if max_jobs is not None:
+            return processed
+        time.sleep(max(delay, 0.25))

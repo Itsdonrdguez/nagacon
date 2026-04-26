@@ -21,6 +21,7 @@ def refresh_nsn_intelligence(
     seed_providers: bool = False,
     limit: int = 50,
     organization_id: int | None = None,
+    user_id: int | None = None,
 ) -> dict[str, Any]:
     target = normalize_nsn(nsn)
     if not target:

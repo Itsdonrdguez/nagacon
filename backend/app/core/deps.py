@@ -17,9 +17,10 @@ def get_db():
 def get_current_user(
     db=Depends(get_db),
     x_user_email: str | None = Header(default=None, alias="X-User-Email"),
+    x_session_token: str | None = Header(default=None, alias="X-Session-Token"),
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ):
-    session_user = get_user_by_session_token(db, session_token)
+    session_user = get_user_by_session_token(db, x_session_token or session_token)
     if session_user:
         return session_user
     user = get_or_create_user_by_email(db, x_user_email)

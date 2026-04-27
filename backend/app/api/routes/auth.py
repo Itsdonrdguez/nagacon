@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Cookie, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Body, Cookie, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -64,9 +64,10 @@ def _clear_session_cookie(response: Response) -> None:
 def get_me(
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    x_session_token: str | None = Header(default=None, alias="X-Session-Token"),
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ):
-    current_user = get_user_by_session_token(db, session_token)
+    current_user = get_user_by_session_token(db, x_session_token or session_token)
     return _auth_payload(current_user, current_org if current_user else None)
 
 
@@ -90,7 +91,9 @@ def signup(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     token, _ = start_user_session(db, user)
     _set_session_cookie(response, token)
-    return _auth_payload(user, current_org)
+    payload = _auth_payload(user, current_org)
+    payload["session_token"] = token
+    return payload
 
 
 @router.post("/login")
@@ -107,16 +110,19 @@ def login(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username/email or password")
     token, _ = start_user_session(db, user)
     _set_session_cookie(response, token)
-    return _auth_payload(user, current_org)
+    payload = _auth_payload(user, current_org)
+    payload["session_token"] = token
+    return payload
 
 
 @router.post("/logout")
 def logout(
     response: Response,
     db: Session = Depends(get_db),
+    x_session_token: str | None = Header(default=None, alias="X-Session-Token"),
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ):
-    current_user = get_user_by_session_token(db, session_token)
+    current_user = get_user_by_session_token(db, x_session_token or session_token)
     if current_user:
         clear_user_session(db, current_user)
     _clear_session_cookie(response)

@@ -1,6 +1,6 @@
 import { Link, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api } from './api/client'
+import { api, persistSessionToken } from './api/client'
 import Sidebar from './components/layout/Sidebar/Sidebar'
 import RouteErrorBoundary from './components/RouteErrorBoundary'
 import { Button, LoadingState } from './components/ui'
@@ -31,6 +31,7 @@ export default function App() {
       return res.data
     },
     onSuccess: async () => {
+      persistSessionToken(null)
       await queryClient.invalidateQueries({ queryKey: ['auth-me'] })
       await queryClient.invalidateQueries({ queryKey: ['notifications'] })
     },

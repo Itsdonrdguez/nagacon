@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api } from '../api/client'
+import { api, persistSessionToken } from '../api/client'
 import { Button, Card, Input, LoadingState } from '../components/ui'
 
 export default function Login() {
@@ -30,6 +30,7 @@ export default function Login() {
       return res.data
     },
     onSuccess: async (data) => {
+      persistSessionToken(data?.session_token)
       queryClient.setQueryData(['auth-me'], data)
       await queryClient.invalidateQueries({ queryKey: ['auth-me'] })
       navigate(location.state?.from || '/', { replace: true })

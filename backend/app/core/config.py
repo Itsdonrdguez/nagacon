@@ -39,6 +39,7 @@ except Exception:
             DEBUG = os.getenv("DEBUG", "true").lower() in {"1", "true", "yes", "on"}
             FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
             CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
+            CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "")
             SESSION_SECRET = os.getenv("SESSION_SECRET", "")
             SESSION_COOKIE_DOMAIN = os.getenv("SESSION_COOKIE_DOMAIN", "")
             SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "lax")

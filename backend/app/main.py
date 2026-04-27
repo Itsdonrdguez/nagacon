@@ -67,6 +67,16 @@ def _cors_origins() -> list[str]:
         return configured or LOCAL_CORS_ORIGINS
     return LOCAL_CORS_ORIGINS + [item for item in configured if item not in LOCAL_CORS_ORIGINS]
 
+
+def _cors_origin_regex() -> str | None:
+    configured_regex = str(getattr(settings, "CORS_ORIGIN_REGEX", "") or "").strip()
+    if configured_regex:
+        return configured_regex
+    configured_origins = _cors_origins()
+    if any("vercel.app" in origin for origin in configured_origins):
+        return r"^https://.*\.vercel\.app$"
+    return None
+
 CORE_ROUTERS = [
     health_router,
     auth_router,
@@ -138,6 +148,7 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins(),
+        allow_origin_regex=_cors_origin_regex(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

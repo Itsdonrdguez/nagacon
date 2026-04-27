@@ -75,6 +75,41 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _result_error_summary(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"has_errors": False, "error_count": 0, "sources": {}}
+
+    source_results = result.get("results") if isinstance(result.get("results"), dict) else result.get("sources")
+    sources = source_results if isinstance(source_results, dict) else {}
+    source_summaries: dict[str, Any] = {}
+    error_count = 0
+
+    for source_name, source_result in sources.items():
+        if not isinstance(source_result, dict):
+            continue
+        source_errors = [str(item) for item in (source_result.get("errors") or []) if str(item or "").strip()]
+        source_summary = {
+            "error_count": len(source_errors),
+            "has_errors": bool(source_errors),
+        }
+        if source_errors:
+            source_summary["errors"] = source_errors
+        source_summaries[str(source_name).lower()] = source_summary
+        error_count += len(source_errors)
+
+    top_level_errors = [str(item) for item in (result.get("errors") or []) if str(item or "").strip()]
+    error_count += len(top_level_errors)
+
+    summary = {
+        "has_errors": error_count > 0,
+        "error_count": error_count,
+        "sources": source_summaries,
+    }
+    if top_level_errors:
+        summary["errors"] = top_level_errors
+    return summary
+
+
 def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": job["id"],
@@ -280,9 +315,13 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
             )
         else:
             raise ValueError(f"Unsupported search job kind: {kind}")
+        result_summary = _result_error_summary(result)
+        final_status = "partial_success" if result_summary.get("has_errors") else "success"
+        if isinstance(result, dict):
+            result = {**result, "_job_summary": result_summary}
         _update_job(
             job_id,
-            status="success",
+            status=final_status,
             result=result,
             completed_at=_now(),
             progress={**(_jobs.get(job_id, {}).get("progress") or {}), "percent": 100},

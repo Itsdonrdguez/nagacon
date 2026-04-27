@@ -10,6 +10,7 @@ const STATUS_VARIANTS = {
   new: 'info',
   research: 'info',
   pending: 'warning',
+  partial_success: 'warning',
   due: 'warning',
   draft: 'warning',
   not_requested: 'default',

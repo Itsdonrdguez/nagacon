@@ -33,6 +33,11 @@ function resultPlan(result) {
   return result.plan || null
 }
 
+function resultSummary(result) {
+  if (!result || typeof result !== 'object') return null
+  return result._job_summary || null
+}
+
 function SearchCoverage({ diagnostics, codeLabel }) {
   if (!diagnostics) return null
 
@@ -178,7 +183,7 @@ export default function Ingestion() {
     enabled: Boolean(activeJobId),
     refetchInterval: (query) => {
       const status = query.state.data?.status
-      return status === 'success' || status === 'failed' ? false : 1500
+      return status === 'success' || status === 'partial_success' || status === 'failed' ? false : 1500
     },
     queryFn: async () => {
       const res = await api.get(`/api/search-jobs/${activeJobId}`)
@@ -187,7 +192,7 @@ export default function Ingestion() {
   })
 
   useEffect(() => {
-    if (searchJobQuery.data?.status !== 'success') {
+    if (!['success', 'partial_success'].includes(searchJobQuery.data?.status)) {
       return
     }
     refreshOpportunityFeeds()
@@ -236,6 +241,7 @@ export default function Ingestion() {
   const resultTotals = totalResult(result)
   const sources = resultSources(result)
   const plan = resultPlan(result) || ingestPlanQuery.data
+  const summary = resultSummary(result)
   const helperText =
     source === 'DIBBS'
       ? `Enter one or more DLA FSC codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per FSC.`
@@ -441,11 +447,33 @@ export default function Ingestion() {
           </div>
         ) : (
           <>
+            {activeJob?.status === 'partial_success' ? (
+              <div className="ingest-errors" style={{ marginBottom: '1rem' }}>
+                <div className="ingest-source-card">
+                  <div className="ingest-result-row">
+                    <span>Run status</span>
+                    <StatusPill status="partial_success" />
+                  </div>
+                  <div className="row-subtitle">
+                    The search completed, but one or more sources reported problems. Check the source cards below for exact errors.
+                  </div>
+                  {summary?.error_count ? (
+                    <div className="row-subtitle">
+                      {summary.error_count} source error{summary.error_count === 1 ? '' : 's'} captured during this run.
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
             <div className="ingest-summary-grid">
               <div className="ingest-source-card ingest-overall-card">
                 <div>
                   <div className="row-title">Overall</div>
                   <div className="row-subtitle">Latest search result</div>
+                </div>
+                <div className="ingest-result-row">
+                  <span>Run status</span>
+                  <StatusPill status={activeJob?.status || 'success'} />
                 </div>
                 <div className="ingest-result-row">
                   <span>New opportunities</span>

@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { Link, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, persistSessionToken } from './api/client'
@@ -8,6 +9,7 @@ import { Button, LoadingState } from './components/ui'
 export default function App() {
   const location = useLocation()
   const queryClient = useQueryClient()
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const authQuery = useQuery({
     queryKey: ['auth-me'],
     queryFn: async () => {
@@ -37,6 +39,10 @@ export default function App() {
     },
   })
 
+  useEffect(() => {
+    setMobileNavOpen(false)
+  }, [location.pathname])
+
   if (authQuery.isLoading) {
     return (
       <div className="auth-shell">
@@ -52,25 +58,46 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <Sidebar />
+    <div className={`app-shell ${mobileNavOpen ? 'nav-open' : ''}`}>
+      <button
+        type="button"
+        className={`mobile-nav-backdrop ${mobileNavOpen ? 'visible' : ''}`}
+        aria-label="Close navigation"
+        onClick={() => setMobileNavOpen(false)}
+      />
+      <Sidebar mobileNavOpen={mobileNavOpen} onNavigate={() => setMobileNavOpen(false)} />
       <main className="main-content">
         <div className="app-topbar">
-          <div>
-            <div className="row-title">
-              {authQuery.data?.organization?.name || 'Workspace'}
-            </div>
-            <div className="row-subtitle">
-              {authQuery.data?.user?.full_name || authQuery.data?.user?.email || 'Current user'}
-              {authQuery.data?.user?.role ? ` | ${authQuery.data.user.role}` : ''}
+          <div className="topbar-leading">
+            <button
+              type="button"
+              className={`mobile-nav-toggle ${mobileNavOpen ? 'active' : ''}`}
+              aria-label={mobileNavOpen ? 'Close navigation menu' : 'Open navigation menu'}
+              aria-expanded={mobileNavOpen}
+              onClick={() => setMobileNavOpen((current) => !current)}
+            >
+              <span />
+              <span />
+              <span />
+            </button>
+            <div>
+              <div className="row-title">
+                {authQuery.data?.organization?.name || 'Workspace'}
+              </div>
+              <div className="row-subtitle">
+                {authQuery.data?.user?.full_name || authQuery.data?.user?.email || 'Current user'}
+                {authQuery.data?.user?.role ? ` | ${authQuery.data.user.role}` : ''}
+              </div>
             </div>
           </div>
-          <Link className="topbar-notification-link" to="/work-queue">
-            {notificationsQuery.data?.unread_count || 0} alerts
-          </Link>
-          <Button variant="secondary" size="sm" loading={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
-            Log Out
-          </Button>
+          <div className="topbar-actions">
+            <Link className="topbar-notification-link" to="/work-queue">
+              {notificationsQuery.data?.unread_count || 0} alerts
+            </Link>
+            <Button variant="secondary" size="sm" loading={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
+              Log Out
+            </Button>
+          </div>
         </div>
         <RouteErrorBoundary>
           <Outlet />

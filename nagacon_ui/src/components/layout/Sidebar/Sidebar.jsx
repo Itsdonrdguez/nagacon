@@ -15,16 +15,22 @@ const items = [
   ['/settings', 'Settings'],
 ]
 
-export default function Sidebar() {
+export default function Sidebar({ mobileNavOpen = false, onNavigate = null }) {
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
       <div className="brand">
         <div className="brand-title">NagaCon</div>
         <div className="brand-subtitle">GovCon Intelligence Platform</div>
       </div>
       <nav className="nav">
         {items.map(([to, label]) => (
-          <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+          <NavLink
+            key={to}
+            to={to}
+            end={to === '/'}
+            className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+            onClick={() => onNavigate?.()}
+          >
             {label}
           </NavLink>
         ))}

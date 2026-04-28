@@ -65,7 +65,12 @@ export default function App() {
         aria-label="Close navigation"
         onClick={() => setMobileNavOpen(false)}
       />
-      <Sidebar mobileNavOpen={mobileNavOpen} onNavigate={() => setMobileNavOpen(false)} />
+      <Sidebar
+        mobileNavOpen={mobileNavOpen}
+        onNavigate={() => setMobileNavOpen(false)}
+        onLogout={() => logoutMutation.mutate()}
+        logoutLoading={logoutMutation.isPending}
+      />
       <main className="main-content">
         <div className="app-topbar">
           <div className="topbar-leading">
@@ -94,7 +99,7 @@ export default function App() {
             <Link className="topbar-notification-link" to="/work-queue">
               {notificationsQuery.data?.unread_count || 0} alerts
             </Link>
-            <Button variant="secondary" size="sm" loading={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
+            <Button className="topbar-logout-button" variant="secondary" size="sm" loading={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
               Log Out
             </Button>
           </div>

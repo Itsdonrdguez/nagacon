@@ -15,7 +15,12 @@ const items = [
   ['/settings', 'Settings'],
 ]
 
-export default function Sidebar({ mobileNavOpen = false, onNavigate = null }) {
+export default function Sidebar({
+  mobileNavOpen = false,
+  onNavigate = null,
+  onLogout = null,
+  logoutLoading = false,
+}) {
   return (
     <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
       <div className="brand">
@@ -35,6 +40,19 @@ export default function Sidebar({ mobileNavOpen = false, onNavigate = null }) {
           </NavLink>
         ))}
       </nav>
+      <div className="sidebar-footer">
+        <button
+          type="button"
+          className="nav-link nav-link-action"
+          onClick={() => {
+            onNavigate?.()
+            onLogout?.()
+          }}
+          disabled={logoutLoading}
+        >
+          {logoutLoading ? 'Logging out...' : 'Log Out'}
+        </button>
+      </div>
     </aside>
   )
 }

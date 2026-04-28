@@ -33,6 +33,19 @@ a { color: inherit; text-decoration: none; }
 .nav { margin-top: 28px; display: flex; flex-direction: column; gap: 8px; }
 .nav-link { padding: 12px 14px; border-radius: 12px; color: #dbeafe; font-weight: 600; }
 .nav-link.active, .nav-link:hover { background: #1d4ed8; color: white; }
+.sidebar-footer { margin-top: auto; padding-top: 1rem; }
+.nav-link-action {
+  width: 100%;
+  border: 1px solid rgba(191, 219, 254, 0.22);
+  background: rgba(255, 255, 255, 0.06);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.nav-link-action:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
 .main-content { flex: 1; padding: 28px; }
 .mobile-nav-backdrop {
   display: none;
@@ -591,6 +604,10 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
 
   .topbar-actions {
     gap: 0.65rem;
+  }
+
+  .topbar-logout-button {
+    display: none;
   }
 }
 

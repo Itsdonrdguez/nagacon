@@ -55,6 +55,7 @@ export default function NSNIntelligence() {
   const [input, setInput] = useState(DEFAULT_NSN)
   const [submittedNsn, setSubmittedNsn] = useState(DEFAULT_NSN)
   const [buildJobId, setBuildJobId] = useState(null)
+  const [autoImportedNsns, setAutoImportedNsns] = useState({})
 
   const cleanNsn = normalizeSearch(submittedNsn)
   const nsnQuery = useQuery({
@@ -62,6 +63,15 @@ export default function NSNIntelligence() {
     enabled: cleanNsn.length === 13,
     queryFn: async () => {
       const res = await api.get(`/api/nsn/${cleanNsn}`)
+      return res.data
+    },
+  })
+  const publogStatusQuery = useQuery({
+    queryKey: ['publog-status'],
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const res = await api.get('/api/nsn/publog/status')
       return res.data
     },
   })
@@ -159,12 +169,37 @@ export default function NSNIntelligence() {
     queryClient.invalidateQueries({ queryKey: ['providers'] })
   }, [buildJobDone, cleanNsn, queryClient])
 
+  useEffect(() => {
+    if (cleanNsn.length !== 13 || !data || importPublogMutation.isPending || autoImportedNsns[cleanNsn]) return
+    if (publogStatusQuery.data?.status !== 'ready') return
+
+    const needsCatalogHelp = !data?.confidence?.has_catalog_record || !data?.confidence?.has_reference_records
+    if (!needsCatalogHelp) return
+
+    setAutoImportedNsns((current) => ({ ...current, [cleanNsn]: true }))
+    importPublogMutation.mutate()
+  }, [
+    autoImportedNsns,
+    cleanNsn,
+    data,
+    importPublogMutation,
+    publogStatusQuery.data?.status,
+  ])
+
   const summaryStats = useMemo(() => ([
     { label: 'Vendor Candidates', value: numberLabel(recommendations.length), subtitle: data?.confidence?.has_vendor_recommendations ? 'Ranked by evidence' : 'Needs more evidence' },
-    { label: 'Catalog References', value: numberLabel(references.length), subtitle: data?.confidence?.has_reference_records ? 'CAGE and part links' : 'Import PUB LOG' },
+    {
+      label: 'Catalog References',
+      value: numberLabel(references.length),
+      subtitle: data?.confidence?.has_reference_records
+        ? 'CAGE and part links'
+        : publogStatusQuery.data?.status === 'ready'
+          ? 'Checking the catalog package'
+          : 'Catalog package not ready yet',
+    },
     { label: 'Awards', value: numberLabel(awardSignalCount), subtitle: snapshotUsaspending ? `${numberLabel(snapshotUsaspending.awards_found)} refresh hits` : awardSignalCount ? 'Persisted evidence' : 'Run refresh' },
     { label: 'Unit Price Avg', value: pricing.unit_average ? money(pricing.unit_average) : 'Not available', subtitle: pricing.count ? `${numberLabel(pricing.count)} price facts` : 'No pricing yet' },
-  ]), [recommendations.length, references.length, awardSignalCount, pricing.unit_average, pricing.count, data?.confidence, snapshotUsaspending])
+  ]), [recommendations.length, references.length, awardSignalCount, pricing.unit_average, pricing.count, data?.confidence, snapshotUsaspending, publogStatusQuery.data?.status])
 
   const handleSearch = (event) => {
     event.preventDefault()
@@ -200,15 +235,6 @@ export default function NSNIntelligence() {
               onClick={() => buildMutation.mutate()}
             >
               Build Intelligence
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              loading={importPublogMutation.isPending}
-              disabled={!data || importPublogMutation.isPending}
-              onClick={() => importPublogMutation.mutate()}
-            >
-              Import PUB LOG
             </Button>
             <Button
               type="button"
@@ -293,7 +319,7 @@ export default function NSNIntelligence() {
                 ) : null}
                 {importPublogMutation.data ? (
                   <div>
-                    <div className="row-title">PUB LOG import</div>
+                    <div className="row-title">Catalog package refresh</div>
                     <div className="row-subtitle">
                       Identity rows {numberLabel(importPublogMutation.data.identity_rows)} | Part rows {numberLabel(importPublogMutation.data.part_rows)}
                     </div>
@@ -423,7 +449,14 @@ export default function NSNIntelligence() {
                   </TableBody>
                 </Table>
               ) : (
-                <EmptyState title="No catalog references" subtitle="Import PUB LOG reference data to populate CAGE and part-number relationships." />
+                <EmptyState
+                  title="No catalog references"
+                  subtitle={
+                    publogStatusQuery.data?.status === 'ready'
+                      ? 'We checked the catalog package, but this item still does not have reference links yet.'
+                      : 'The catalog package is not ready yet, so reference links have not been loaded.'
+                  }
+                />
               )}
             </Card>
 

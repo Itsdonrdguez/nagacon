@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_user
 from app.core.db import get_db
 from app.schemas.opportunity import RawOpportunity
+from app.services.dibbs.fetch_guard import guarded_fetch_dibbs_opportunities
 from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
 from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
@@ -473,7 +474,7 @@ def run_multi_source_search(
                         "all_results": use_all_results,
                     }
                     try:
-                        dibbs_code_raw = fetch_dibbs_opportunities(
+                        dibbs_code_raw = guarded_fetch_dibbs_opportunities(
                             params=dibbs_payload, max_pages=max_pages
                         )
                     except Exception as exc:

@@ -7,11 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.models.company_profile import CompanyProfile
 from app.schemas.opportunity import RawOpportunity
+from app.services.dibbs.fetch_guard import guarded_fetch_dibbs_opportunities
 from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
 from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
 from app.services.provider_settings_service import get_effective_sam_api_key
-from app.services.scrapers.dibbs_scraper import fetch_dibbs_opportunities
 from app.services.scrapers.sam_scraper import SamScraperError, fetch_sam_opportunities
 
 DEFAULT_DIBBS_FSC_CODES = [
@@ -263,7 +263,10 @@ def run_company_profile_ingest(
     dibbs_errors: list[str] = []
     for fsc_code in plan["dibbs"]["fsc_codes"]:
         try:
-            rows = fetch_dibbs_opportunities({"fsc": fsc_code, "limit": limit, "max_pages": 4}, max_pages=4)
+            rows = guarded_fetch_dibbs_opportunities(
+                {"fsc": fsc_code, "limit": limit, "max_pages": 4},
+                max_pages=4,
+            )
         except Exception as exc:
             rows = []
             dibbs_errors.append(f"FSC {fsc_code}: {exc}")

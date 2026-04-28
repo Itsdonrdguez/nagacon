@@ -128,6 +128,7 @@ export default function Ingestion() {
   const [samZip, setSamZip] = useState('')
   const [samAgency, setSamAgency] = useState('')
   const [activeJobId, setActiveJobId] = useState(null)
+  const [activeAction, setActiveAction] = useState(null)
 
   const refreshOpportunityFeeds = () => {
     queryClient.invalidateQueries({ queryKey: ['opportunities'] })
@@ -200,6 +201,7 @@ export default function Ingestion() {
   }, [searchJobQuery.data?.status, searchJobQuery.data?.completed_at])
 
   const runManualSearch = async ({ limit = DEFAULT_PER_CODE_SEARCH_SIZE, deep = false } = {}) => {
+    setActiveAction(deep ? 'manual_deep' : 'manual_search')
     await ingestMutation.mutateAsync({
       q: query.trim(),
       per_code_limit: limit,
@@ -213,6 +215,7 @@ export default function Ingestion() {
   }
 
   const runBulkPdfDownload = async () => {
+    setActiveAction('manual_pdfs')
     await pdfDownloadMutation.mutateAsync({
       fscs: query.trim(),
     })
@@ -231,6 +234,7 @@ export default function Ingestion() {
   }
 
   const runProfileIngest = async () => {
+    setActiveAction('profile_search')
     await profileIngestMutation.mutateAsync()
   }
 
@@ -276,7 +280,7 @@ export default function Ingestion() {
             </div>
             <Button
               onClick={runProfileIngest}
-              loading={profileIngestMutation.isPending || (isSearching && activeJob?.kind === 'profile')}
+              loading={profileIngestMutation.isPending || (isSearching && activeAction === 'profile_search')}
               disabled={ingestMutation.isPending || isSearching}
             >
               Search
@@ -307,7 +311,7 @@ export default function Ingestion() {
                   <Button
                     type="submit"
                     variant="secondary"
-                    loading={ingestMutation.isPending || (isSearching && activeJob?.kind === 'manual')}
+                    loading={ingestMutation.isPending || (isSearching && activeAction === 'manual_search')}
                     disabled={profileIngestMutation.isPending || isSearching}
                   >
                     Search
@@ -315,7 +319,7 @@ export default function Ingestion() {
                   <Button
                     type="button"
                     variant="secondary"
-                    loading={ingestMutation.isPending || (isSearching && activeJob?.kind === 'manual')}
+                    loading={ingestMutation.isPending || (isSearching && activeAction === 'manual_deep')}
                     disabled={profileIngestMutation.isPending || isSearching}
                     onClick={() => runManualSearch({ deep: true })}
                   >
@@ -324,7 +328,7 @@ export default function Ingestion() {
                   <Button
                     type="button"
                     variant="secondary"
-                    loading={pdfDownloadMutation.isPending || (isSearching && isPdfDownloadJob)}
+                    loading={pdfDownloadMutation.isPending || (isSearching && activeAction === 'manual_pdfs')}
                     disabled={source !== 'DIBBS' || profileIngestMutation.isPending || ingestMutation.isPending || isSearching || !query.trim()}
                     onClick={runBulkPdfDownload}
                   >
@@ -360,6 +364,20 @@ export default function Ingestion() {
               ) : null}
               <div className="row-subtitle">
                 Deep Search reviews all available source records for the selected codes and may take significantly longer on DIBBS.
+              </div>
+              <div className="simple-list">
+                <div className="simple-list-row">
+                  <div className="row-title">Search</div>
+                  <div className="row-subtitle">Runs a quick pass across the codes you entered and keeps the result set small enough to review fast.</div>
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">Deep Search</div>
+                  <div className="row-subtitle">Keeps going through every available page for those codes. Use it when you want full coverage and do not mind waiting.</div>
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">Bulk Download PDFs</div>
+                  <div className="row-subtitle">Downloads the main solicitation PDFs for DIBBS results so you can mine vendor and part details later.</div>
+                </div>
               </div>
             </div>
           </form>

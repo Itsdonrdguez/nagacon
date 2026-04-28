@@ -68,13 +68,15 @@ export default function Providers() {
   const queryClient = useQueryClient()
   const [filters, setFilters] = useState({ q: '', nsn: '', fsc: '', relationship_type: 'all', source: 'all' })
   const [submittedFilters, setSubmittedFilters] = useState(filters)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
   const [form, setForm] = useState(EMPTY_FORM)
   const [csvContent, setCsvContent] = useState('')
   const [selectedProviderId, setSelectedProviderId] = useState(null)
   const [backfillJobId, setBackfillJobId] = useState(null)
 
   const providersQuery = useQuery({
-    queryKey: ['providers', submittedFilters],
+    queryKey: ['providers', submittedFilters, page, pageSize],
     queryFn: async () => {
       const res = await api.get('/api/providers', {
         params: {
@@ -83,7 +85,8 @@ export default function Providers() {
           fsc: submittedFilters.fsc || undefined,
           relationship_type: submittedFilters.relationship_type === 'all' ? undefined : submittedFilters.relationship_type,
           source: submittedFilters.source === 'all' ? undefined : submittedFilters.source,
-          limit: 100,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
         },
       })
       return res.data
@@ -186,6 +189,9 @@ export default function Providers() {
 
   const rows = providersQuery.data?.items || []
   const total = providersQuery.data?.total || 0
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const pageStart = total === 0 ? 0 : (page - 1) * pageSize + 1
+  const pageEnd = total === 0 ? 0 : Math.min(page * pageSize, total)
   const exportProvidersUrl = `${api.defaults.baseURL}/api/export/providers.csv`
   const providerDetail = providerDetailQuery.data
 
@@ -203,6 +209,7 @@ export default function Providers() {
 
   const handleFilterSubmit = (event) => {
     event.preventDefault()
+    setPage(1)
     setSubmittedFilters({ ...filters })
   }
 
@@ -325,6 +332,32 @@ export default function Providers() {
                 Run Provider Backfill
               </Button>
             </div>
+            <div className="simple-list">
+              <div className="simple-list-row">
+                <div className="row-title">Import CSV</div>
+                <div className="row-subtitle">Loads providers from a spreadsheet or pasted CSV. Best when you already have a clean list.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Seed From Vendor Leads</div>
+                <div className="row-subtitle">Turns vendor leads you already collected elsewhere in the app into reusable provider records.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Extract From DIBBS PDFs</div>
+                <div className="row-subtitle">Reads saved DIBBS solicitation PDFs and pulls out CAGEs, names, and item links.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Enrich SAM Websites</div>
+                <div className="row-subtitle">Fills in missing company websites from SAM. Usually not needed right after a full backfill run.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Discover Contacts</div>
+                <div className="row-subtitle">Looks for contact details on providers that already exist in your database.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Run Provider Backfill</div>
+                <div className="row-subtitle">The broad cleanup pass. It resolves names, fills gaps, and pulls in missing provider details across the database.</div>
+              </div>
+            </div>
             {importMutation.data ? (
               <div className="settings-summary-box">
                 <div className="row-title">Latest Import</div>
@@ -396,7 +429,21 @@ export default function Providers() {
         ) : (
           <>
             <div className="results-toolbar">
-              <div className="results-count">Showing {rows.length} of {total}</div>
+              <div className="results-count">Showing {pageStart}-{pageEnd} of {total}</div>
+              <div className="page-size-control">
+                <label className="input-label">Rows</label>
+                <select
+                  value={pageSize}
+                  onChange={(event) => {
+                    setPageSize(Number(event.target.value))
+                    setPage(1)
+                  }}
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
               <div className="badge-stack">
                 {Object.entries(sourceCounts).slice(0, 5).map(([source, count]) => (
                   <Badge key={source} label={`${source}: ${count}`} variant="info" />
@@ -471,6 +518,15 @@ export default function Providers() {
                 ))}
               </TableBody>
             </Table>
+            <div className="pagination-bar">
+              <div className="row-subtitle">Page {page} of {totalPages}</div>
+              <Button variant="secondary" size="sm" disabled={page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>
+                Previous
+              </Button>
+              <Button variant="secondary" size="sm" disabled={page >= totalPages} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>
+                Next
+              </Button>
+            </div>
           </>
         )}
       </Card>

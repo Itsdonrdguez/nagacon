@@ -256,6 +256,24 @@ export default function NSNIntelligence() {
             </Button>
           </div>
         </form>
+        <div className="simple-list">
+          <div className="simple-list-row">
+            <div className="row-title">Lookup</div>
+            <div className="row-subtitle">Loads the current NSN record, references, vendors, pricing, and any saved evidence already in the system.</div>
+          </div>
+          <div className="simple-list-row">
+            <div className="row-title">Build Intelligence</div>
+            <div className="row-subtitle">Runs the fuller pipeline for this NSN: catalog package refresh, awards research, and provider seeding.</div>
+          </div>
+          <div className="simple-list-row">
+            <div className="row-title">Refresh</div>
+            <div className="row-subtitle">Updates awards and pricing signals without running the full provider-building workflow.</div>
+          </div>
+          <div className="simple-list-row">
+            <div className="row-title">Seed Providers</div>
+            <div className="row-subtitle">Creates or updates provider candidates from the evidence already tied to this NSN.</div>
+          </div>
+        </div>
         {normalizeSearch(input).length > 0 && normalizeSearch(input).length !== 13 ? (
           <div className="form-hint error">Enter a 13 digit NSN.</div>
         ) : null}

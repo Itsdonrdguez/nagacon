@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import time
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,9 +14,12 @@ import requests
 
 from app.services.dibbs.custom_query_search import search_dibbs_custom_query_by_fsc
 from app.services.dibbs.session import dibbs_page
+from app.services.storage import store_bytes, store_text
 
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DIBBS_PDF_EXPORT_DIR = BACKEND_ROOT / "exports" / "dibbs_pdfs"
+PDF_STORAGE_PREFIX = "dibbs_pdfs"
+LATEST_MANIFEST_REF = f"{PDF_STORAGE_PREFIX}/latest_manifest.json"
 PDF_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -119,35 +123,30 @@ def _accept_dibbs2_warning(pdf_url: str, headless: bool = True) -> dict[str, str
         return {cookie["name"]: cookie["value"] for cookie in context.cookies("https://dibbs2.bsm.dla.mil")}
 
 
-def _download_pdf(
+def _download_pdf_bytes(
     url: str,
-    destination: Path,
     *,
     session: requests.Session,
     timeout: int = 60,
-) -> None:
+) -> bytes:
+    data = bytearray()
     with session.get(url, headers={**PDF_HEADERS, "Referer": url}, timeout=timeout, stream=True) as response:
         response.raise_for_status()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 64):
-                if chunk:
-                    handle.write(chunk)
-    if destination.stat().st_size == 0:
+        for chunk in response.iter_content(chunk_size=1024 * 64):
+            if chunk:
+                data.extend(chunk)
+    if not data:
         raise ValueError("Downloaded file was empty")
-    if not _is_pdf_bytes(destination):
-        try:
-            destination.unlink()
-        except Exception:
-            pass
+    if bytes(data[:5]) != b"%PDF-":
         raise ValueError("DIBBS returned a non-PDF response instead of the solicitation PDF")
+    return bytes(data)
 
 
 def _record_from_row(
     fsc: str,
     row: dict[str, Any],
     status: str,
-    file_path: Path | None = None,
+    file_path: str | Path | None = None,
     error: str | None = None,
 ) -> DibbsPdfExportRecord:
     return DibbsPdfExportRecord(
@@ -165,20 +164,43 @@ def _record_from_row(
     )
 
 
-def _write_manifest(records: list[DibbsPdfExportRecord], output_dir: Path, run_id: str) -> tuple[Path, Path]:
+def _write_manifest(records: list[DibbsPdfExportRecord], output_dir: Path, run_id: str) -> tuple[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / f"manifest_{run_id}.csv"
     jsonl_path = output_dir / f"manifest_{run_id}.jsonl"
     fieldnames = list(DibbsPdfExportRecord.__dataclass_fields__.keys())
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+    with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", suffix=".csv", delete=False) as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for record in records:
             writer.writerow(record.__dict__)
-    with jsonl_path.open("w", encoding="utf-8") as handle:
+        temp_csv = Path(handle.name)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl", delete=False) as handle:
         for record in records:
             handle.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
-    return csv_path, jsonl_path
+        temp_jsonl = Path(handle.name)
+    try:
+        csv_ref = store_text(f"{PDF_STORAGE_PREFIX}/{run_id}/{csv_path.name}", temp_csv.read_text(encoding="utf-8"), encoding="utf-8")
+        jsonl_ref = store_text(f"{PDF_STORAGE_PREFIX}/{run_id}/{jsonl_path.name}", temp_jsonl.read_text(encoding="utf-8"), encoding="utf-8")
+        store_text(
+            LATEST_MANIFEST_REF,
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "manifest_csv": csv_ref,
+                    "manifest_jsonl": jsonl_ref,
+                    "output_dir": f"{PDF_STORAGE_PREFIX}/{run_id}",
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return csv_ref, jsonl_ref
+    finally:
+        temp_csv.unlink(missing_ok=True)
+        temp_jsonl.unlink(missing_ok=True)
 
 
 def export_dibbs_pdfs_for_fscs(
@@ -267,6 +289,7 @@ def export_dibbs_pdfs_for_fscs(
             nsn = _safe_filename(row.get("nsn"), "NO_NSN")
             stem = _safe_filename(f"{sol or 'NO_SOL'}_{nsn}", f"dibbs_{fsc}")
             destination = _versioned_path(fsc_folder, stem)
+            storage_path = f"{PDF_STORAGE_PREFIX}/{run_id}/{fsc}/{destination.name}"
 
             try:
                 if not dibbs2_session_ready:
@@ -274,12 +297,13 @@ def export_dibbs_pdfs_for_fscs(
                         pdf_session.cookies.set(name, value, domain="dibbs2.bsm.dla.mil")
                     dibbs2_session_ready = True
                 _progress("DIBBS PDFs", f"Downloading {label}", 1)
-                _download_pdf(pdf_url, destination, session=pdf_session, timeout=download_timeout)
-                records.append(_record_from_row(fsc, row, "downloaded", file_path=destination))
+                pdf_bytes = _download_pdf_bytes(pdf_url, session=pdf_session, timeout=download_timeout)
+                stored_ref = store_bytes(storage_path, pdf_bytes, content_type="application/pdf")
+                records.append(_record_from_row(fsc, row, "downloaded", file_path=stored_ref))
                 summary["downloaded"] += 1
                 summary["by_fsc"][fsc]["downloaded"] += 1
             except Exception as exc:
-                records.append(_record_from_row(fsc, row, "failed", file_path=destination, error=str(exc)))
+                records.append(_record_from_row(fsc, row, "failed", file_path=Path(storage_path), error=str(exc)))
                 summary["failed"] += 1
                 summary["by_fsc"][fsc]["failed"] += 1
             finally:

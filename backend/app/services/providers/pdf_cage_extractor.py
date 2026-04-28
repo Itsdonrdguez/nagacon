@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from functools import lru_cache
@@ -15,10 +16,11 @@ from app.models.opportunity_file import OpportunityFile
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
 from app.schemas.provider import ProviderCreate, ProviderItemCreate, ProviderPdfExtractResult
+from app.services.dibbs.pdf_bulk_export import LATEST_MANIFEST_REF
 from app.services.document_parser import parse_opportunity_file
 from app.services.provider_settings_service import get_effective_sam_api_key
 from app.services.rfq_parser import parse_dibbs_sources
-from app.services.storage import local_temp_path
+from app.services.storage import file_exists, local_temp_path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
 EXPORT_ROOT = BACKEND_ROOT / "exports" / "dibbs_pdfs"
@@ -475,36 +477,98 @@ def extract_providers_from_dibbs_pdfs(
 ) -> ProviderPdfExtractResult:
     result = ProviderPdfExtractResult()
     base = Path(root)
-    if not base.exists():
-        result.errors.append(f"PDF export folder does not exist: {base}")
-        return result
 
     repo = ProviderRepository(db, organization_id=organization_id)
     sam_api_key = get_effective_sam_api_key(db, user_id=user_id) if enrich_with_sam else None
-    pdf_paths = sorted(base.rglob("*.pdf"))
-    if limit:
-        pdf_paths = pdf_paths[: max(limit, 0)]
-
     seen_cage_item: set[tuple[str, str | None, str]] = set()
-    for path in pdf_paths:
-        result.scanned_files += 1
-        if not _is_valid_pdf(path):
+    if base.exists():
+        pdf_paths = sorted(base.rglob("*.pdf"))
+        if limit:
+            pdf_paths = pdf_paths[: max(limit, 0)]
+        for path in pdf_paths:
+            _extract_provider_rows_from_pdf(
+                db,
+                repo=repo,
+                sam_api_key=sam_api_key,
+                result=result,
+                seen_cage_item=seen_cage_item,
+                reference=str(path),
+                display_name=path.name,
+            )
+        return result
+
+    if not file_exists(LATEST_MANIFEST_REF):
+        result.errors.append(f"PDF export folder does not exist: {base}")
+        return result
+
+    try:
+        with local_temp_path(LATEST_MANIFEST_REF, suffix=".json") as manifest_meta_path:
+            manifest_meta = json.loads(manifest_meta_path.read_text(encoding="utf-8"))
+        manifest_ref = manifest_meta.get("manifest_jsonl")
+        if not manifest_ref or not file_exists(manifest_ref):
+            result.errors.append("The latest DIBBS PDF manifest was not found in shared storage.")
+            return result
+        with local_temp_path(manifest_ref, suffix=".jsonl") as manifest_path:
+            count = 0
+            for line in manifest_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("status") != "downloaded" or not row.get("file_path"):
+                    continue
+                _extract_provider_rows_from_pdf(
+                    db,
+                    repo=repo,
+                    sam_api_key=sam_api_key,
+                    result=result,
+                    seen_cage_item=seen_cage_item,
+                    reference=row["file_path"],
+                    display_name=Path(str(row["file_path"])).name,
+                    nsn_hint=_normalize_nsn(row.get("nsn")),
+                    fsc_hint=_clean(row.get("fsc")) or _fsc_from_path(Path(str(row["file_path"])), _normalize_nsn(row.get("nsn"))),
+                    nomenclature_hint=_clean(row.get("nomenclature"), 300),
+                )
+                count += 1
+                if limit and count >= max(limit, 0):
+                    break
+    except Exception as exc:
+        result.errors.append(f"Could not read shared DIBBS PDF manifest: {exc}")
+
+    return result
+
+
+def _extract_provider_rows_from_pdf(
+    db: Session,
+    *,
+    repo: ProviderRepository,
+    sam_api_key: str | None,
+    result: ProviderPdfExtractResult,
+    seen_cage_item: set[tuple[str, str | None, str]],
+    reference: str,
+    display_name: str,
+    nsn_hint: str | None = None,
+    fsc_hint: str | None = None,
+    nomenclature_hint: str | None = None,
+) -> None:
+    result.scanned_files += 1
+    with local_temp_path(reference, suffix=Path(display_name).suffix or ".pdf") as path:
+        if not path.exists() or not _is_valid_pdf(path):
             result.invalid_pdfs += 1
             result.skipped += 1
-            continue
+            return
 
         result.valid_pdfs += 1
         parsed_doc = parse_opportunity_file(str(path))
         text = parsed_doc.get("text") or ""
         parsed = parse_dibbs_sources(text)
-        nsn = parsed.get("nsn") or _nsn_from_filename(path)
-        fsc = _fsc_from_path(path, nsn)
-        nomenclature = _nomenclature_for_provider(parsed, path)
+        nsn = parsed.get("nsn") or nsn_hint or _nsn_from_filename(path)
+        fsc = fsc_hint or _fsc_from_path(path, nsn)
+        nomenclature = _nomenclature_for_provider(parsed, path) or nomenclature_hint
         rows = _approved_source_rows(parsed) + _manufacturer_rows_from_text(text)
 
         if not rows:
             result.skipped += 1
-            continue
+            return
 
         for row in rows:
             cage = row["cage"]
@@ -520,7 +584,7 @@ def extract_providers_from_dibbs_pdfs(
             if sam_api_key:
                 sam_row = _lookup_sam_entity(cage, sam_api_key)
                 if sam_row.get("error"):
-                    result.errors.append(f"{path.name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
+                    result.errors.append(f"{display_name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
                     sam_row = {}
                 sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
                 sam_website = sam_row.get("website")
@@ -534,7 +598,7 @@ def extract_providers_from_dibbs_pdfs(
             notes = []
             if row.get("part_number"):
                 notes.append(f"Part number: {row['part_number']}")
-            notes.append(f"Extracted from {path.name}")
+            notes.append(f"Extracted from {display_name}")
 
             payload = ProviderCreate(
                 company_name=company_name,
@@ -547,7 +611,7 @@ def extract_providers_from_dibbs_pdfs(
                     nomenclature=nomenclature,
                     relationship_type=row["relationship_type"],
                     source="DIBBS Solicitation PDF",
-                    source_url=str(path),
+                    source_url=reference,
                     confidence=95 if row["relationship_type"] == "Approved Source" else 65,
                     notes="; ".join(notes),
                 ),
@@ -561,9 +625,7 @@ def extract_providers_from_dibbs_pdfs(
                     result.inserted += 1
             except Exception as exc:
                 db.rollback()
-                result.errors.append(f"{path.name} / CAGE {cage}: {exc}")
-
-    return result
+                result.errors.append(f"{display_name} / CAGE {cage}: {exc}")
 
 
 def seed_vendor_leads_from_providers(

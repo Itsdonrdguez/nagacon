@@ -253,44 +253,96 @@ export default function Ingestion() {
         ? `Enter SAM NAICS, PSC, or classification codes separated by commas. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per code.`
         : `Use this for a combined manual run. DIBBS uses FSC codes; SAM uses NAICS/PSC/classification codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per code.`
   const showSamFilters = source !== 'DIBBS'
+  const profileFscCodes = plan?.dibbs?.fsc_codes || DEFAULT_DIBBS_FSC_CODES
+  const profileKeywords = plan?.sam?.keywords || []
+  const profileNaics = plan?.sam?.naics_codes || []
+  const manualModeLabel = source === 'DIBBS' ? 'DIBBS quick search' : source === 'SAM' ? 'SAM quick search' : 'Combined source search'
+  const isManualBusy = ingestMutation.isPending || (isSearching && (activeAction === 'manual_search' || activeAction === 'manual_deep'))
+  const searchStateLabel = isSearching
+    ? 'Search in progress'
+    : result
+      ? 'Latest search'
+      : 'Ready to search'
 
   return (
     <div className="page">
-      <h1 className="page-title">Opportunity Search</h1>
+      <div className="page-header">
+        <div>
+          <div className="page-kicker">Research Desk</div>
+          <h1 className="page-title">Opportunity Search</h1>
+          <div className="page-subtitle">
+            Run your saved profile search for the normal workflow, or use a focused manual search when you want to inspect one code set more closely.
+          </div>
+        </div>
+      </div>
 
       <div className="ingestion-grid">
-        <Card title="Company Profile Search">
-          <div className="ingest-command-card">
-            <p className="panel-subtitle">
-              Uses your saved DIBBS FSCs and SAM NAICS filters. The button runs a quick search so the page stays responsive.
-            </p>
+        <Card title="Use Saved Profile">
+          <div className="ingest-command-card ingest-command-card-primary">
+            <div className="ingest-command-header">
+              <div>
+                <div className="row-title">Quick company search</div>
+                <div className="panel-subtitle">
+                  Uses your saved DIBBS FSCs and SAM targeting so you can refresh the main opportunity feed without rebuilding the filters every time.
+                </div>
+              </div>
+              <div className="ingest-mode-badge">Primary workflow</div>
+            </div>
+
+            <div className="ingest-profile-highlights">
+              <div className="ingest-profile-stat">
+                <span>FSC codes</span>
+                <strong>{profileFscCodes.length}</strong>
+              </div>
+              <div className="ingest-profile-stat">
+                <span>SAM keywords</span>
+                <strong>{profileKeywords.length}</strong>
+              </div>
+              <div className="ingest-profile-stat">
+                <span>SAM NAICS</span>
+                <strong>{profileNaics.length}</strong>
+              </div>
+            </div>
+
             <div className="ingest-profile-plan">
               <div className="row-subtitle">
-                <strong>DIBBS FSCs:</strong> {(plan?.dibbs?.fsc_codes || DEFAULT_DIBBS_FSC_CODES).join(', ')}
+                <strong>DIBBS FSCs:</strong> {profileFscCodes.join(', ')}
               </div>
               <div className="row-subtitle">
-                <strong>SAM keywords:</strong> {(plan?.sam?.keywords || []).join(', ') || 'Profile keywords not loaded yet'}
+                <strong>SAM keywords:</strong> {profileKeywords.join(', ') || 'Profile keywords not loaded yet'}
               </div>
               <div className="row-subtitle">
-                <strong>SAM NAICS:</strong> {(plan?.sam?.naics_codes || []).join(', ') || 'Profile NAICS not loaded yet'}
+                <strong>SAM NAICS:</strong> {profileNaics.join(', ') || 'Profile NAICS not loaded yet'}
               </div>
               <div className="row-subtitle">
                 <strong>Search size:</strong> Up to {DEFAULT_PER_CODE_SEARCH_SIZE} results per FSC or NAICS.
               </div>
             </div>
-            <Button
-              onClick={runProfileIngest}
-              loading={profileIngestMutation.isPending || (isSearching && activeAction === 'profile_search')}
-              disabled={ingestMutation.isPending || isSearching}
-            >
-              Search
-            </Button>
+            <div className="ingest-command-footer">
+              <div className="panel-subtitle">Best for your normal daily refresh.</div>
+              <Button
+                onClick={runProfileIngest}
+                loading={profileIngestMutation.isPending || (isSearching && activeAction === 'profile_search')}
+                disabled={ingestMutation.isPending || isSearching}
+              >
+                Search
+              </Button>
+            </div>
           </div>
         </Card>
 
-        <Card title="Manual Search">
+        <Card title="Run a Custom Search">
           <form className="company-form" onSubmit={handleSubmit}>
             <div className="ingest-search-stack">
+              <div className="ingest-command-header">
+                <div>
+                  <div className="row-title">{manualModeLabel}</div>
+                  <div className="panel-subtitle">
+                    Use this when you want to inspect one FSC, one SAM code set, or a one-off combined search without changing the saved company profile.
+                  </div>
+                </div>
+                <div className="ingest-mode-badge ingest-mode-badge-muted">Targeted search</div>
+              </div>
               <Input
                 label={source === 'DIBBS' ? 'DLA FSC Codes' : 'Search Codes'}
                 value={query}
@@ -307,7 +359,7 @@ export default function Ingestion() {
                     <option value="ALL">All Sources</option>
                   </select>
                 </div>
-                <div className="form-action">
+                <div className="form-action ingest-action-group">
                   <Button
                     type="submit"
                     variant="secondary"
@@ -362,21 +414,23 @@ export default function Ingestion() {
                   />
                 </div>
               ) : null}
-              <div className="row-subtitle">
-                Deep Search reviews all available source records for the selected codes and may take significantly longer on DIBBS.
-              </div>
-              <div className="simple-list">
-                <div className="simple-list-row">
-                  <div className="row-title">Search</div>
-                  <div className="row-subtitle">Runs a quick pass across the codes you entered and keeps the result set small enough to review fast.</div>
+              <div className="ingest-manual-guidance">
+                <div className="row-subtitle">
+                  Deep Search reviews all available source records for the selected codes and may take significantly longer on DIBBS.
                 </div>
-                <div className="simple-list-row">
-                  <div className="row-title">Deep Search</div>
-                  <div className="row-subtitle">Keeps going through every available page for those codes. Use it when you want full coverage and do not mind waiting.</div>
-                </div>
-                <div className="simple-list-row">
-                  <div className="row-title">Bulk Download PDFs</div>
-                  <div className="row-subtitle">Downloads the main solicitation PDFs for DIBBS results so you can mine vendor and part details later.</div>
+                <div className="simple-list">
+                  <div className="simple-list-row">
+                    <div className="row-title">Search</div>
+                    <div className="row-subtitle">Runs a quick pass across the codes you entered and keeps the result set small enough to review fast.</div>
+                  </div>
+                  <div className="simple-list-row">
+                    <div className="row-title">Deep Search</div>
+                    <div className="row-subtitle">Keeps going through every available page for those codes. Use it when you want full coverage and do not mind waiting.</div>
+                  </div>
+                  <div className="simple-list-row">
+                    <div className="row-title">Bulk Download PDFs</div>
+                    <div className="row-subtitle">Downloads the main solicitation PDFs for DIBBS results so you can mine vendor and part details later.</div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -385,6 +439,34 @@ export default function Ingestion() {
       </div>
 
       <Card title="Search Results">
+        <div className="ingest-results-header">
+          <div>
+            <div className="row-title">{searchStateLabel}</div>
+            <div className="panel-subtitle">
+              {isSearching
+                ? 'The latest search is still running. Progress will update here as each source finishes its steps.'
+                : result
+                  ? 'Review the latest source coverage and opportunity updates below.'
+                  : 'Results from saved profile searches, custom searches, and PDF download runs will appear here.'}
+            </div>
+          </div>
+          {result ? (
+            <div className="ingest-results-totals">
+              <div className="ingest-results-total">
+                <span>New</span>
+                <strong>{resultTotals.inserted ?? 0}</strong>
+              </div>
+              <div className="ingest-results-total">
+                <span>Updated</span>
+                <strong>{resultTotals.updated ?? 0}</strong>
+              </div>
+              <div className="ingest-results-total">
+                <span>Current</span>
+                <strong>{resultTotals.skipped ?? 0}</strong>
+              </div>
+            </div>
+          ) : null}
+        </div>
         {isSearching ? (
           <div className="search-progress-box">
             <div className="search-progress-header">
@@ -408,7 +490,7 @@ export default function Ingestion() {
         ) : activeJob?.status === 'failed' ? (
           <div className="form-error">{activeJob.error || 'Search failed.'}</div>
         ) : !result ? (
-          <EmptyState title="No search run yet" subtitle="Run the company profile search for the normal workflow, or use manual search for a focused DIBBS/SAM lookup." />
+          <EmptyState title="No search run yet" subtitle="Start with the saved company profile search for the normal workflow, or run a custom search for one focused DIBBS or SAM check." />
         ) : isPdfDownloadJob ? (
           <div className="ingest-summary-grid">
             <div className="ingest-source-card ingest-overall-card">

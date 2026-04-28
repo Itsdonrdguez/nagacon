@@ -1,11 +1,18 @@
 import { useState } from 'react'
 
-export default function Tabs({ tabs = [] }) {
-  const [activeTab, setActiveTab] = useState(0)
+export default function Tabs({ tabs = [], activeTab: controlledActiveTab = null, onChange = null }) {
+  const [internalActiveTab, setInternalActiveTab] = useState(0)
+  const activeTab = Number.isInteger(controlledActiveTab) ? controlledActiveTab : internalActiveTab
 
   if (tabs.length === 0) return null
 
   const active = tabs[activeTab] || tabs[0]
+  const setActiveTab = (idx) => {
+    if (!Number.isInteger(controlledActiveTab)) {
+      setInternalActiveTab(idx)
+    }
+    onChange?.(idx)
+  }
 
   return (
     <div className="tabs-container">

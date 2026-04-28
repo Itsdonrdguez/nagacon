@@ -113,6 +113,28 @@ const formatDateOnly = (value) => {
   })
 }
 
+const titleCaseWords = (value) => value.replace(/\b\w+/g, (word) => {
+  const upper = word.toUpperCase()
+  if (['NSN', 'NAICS', 'FSC', 'PSC', 'PDF', 'RFQ', 'DIBBS', 'SAM', 'CAGE', 'POC', 'AI'].includes(upper)) return upper
+  return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+})
+
+const humanizeLabel = (value, fallback = 'Not set') => {
+  const raw = String(value || '').trim()
+  if (!raw) return fallback
+  const normalized = raw.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
+  const exact = {
+    no_bid: 'No bid',
+    not_bid: 'No bid',
+    in_progress: 'In progress',
+    not_requested: 'Not requested',
+    partial_success: 'Needs attention',
+  }
+  const key = normalized.toLowerCase().replace(/\s+/g, '_')
+  if (exact[key]) return exact[key]
+  return titleCaseWords(normalized)
+}
+
 const normalizeInlineText = (value) => String(value || '').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
 
 const formatBriefText = (value, { punctuate = true } = {}) => {
@@ -273,6 +295,20 @@ export default function Workspace() {
   const [selectedFileId, setSelectedFileId] = useState(null)
   const [activeIntakeJobId, setActiveIntakeJobId] = useState(null)
   const [quoteFilter, setQuoteFilter] = useState('all')
+  const [activeTab, setActiveTab] = useState(0)
+  const [secondaryDataReady, setSecondaryDataReady] = useState(false)
+
+  const tabIndexes = {
+    overview: 0,
+    vendors: 1,
+    documents: 2,
+    submissionPackage: 3,
+    submission: 4,
+  }
+
+  const needsVendorData = activeTab === tabIndexes.overview || activeTab === tabIndexes.vendors || activeTab === tabIndexes.submissionPackage || activeTab === tabIndexes.submission
+  const needsDocumentData = activeTab === tabIndexes.overview || activeTab === tabIndexes.documents || activeTab === tabIndexes.submissionPackage
+  const needsNsnData = activeTab === tabIndexes.vendors || activeTab === tabIndexes.submissionPackage
 
   const workspaceQuery = useQuery({
     queryKey: ['workspace', id],
@@ -282,7 +318,18 @@ export default function Workspace() {
     },
     enabled: !!id,
     retry: 1,
+    staleTime: 30000,
+    refetchOnWindowFocus: false,
   })
+
+  useEffect(() => {
+    if (!workspaceQuery.isSuccess) {
+      setSecondaryDataReady(false)
+      return
+    }
+    const timer = window.setTimeout(() => setSecondaryDataReady(true), 150)
+    return () => window.clearTimeout(timer)
+  }, [workspaceQuery.isSuccess, id])
 
   const pipelineQuery = useQuery({
     queryKey: ['pipeline-by-opp', id],
@@ -292,6 +339,8 @@ export default function Workspace() {
     },
     enabled: !!id,
     retry: false,
+    staleTime: 30000,
+    refetchOnWindowFocus: false,
   })
 
   const filesQuery = useQuery({
@@ -300,8 +349,10 @@ export default function Workspace() {
       const res = await api.get('/api/files/list', { params: { opportunity_id: id } })
       return res.data
     },
-    enabled: !!id,
+    enabled: !!id && secondaryDataReady && needsDocumentData,
     retry: false,
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
   })
   const fileInsightsQuery = useQuery({
     queryKey: ['workspace-file-insights', selectedFileId],
@@ -309,8 +360,10 @@ export default function Workspace() {
       const res = await api.get(`/api/files/${selectedFileId}/insights`)
       return res.data
     },
-    enabled: !!selectedFileId,
+    enabled: !!selectedFileId && activeTab === tabIndexes.documents,
     retry: false,
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
   })
   const vendorLeadsQuery = useQuery({
     queryKey: ['vendor-leads', id],
@@ -318,8 +371,10 @@ export default function Workspace() {
       const res = await api.get('/api/vendors/leads', { params: { opportunity_id: id } })
       return res.data
     },
-    enabled: !!id,
+    enabled: !!id && secondaryDataReady && needsVendorData,
     retry: false,
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
   })
   const vendorQuotesQuery = useQuery({
     queryKey: ['vendor-quotes', id],
@@ -327,8 +382,10 @@ export default function Workspace() {
       const res = await api.get('/api/vendors/quotes', { params: { opportunity_id: id } })
       return res.data
     },
-    enabled: !!id,
+    enabled: !!id && secondaryDataReady && needsVendorData,
     retry: false,
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
   })
   const usaspendingResearchQuery = useQuery({
     queryKey: ['workspace-usaspending', id],
@@ -345,8 +402,10 @@ export default function Workspace() {
       const res = await api.get('/api/workspace/intelligence/nsn', { params: { opp_id: id } })
       return res.data
     },
-    enabled: !!id,
+    enabled: !!id && secondaryDataReady && needsNsnData,
     retry: false,
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
   })
 
   const ensurePipelineMutation = useMutation({
@@ -417,12 +476,13 @@ export default function Workspace() {
     enabled: Boolean(activeIntakeJobId),
     refetchInterval: (query) => {
       const status = query.state.data?.status
-      return status === 'success' || status === 'failed' ? false : 1500
+      return status === 'success' || status === 'failed' ? false : 3000
     },
     queryFn: async () => {
       const res = await api.get(`/api/search-jobs/${activeIntakeJobId}`)
       return res.data
     },
+    refetchOnWindowFocus: false,
   })
   const activeIntakeJob = intakeJobQuery.data
   const isIntakeRunning = activeIntakeJob && !['success', 'failed'].includes(activeIntakeJob.status)
@@ -693,7 +753,7 @@ export default function Workspace() {
 
   const data = workspaceQuery.data
   const opp = data?.opportunity || {}
-  const files = filesQuery.data || []
+  const files = filesQuery.data || data?.files || []
   const hasRealDocuments = files.some((file) => String(file?.file_type || '').toUpperCase() !== 'PDF_FALLBACK_SNAPSHOT')
   const visibleFiles = hasRealDocuments
     ? files.filter((file) => String(file?.file_type || '').toUpperCase() !== 'PDF_FALLBACK_SNAPSHOT')
@@ -895,7 +955,7 @@ export default function Workspace() {
     complianceArtifact ? 'Compliance brief is available.' : null,
     quoteComparison.some((quote) => quote.normalized_status === 'RECEIVED') ? 'At least one vendor quote has been received.' : null,
     recommendedQuote?.hasPrice ? `Recommended vendor candidate identified: ${recommendedQuote.company_name || recommendedQuote.cage}.` : null,
-    submission?.status && submission.status !== 'DRAFT' ? `Submission status is ${submission.status}.` : null,
+    submission?.status && submission.status !== 'DRAFT' ? `Submission status is ${humanizeLabel(submission.status, 'Draft')}.` : null,
   ].filter(Boolean)))
 
   const contractAboutText = [
@@ -1442,7 +1502,7 @@ export default function Workspace() {
                   disabled={isClosedSolicitation}
                   onClick={() => updateDecisionStatus(option)}
                 >
-                  {option.replace('_', ' ')}
+                  {humanizeLabel(option)}
                 </button>
               ))}
             </div>
@@ -1545,7 +1605,7 @@ export default function Workspace() {
                     {`${readinessReadyCount} of ${readinessChecks.length} readiness signals are in place. ${readinessPendingCount} item${readinessPendingCount === 1 ? '' : 's'} still need attention.`}
                   </div>
                   <div className="panel-subtitle">
-                    Submission state: {submission?.status || 'DRAFT'}
+                    Submission state: {humanizeLabel(submission?.status, 'Draft')}
                   </div>
                 </div>
 
@@ -1796,7 +1856,7 @@ export default function Workspace() {
                     <div className="artifact-note-box">
                       <div className="row-title">{recommendedQuote?.id === quote.id ? 'Recommended Quote Candidate' : 'Quote Snapshot'}</div>
                       <div className="panel-subtitle">
-                        Status: {quoteComparison.find((item) => item.id === quote.id)?.normalized_status || quote.status || '-'}
+                        Status: {humanizeLabel(quoteComparison.find((item) => item.id === quote.id)?.normalized_status || quote.status, '-')}
                         {quote.unit_price ? ` | ${formatCurrency(quote.unit_price)}` : ''}
                         {quote.lead_time_days ? ` | ${quote.lead_time_days} day lead time` : ''}
                       </div>
@@ -2465,7 +2525,7 @@ export default function Workspace() {
                       }
                     >
                       {TASK_STATUSES.map((status) => (
-                        <option key={status} value={status}>{status.replace('_', ' ')}</option>
+                        <option key={status} value={status}>{humanizeLabel(status)}</option>
                       ))}
                     </select>
                   </div>
@@ -3217,7 +3277,7 @@ export default function Workspace() {
               <div className="panel-subtitle">
                 {isClosedSolicitation
                   ? 'Submission updates are disabled because the solicitation is closed.'
-                  : `Current status: ${submission?.status || 'DRAFT'}${submission?.planned_vendor_name || submission?.planned_vendor_cage ? ` | Planned vendor: ${submission?.planned_vendor_name || submission?.planned_vendor_cage}` : ''}`}
+                  : `Current status: ${humanizeLabel(submission?.status, 'Draft')}${submission?.planned_vendor_name || submission?.planned_vendor_cage ? ` | Planned vendor: ${submission?.planned_vendor_name || submission?.planned_vendor_cage}` : ''}`}
               </div>
             </div>
           </div>
@@ -3596,7 +3656,7 @@ export default function Workspace() {
           {opp.set_aside_type ? <Badge label={setAsideBadgeLabel(opp.set_aside_type)} variant={setAsideBadgeVariant(opp.set_aside_type)} /> : null}
         </div>
       </div>
-      <Tabs tabs={tabs} />
+      <Tabs tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
     </div>
   )
 }

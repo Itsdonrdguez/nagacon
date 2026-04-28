@@ -6,6 +6,8 @@
 
 .tabs-nav {
   display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
   border-bottom: 1px solid #e5e7eb;
   margin-bottom: 1.5rem;
 }
@@ -22,6 +24,7 @@
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  border-radius: 8px 8px 0 0;
 }
 
 .tab-button:hover {
@@ -39,4 +42,22 @@
 
 .tab-content {
   flex: 1;
+}
+
+@media (max-width: 720px) {
+  .tabs-nav {
+    border-bottom: none;
+    margin-bottom: 1rem;
+  }
+
+  .tab-button {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    flex: 1 1 calc(50% - 0.25rem);
+    justify-content: center;
+  }
+
+  .tab-button.active {
+    border-color: #2563eb;
+  }
 }

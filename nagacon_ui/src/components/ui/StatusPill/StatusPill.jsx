@@ -21,11 +21,26 @@ const STATUS_VARIANTS = {
   not_bid: 'error',
 }
 
+const STATUS_LABELS = {
+  partial_success: 'Needs Attention',
+  in_progress: 'In Progress',
+  no_bid: 'No Bid',
+  not_bid: 'No Bid',
+  not_requested: 'Not Requested',
+}
+
 function normalizeStatus(status) {
-  return String(status || 'Unknown')
+  const raw = String(status || 'Unknown')
     .trim()
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
+  const key = raw.toLowerCase().replace(/\s+/g, '_')
+  if (STATUS_LABELS[key]) return STATUS_LABELS[key]
+  return raw.replace(/\b\w+/g, (word) => {
+    const upper = word.toUpperCase()
+    if (['NSN', 'NAICS', 'FSC', 'PSC', 'PDF', 'RFQ', 'DIBBS', 'SAM', 'CAGE'].includes(upper)) return upper
+    return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+  })
 }
 
 function variantForStatus(status) {

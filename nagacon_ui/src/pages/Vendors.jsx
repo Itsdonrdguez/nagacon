@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import {
   EmptyState,
@@ -16,6 +17,7 @@ import {
 } from '../components/ui'
 
 export default function Vendors() {
+  const [searchParams] = useSearchParams()
   const [form, setForm] = useState({
     naics_code: '621910',
     keywords: 'medical, transportation',
@@ -30,17 +32,30 @@ export default function Vendors() {
   const [providerError, setProviderError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [isProviderLoading, setIsProviderLoading] = useState(false)
+  const [appliedPrefillKey, setAppliedPrefillKey] = useState('')
 
-  async function executeSearch() {
+  const todayContext = useMemo(() => {
+    if (searchParams.get('source') !== 'today') return null
+    return {
+      title: searchParams.get('title') || '',
+      solicitation: searchParams.get('sol') || '',
+      agency: searchParams.get('agency') || '',
+      nsn: searchParams.get('nsn') || '',
+      fsc: searchParams.get('fsc') || '',
+      q: searchParams.get('q') || '',
+    }
+  }, [searchParams])
+
+  async function executeSearch(nextForm = form) {
     setError('')
     setIsLoading(true)
 
     try {
       const payload = {
-        ...form,
-        keywords: form.keywords.split(',').map((item) => item.trim()).filter(Boolean),
-        page: Number(form.page),
-        limit: Number(form.limit),
+        ...nextForm,
+        keywords: String(nextForm.keywords || '').split(',').map((item) => item.trim()).filter(Boolean),
+        page: Number(nextForm.page),
+        limit: Number(nextForm.limit),
       }
       const res = await api.post('/api/vendors/usaspending/search', payload)
       setData(res.data)
@@ -57,15 +72,15 @@ export default function Vendors() {
     await executeSearch()
   }
 
-  async function executeProviderSearch() {
+  async function executeProviderSearch(nextProviderForm = providerForm) {
     setProviderError('')
     setIsProviderLoading(true)
     try {
       const res = await api.get('/api/providers', {
         params: {
-          q: providerForm.q || undefined,
-          nsn: providerForm.nsn || undefined,
-          fsc: providerForm.fsc || undefined,
+          q: nextProviderForm.q || undefined,
+          nsn: nextProviderForm.nsn || undefined,
+          fsc: nextProviderForm.fsc || undefined,
           limit: 25,
         },
       })
@@ -83,6 +98,32 @@ export default function Vendors() {
     await executeProviderSearch()
   }
 
+  useEffect(() => {
+    const currentKey = searchParams.toString()
+    if (!currentKey || currentKey === appliedPrefillKey || !todayContext) return
+
+    const nextProviderForm = {
+      q: todayContext.q || '',
+      nsn: todayContext.nsn || '',
+      fsc: todayContext.fsc || '',
+    }
+    const hasProviderPrefill = Boolean(nextProviderForm.q || nextProviderForm.nsn || nextProviderForm.fsc)
+    if (hasProviderPrefill) {
+      setProviderForm(nextProviderForm)
+      executeProviderSearch(nextProviderForm)
+    }
+
+    const nextAwardForm = {
+      ...form,
+      awarding_agency: todayContext.agency || form.awarding_agency,
+    }
+    if (todayContext.agency && !hasProviderPrefill) {
+      setForm(nextAwardForm)
+    }
+
+    setAppliedPrefillKey(currentKey)
+  }, [appliedPrefillKey, form, searchParams, todayContext])
+
   return (
     <div className="page">
       <div className="page-header">
@@ -92,6 +133,23 @@ export default function Vendors() {
           <div className="page-subtitle">Search likely awardees and vendor signals with a cleaner intelligence view.</div>
         </div>
       </div>
+
+      {todayContext ? (
+        <Card title="Picked Up From Today" className="research-warning-box">
+          <div className="row-title">{todayContext.title || 'Opportunity context loaded'}</div>
+          <div className="row-subtitle">
+            {[
+              todayContext.solicitation,
+              todayContext.agency,
+              todayContext.nsn ? `NSN ${todayContext.nsn}` : '',
+              todayContext.fsc ? `FSC ${todayContext.fsc}` : '',
+            ].filter(Boolean).join(' | ')}
+          </div>
+          <div className="panel-subtitle">
+            We prefilled vendor research using the opportunity context from Today so you can keep moving without retyping the basics.
+          </div>
+        </Card>
+      ) : null}
 
       <Card title="USAspending Search">
         <form className="form-grid" onSubmit={runSearch}>

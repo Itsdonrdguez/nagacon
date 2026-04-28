@@ -60,6 +60,7 @@ def _opp_payload(opp: Opportunity) -> dict[str, Any]:
         "solicitation_number": opp.solicitation_number,
         "source": opp.source,
         "agency": opp.agency,
+        "fsc": getattr(opp, "fsc", None),
         "due_at": opp.due_at.isoformat() if opp.due_at else None,
         "workspace_url": f"/workspace/{opp.id}",
     }
@@ -311,6 +312,7 @@ def build_daily_work_queue(
             continue
         days_left = _days_until(opp.due_at, current_time)
         is_open = days_left is None or days_left >= 0
+        nsn = _extract_nsn(opp)
         if days_left is not None and 0 <= days_left <= 7:
             priority = HIGH if days_left <= 2 else MEDIUM
             items.append(_item(
@@ -331,10 +333,15 @@ def build_daily_work_queue(
                 "Find vendor leads",
                 "No vendor leads are attached to this opportunity yet.",
                 action_label="Open Vendor Research",
-                meta={"lead_count": 0},
+                meta={
+                    "lead_count": 0,
+                    "nsn": nsn,
+                    "fsc": getattr(opp, "fsc", None),
+                    "title": getattr(opp, "display_title", None) or opp.title,
+                    "agency": getattr(opp, "agency", None),
+                },
             ))
 
-        nsn = _extract_nsn(opp)
         if is_open and nsn and part_finder_counts.get(opp.id, 0) == 0:
             items.append(_item(
                 "MISSING_PART_FINDER",

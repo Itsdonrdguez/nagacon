@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import {
@@ -52,8 +53,10 @@ function SectionList({ items, empty }) {
 
 export default function NSNIntelligence() {
   const queryClient = useQueryClient()
-  const [input, setInput] = useState(DEFAULT_NSN)
-  const [submittedNsn, setSubmittedNsn] = useState(DEFAULT_NSN)
+  const [searchParams] = useSearchParams()
+  const initialNsn = normalizeSearch(searchParams.get('nsn')) || DEFAULT_NSN
+  const [input, setInput] = useState(initialNsn)
+  const [submittedNsn, setSubmittedNsn] = useState(initialNsn)
   const [buildJobId, setBuildJobId] = useState(null)
   const [autoImportedNsns, setAutoImportedNsns] = useState({})
 
@@ -162,6 +165,15 @@ export default function NSNIntelligence() {
   const buildJobDone = buildJob?.status === 'success'
   const buildJobFailed = buildJob?.status === 'failed'
   const awardSignalCount = Number(awards.count || 0) + Number(nsnAwardEvidence.count || 0)
+  const todayContext = useMemo(() => {
+    if (searchParams.get('source') !== 'today') return null
+    return {
+      mode: searchParams.get('mode') || 'lookup',
+      title: searchParams.get('title') || '',
+      solicitation: searchParams.get('sol') || '',
+      nsn: normalizeSearch(searchParams.get('nsn')),
+    }
+  }, [searchParams])
 
   useEffect(() => {
     if (!buildJobDone) return
@@ -185,6 +197,13 @@ export default function NSNIntelligence() {
     importPublogMutation,
     publogStatusQuery.data?.status,
   ])
+
+  useEffect(() => {
+    const prefilledNsn = normalizeSearch(searchParams.get('nsn'))
+    if (!prefilledNsn || prefilledNsn === submittedNsn) return
+    setInput(prefilledNsn)
+    setSubmittedNsn(prefilledNsn)
+  }, [searchParams, submittedNsn])
 
   const summaryStats = useMemo(() => ([
     { label: 'Vendor Candidates', value: numberLabel(recommendations.length), subtitle: data?.confidence?.has_vendor_recommendations ? 'Ranked by evidence' : 'Needs more evidence' },
@@ -217,6 +236,20 @@ export default function NSNIntelligence() {
           </div>
         </div>
       </div>
+
+      {todayContext ? (
+        <Card title="Picked Up From Today" className="research-warning-box">
+          <div className="row-title">
+            {todayContext.mode === 'build' ? 'Recommended next step: Build intelligence' : 'Recommended next step: Review this NSN'}
+          </div>
+          <div className="row-subtitle">
+            {[todayContext.solicitation, todayContext.title, todayContext.nsn ? `NSN ${todayContext.nsn}` : ''].filter(Boolean).join(' | ')}
+          </div>
+          <div className="panel-subtitle">
+            We carried the NSN over from Today so you can keep researching without starting over.
+          </div>
+        </Card>
+      ) : null}
 
       <Card title="Lookup">
         <form className="nsn-search-form" onSubmit={handleSearch}>

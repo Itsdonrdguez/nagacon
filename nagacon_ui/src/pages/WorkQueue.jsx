@@ -102,6 +102,56 @@ const PRIMARY_ACTIONS = {
   },
 }
 
+function buildVendorResearchUrl(item) {
+  const params = new URLSearchParams()
+  params.set('source', 'today')
+  params.set('opportunity_id', String(item.opportunity?.id || ''))
+  if (item.meta?.title || item.opportunity?.title) params.set('title', item.meta?.title || item.opportunity?.title)
+  if (item.meta?.agency || item.opportunity?.agency) params.set('agency', item.meta?.agency || item.opportunity?.agency)
+  if (item.opportunity?.solicitation_number) params.set('sol', item.opportunity.solicitation_number)
+  if (item.meta?.nsn) params.set('nsn', item.meta.nsn)
+  if (item.meta?.fsc || item.opportunity?.fsc) params.set('fsc', item.meta?.fsc || item.opportunity?.fsc)
+  if (item.meta?.title || item.opportunity?.title) params.set('q', item.meta?.title || item.opportunity?.title)
+  return `/vendors?${params.toString()}`
+}
+
+function buildNsnIntelligenceUrl(item, mode = 'lookup') {
+  const params = new URLSearchParams()
+  params.set('source', 'today')
+  params.set('mode', mode)
+  params.set('opportunity_id', String(item.opportunity?.id || ''))
+  if (item.opportunity?.solicitation_number) params.set('sol', item.opportunity.solicitation_number)
+  if (item.opportunity?.title) params.set('title', item.opportunity.title)
+  if (item.meta?.nsn) params.set('nsn', item.meta.nsn)
+  return `/nsn-intelligence?${params.toString()}`
+}
+
+function recommendedActionLink(item) {
+  if (!item) return { to: item?.action_url || '/work-queue', label: 'Open Workspace' }
+  if (item.type === 'MISSING_VENDOR_LEADS') {
+    return { to: buildVendorResearchUrl(item), label: 'Start Vendor Research' }
+  }
+  if (item.type === 'MISSING_PART_FINDER') {
+    return { to: buildNsnIntelligenceUrl(item, 'lookup'), label: 'Analyze This NSN' }
+  }
+  if (item.type === 'NSN_INTELLIGENCE_REFRESH') {
+    return { to: buildNsnIntelligenceUrl(item, 'build'), label: 'Open NSN Intelligence' }
+  }
+  if (item.type === 'RFQ_CLOSING_SOON') {
+    return { to: item.action_url, label: 'Review RFQ' }
+  }
+  if (item.type === 'MISSING_SUBMISSION_PACKAGE') {
+    return { to: item.action_url, label: 'Prepare Submission' }
+  }
+  if (item.type === 'QUOTE_REQUESTED_NO_RESPONSE') {
+    return { to: item.action_url, label: 'Review Quote Progress' }
+  }
+  if (item.type === 'AWARDEE_ENRICHMENT_READY') {
+    return { to: item.action_url, label: 'Review Closed Intelligence' }
+  }
+  return { to: item.action_url, label: item.action_label || 'Open Workspace' }
+}
+
 function groupActionItems(items) {
   const groups = new Map()
   for (const item of items) {
@@ -454,6 +504,7 @@ export default function WorkQueue() {
             {groupedVisibleItems.map((group) => {
               const item = group.primary
               const actionMeta = primaryActionMeta(item)
+              const recommendedAction = recommendedActionLink(item)
               const supportingLabels = [item.type, ...group.additionalItems.map((entry) => entry.type)]
               return (
                 <div key={group.opportunity?.id || item.id} className={`work-queue-item work-queue-${String(item.priority || '').toLowerCase()} work-queue-item-spotlight`}>
@@ -489,6 +540,9 @@ export default function WorkQueue() {
                     ) : null}
                   </div>
                   <div className="work-queue-actions">
+                    <Link className="btn btn-sm" to={recommendedAction.to}>
+                      {recommendedAction.label}
+                    </Link>
                     {directActionLabel(item) ? (
                       <Button
                         size="sm"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,7 @@ from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.publog_sync import sync_publog_package
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
 from app.services.providers.provider_backfill import run_provider_backfill
+from app.services.worker_traceback_report import write_worker_traceback_report
 
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
@@ -327,7 +329,31 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
             progress={**(_jobs.get(job_id, {}).get("progress") or {}), "percent": 100},
         )
     except Exception as exc:
-        _update_job(job_id, status="failed", error=str(exc), completed_at=_now())
+        traceback_text = traceback.format_exc()
+        report_path = write_worker_traceback_report(
+            job_id=job_id,
+            kind=kind,
+            payload=payload,
+            error=str(exc),
+            traceback_text=traceback_text,
+        )
+        print(
+            f"[worker] job {job_id} ({kind}) failed; traceback report written to {report_path}\n"
+            f"{traceback_text}"
+        )
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            result={
+                "_worker_failure": {
+                    "error": str(exc),
+                    "traceback": traceback_text,
+                    "report_path": report_path,
+                }
+            },
+            completed_at=_now(),
+        )
     finally:
         db.close()
 

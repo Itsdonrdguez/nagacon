@@ -62,7 +62,6 @@ export default function WorkQueue() {
   const data = workQueueQuery.data || {}
   const items = data.items || []
   const inProgressItems = data.in_progress_items || []
-  const recentCompletedItems = data.recent_completed_items || []
   const recentFailedItems = data.recent_failed_items || []
   const summary = data.summary || {}
   const inProgressSummary = data.in_progress_summary || {}
@@ -258,7 +257,7 @@ export default function WorkQueue() {
             </div>
           </div>
         ) : null}
-        {visibleItems.length === 0 && inProgressItems.length === 0 && recentCompletedItems.length === 0 && recentFailedItems.length === 0 ? (
+        {visibleItems.length === 0 && inProgressItems.length === 0 && recentFailedItems.length === 0 ? (
           <EmptyState
             title="No work items match this filter"
             subtitle="Try another filter or refresh the queue."
@@ -283,37 +282,6 @@ export default function WorkQueue() {
                       {item.subtitle}
                       {isRunning && queueState.progress?.current_label ? ` | ${queueState.progress.current_label}` : ''}
                       {!isRunning && queueState.created_at ? ` | queued ${formatDate(queueState.created_at)}` : ''}
-                    </div>
-                    <div className="row-subtitle">
-                      {compactMeta([
-                        item.opportunity?.source,
-                        item.opportunity?.solicitation_number,
-                        item.opportunity?.agency,
-                      ])}
-                    </div>
-                  </div>
-                  <div className="work-queue-actions">
-                    <Link className="btn btn-secondary btn-sm" to={item.action_url}>
-                      {item.action_label || 'Open Workspace'}
-                    </Link>
-                  </div>
-                </div>
-              )
-            })}
-            {recentCompletedItems.map((item) => {
-              const queueState = item.queue_state || {}
-              return (
-                <div key={`completed-${item.id}`} className="work-queue-item work-queue-low">
-                  <div className="work-queue-item-main">
-                    <div className="work-queue-item-header">
-                      <Badge label="COMPLETED" variant="success" />
-                      <Badge label={TYPE_LABELS[item.type] || item.type} variant="info" />
-                      {queueState.completed_at ? <span className="row-subtitle">{formatDate(queueState.completed_at)}</span> : null}
-                    </div>
-                    <div className="row-title">{item.title}</div>
-                    <div className="panel-subtitle">
-                      {item.subtitle}
-                      {' | recently completed; will return if the opportunity changes'}
                     </div>
                     <div className="row-subtitle">
                       {compactMeta([

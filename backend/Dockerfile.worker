@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -e .
+
+CMD ["python", "-m", "app.workers.search_jobs_worker", "--poll-seconds", "2", "--concurrency", "4"]

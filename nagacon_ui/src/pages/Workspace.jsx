@@ -297,6 +297,10 @@ export default function Workspace() {
   const [quoteFilter, setQuoteFilter] = useState('all')
   const [activeTab, setActiveTab] = useState(0)
   const [secondaryDataReady, setSecondaryDataReady] = useState(false)
+  const [isCompactWorkspace, setIsCompactWorkspace] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.matchMedia('(max-width: 720px)').matches
+  })
 
   const tabIndexes = {
     overview: 0,
@@ -330,6 +334,15 @@ export default function Workspace() {
     const timer = window.setTimeout(() => setSecondaryDataReady(true), 150)
     return () => window.clearTimeout(timer)
   }, [workspaceQuery.isSuccess, id])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    const mediaQuery = window.matchMedia('(max-width: 720px)')
+    const updateMatch = () => setIsCompactWorkspace(mediaQuery.matches)
+    updateMatch()
+    mediaQuery.addEventListener('change', updateMatch)
+    return () => mediaQuery.removeEventListener('change', updateMatch)
+  }, [])
 
   const pipelineQuery = useQuery({
     queryKey: ['pipeline-by-opp', id],
@@ -2241,6 +2254,37 @@ export default function Workspace() {
               title="No documents yet"
               subtitle={data.ui_hints?.empty_artifacts_message || 'Use Download Documents to fetch files for this opportunity.'}
             />
+          ) : isCompactWorkspace ? (
+            <div className="workspace-mobile-card-list">
+              {visibleFiles.map((file) => (
+                <div key={file.id} className="workspace-mobile-card">
+                  <button
+                    type="button"
+                    className={`document-select-button ${selectedFileId === file.id ? 'selected' : ''}`}
+                    onClick={() => setSelectedFileId(file.id)}
+                  >
+                    {file.filename}
+                  </button>
+                  <div className="workspace-mobile-card-meta">
+                    <StatusPill status={getDocumentStatusLabel(file)} />
+                    {file.review_required ? (
+                      <div className="panel-subtitle">Review recommended</div>
+                    ) : null}
+                  </div>
+                  <div className="workspace-mobile-card-actions">
+                    <a className="action-btn-small" href={`${API_BASE_URL}/api/files/download/${file.id}`} target="_blank" rel="noreferrer">Download</a>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={parseFileMutation.isPending && parseFileMutation.variables === file.id}
+                      onClick={() => parseFileMutation.mutate(file.id)}
+                    >
+                      {getDocumentStatusLabel(file) === 'Failed' ? 'Retry' : 'Reprocess'}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
           ) : (
             <Table>
               <TableHeader>

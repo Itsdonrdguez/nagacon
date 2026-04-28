@@ -221,20 +221,26 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     try:
         analysis = db.query(OpportunityAnalysis).filter(OpportunityAnalysis.opportunity_id == opp_id).first()
     except Exception:
+        _safe_session_call(db, "rollback")
         analysis = None
 
     try:
         vendor_matches = _vendor_match_repo(db, org_id).list_by_opportunity_id(opp_id)
     except Exception:
+        _safe_session_call(db, "rollback")
         vendor_matches = []
 
     vendor_ids = [getattr(v, "vendor_id", None) for v in vendor_matches if getattr(v, "vendor_id", None) is not None]
     vendor_lookup = {}
     if vendor_ids:
-        vendor_lookup = {
-            lead.id: lead
-            for lead in db.query(VendorLead).filter(VendorLead.id.in_(vendor_ids)).all()
-        }
+        try:
+            vendor_lookup = {
+                lead.id: lead
+                for lead in db.query(VendorLead).filter(VendorLead.id.in_(vendor_ids)).all()
+            }
+        except Exception:
+            _safe_session_call(db, "rollback")
+            vendor_lookup = {}
 
     vendor_matches = [
         {
@@ -297,6 +303,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     try:
         pipeline_item = _pipeline_repo(db, org_id).get_by_opportunity_id(opp_id)
     except Exception:
+        _safe_session_call(db, "rollback")
         pipeline_item = None
 
     files_query = db.query(OpportunityFile).filter(OpportunityFile.opportunity_id == opp_id)

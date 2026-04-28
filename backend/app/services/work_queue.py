@@ -101,6 +101,14 @@ def _stable_json(value: Any) -> str:
         return str(value)
 
 
+def _freeze_signature_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _freeze_signature_value(inner)) for key, inner in value.items()))
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_freeze_signature_value(item) for item in value)
+    return value
+
+
 def _opportunity_fingerprint(opp: Opportunity, nsn: str | None = None) -> str:
     payload = {
         "id": opp.id,
@@ -526,7 +534,7 @@ def _job_signature(kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
         return (kind, payload.get("organization_id"), payload.get("opportunity_id"))
     if kind == "nsn_build":
         return (kind, payload.get("organization_id"), _normalize_nsn(payload.get("nsn")))
-    return (kind, payload.get("organization_id"), tuple(sorted((payload or {}).items())))
+    return (kind, payload.get("organization_id"), _freeze_signature_value(payload or {}))
 
 
 def _active_job_signatures(db: Session, organization_id: int | None) -> set[tuple[Any, ...]]:

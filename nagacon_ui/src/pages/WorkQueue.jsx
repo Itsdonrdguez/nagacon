@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { Badge, Button, Card, EmptyState, LoadingState } from '../components/ui'
@@ -44,6 +44,97 @@ const formatDate = (value) => {
 const compactMeta = (parts) => parts.filter(Boolean).join(' | ')
 
 const queueStatusLabel = (value) => String(value || '').toUpperCase() || 'QUEUED'
+
+const ACTION_RANK = {
+  QUOTE_FOLLOW_UP_DUE: 0,
+  RFQ_CLOSING_SOON: 1,
+  MISSING_VENDOR_LEADS: 2,
+  MISSING_PART_FINDER: 3,
+  MISSING_SUBMISSION_PACKAGE: 4,
+  AWARDEE_ENRICHMENT_READY: 5,
+  NSN_INTELLIGENCE_REFRESH: 6,
+  QUOTE_REQUESTED_NO_RESPONSE: 7,
+}
+
+const READINESS_LABELS = {
+  RFQ_CLOSING_SOON: 'Review due timing',
+  QUOTE_FOLLOW_UP_DUE: 'Vendor response needed',
+  QUOTE_REQUESTED_NO_RESPONSE: 'Quote still pending',
+  MISSING_VENDOR_LEADS: 'Vendor research missing',
+  MISSING_PART_FINDER: 'Part research missing',
+  MISSING_SUBMISSION_PACKAGE: 'Submission package missing',
+  AWARDEE_ENRICHMENT_READY: 'Closed item ready for enrichment',
+  NSN_INTELLIGENCE_REFRESH: 'NSN intelligence missing',
+}
+
+const PRIMARY_ACTIONS = {
+  QUOTE_FOLLOW_UP_DUE: {
+    heading: 'Follow up with vendor',
+    detail: 'A quote follow-up is due now. Log the outreach so the queue stops treating this like a waiting item.',
+  },
+  QUOTE_REQUESTED_NO_RESPONSE: {
+    heading: 'Check quote progress',
+    detail: 'A quote request exists, but no response is logged yet.',
+  },
+  RFQ_CLOSING_SOON: {
+    heading: 'Review the RFQ now',
+    detail: 'This solicitation is closing soon. Confirm the bid path before the window gets tighter.',
+  },
+  MISSING_VENDOR_LEADS: {
+    heading: 'Find vendor leads',
+    detail: 'There are no vendor leads attached yet, so vendor research is the best next move.',
+  },
+  MISSING_PART_FINDER: {
+    heading: 'Run Part Finder',
+    detail: 'This NSN has not been researched with Part Finder yet.',
+  },
+  MISSING_SUBMISSION_PACKAGE: {
+    heading: 'Prepare the submission package',
+    detail: 'Quote work exists, but the submission package has not been assembled yet.',
+  },
+  AWARDEE_ENRICHMENT_READY: {
+    heading: 'Enrich the closed award',
+    detail: 'This closed solicitation can improve vendor and award history for future bids.',
+  },
+  NSN_INTELLIGENCE_REFRESH: {
+    heading: 'Build NSN intelligence',
+    detail: 'This NSN still needs a saved intelligence record.',
+  },
+}
+
+function groupActionItems(items) {
+  const groups = new Map()
+  for (const item of items) {
+    const oppId = item.opportunity?.id || item.id
+    const current = groups.get(oppId) || {
+      opportunity: item.opportunity,
+      items: [],
+    }
+    current.items.push(item)
+    groups.set(oppId, current)
+  }
+  return Array.from(groups.values())
+    .map((group) => {
+      const sorted = [...group.items].sort((a, b) => {
+        const priorityOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 }
+        const priorityGap = (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9)
+        if (priorityGap !== 0) return priorityGap
+        return (ACTION_RANK[a.type] ?? 99) - (ACTION_RANK[b.type] ?? 99)
+      })
+      const primary = sorted[0]
+      return {
+        ...group,
+        primary,
+        additionalItems: sorted.slice(1),
+      }
+    })
+    .sort((a, b) => {
+      const priorityOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 }
+      const primaryGap = (priorityOrder[a.primary?.priority] ?? 9) - (priorityOrder[b.primary?.priority] ?? 9)
+      if (primaryGap !== 0) return primaryGap
+      return (a.primary?.due_at || '9999').localeCompare(b.primary?.due_at || '9999')
+    })
+}
 
 export default function WorkQueue() {
   const [filter, setFilter] = useState('all')
@@ -150,6 +241,13 @@ export default function WorkQueue() {
     if (filter === 'all') return true
     return item.priority === filter || item.type === filter
   })
+  const groupedVisibleItems = useMemo(() => groupActionItems(visibleItems), [visibleItems])
+  const spotlightStats = useMemo(() => ([
+    { label: 'Total Actions', value: data.total || 0, subtitle: "Open items in today's queue" },
+    { label: 'High Priority', value: summary.HIGH || 0, subtitle: 'Needs attention first' },
+    { label: 'Closing Soon', value: summary.RFQ_CLOSING_SOON || 0, subtitle: 'Solicitations nearing deadline' },
+    { label: 'Vendor Leads', value: summary.MISSING_VENDOR_LEADS || 0, subtitle: 'Items still missing vendor coverage' },
+  ]), [data.total, summary])
   useEffect(() => {
     if (backgroundJobQuery.data?.status === 'success') {
       refreshQueue()
@@ -187,6 +285,10 @@ export default function WorkQueue() {
     if (item.type === 'NSN_INTELLIGENCE_REFRESH') return 'Queue NSN Build'
     return ''
   }
+  const primaryActionMeta = (item) => PRIMARY_ACTIONS[item?.type] || {
+    heading: item?.action_label || 'Open workspace',
+    detail: item?.subtitle || 'Open the workspace and continue the next step.',
+  }
 
   if (workQueueQuery.isLoading) {
     return (
@@ -214,19 +316,31 @@ export default function WorkQueue() {
     <div className="page">
       <div className="page-header">
         <div>
-          <div className="page-kicker">Daily Work Queue</div>
+          <div className="page-kicker">Mission Control</div>
           <h1 className="page-title">Today</h1>
-          <div className="page-subtitle">The highest-value actions across quotes, RFQs, vendor research, Part Finder, submissions, and closed solicitations.</div>
+          <div className="page-subtitle">Start with the next best action for each opportunity instead of sorting through a raw queue by hand.</div>
         </div>
-        <Button onClick={() => queueTodayMutation.mutate()} loading={queueTodayMutation.isPending}>
-          Queue Today's Work
-        </Button>
-        <Button variant="secondary" onClick={() => workQueueQuery.refetch()}>
-          Refresh
-        </Button>
-        <a className="btn btn-secondary btn-sm" href={`${api.defaults.baseURL}/api/export/work_queue.csv`}>
-          Export CSV
-        </a>
+        <div className="company-form-actions">
+          <Button onClick={() => queueTodayMutation.mutate()} loading={queueTodayMutation.isPending}>
+            Queue Today's Work
+          </Button>
+          <Button variant="secondary" onClick={() => workQueueQuery.refetch()}>
+            Refresh
+          </Button>
+          <a className="btn btn-secondary btn-sm" href={`${api.defaults.baseURL}/api/export/work_queue.csv`}>
+            Export CSV
+          </a>
+        </div>
+      </div>
+
+      <div className="stats-grid">
+        {spotlightStats.map((stat) => (
+          <Card key={stat.label} className="stat-card work-queue-stat">
+            <div className="stat-label">{stat.label}</div>
+            <div className="stat-value">{stat.value}</div>
+            <div className="stat-subtitle">{stat.subtitle}</div>
+          </Card>
+        ))}
       </div>
 
       <Card title="Action Filters">
@@ -244,7 +358,7 @@ export default function WorkQueue() {
         </div>
       </Card>
 
-      <Card title="Work Items">
+      <Card title="Recommended Next Steps">
         {queueTodayResult ? (
           <div className="settings-summary-box">
             <div className="row-title">Today's collection work queued</div>
@@ -257,7 +371,7 @@ export default function WorkQueue() {
             </div>
           </div>
         ) : null}
-        {visibleItems.length === 0 && inProgressItems.length === 0 && recentFailedItems.length === 0 ? (
+        {groupedVisibleItems.length === 0 && inProgressItems.length === 0 && recentFailedItems.length === 0 ? (
           <EmptyState
             title="No work items match this filter"
             subtitle="Try another filter or refresh the queue."
@@ -337,41 +451,61 @@ export default function WorkQueue() {
                 </div>
               )
             })}
-            {visibleItems.map((item) => (
-              <div key={item.id} className={`work-queue-item work-queue-${String(item.priority || '').toLowerCase()}`}>
-                <div className="work-queue-item-main">
-                  <div className="work-queue-item-header">
-                    <Badge label={item.priority} variant={PRIORITY_VARIANT[item.priority] || 'default'} />
-                    <Badge label={TYPE_LABELS[item.type] || item.type} variant="info" />
-                    {item.due_at ? <span className="row-subtitle">Due {formatDate(item.due_at)}</span> : null}
+            {groupedVisibleItems.map((group) => {
+              const item = group.primary
+              const actionMeta = primaryActionMeta(item)
+              const supportingLabels = [item.type, ...group.additionalItems.map((entry) => entry.type)]
+              return (
+                <div key={group.opportunity?.id || item.id} className={`work-queue-item work-queue-${String(item.priority || '').toLowerCase()} work-queue-item-spotlight`}>
+                  <div className="work-queue-item-main">
+                    <div className="work-queue-item-header">
+                      <Badge label={item.priority} variant={PRIORITY_VARIANT[item.priority] || 'default'} />
+                      <Badge label={READINESS_LABELS[item.type] || TYPE_LABELS[item.type] || item.type} variant="info" />
+                      {item.due_at ? <span className="row-subtitle">Due {formatDate(item.due_at)}</span> : null}
+                    </div>
+                    <div className="row-title">{group.opportunity?.title || item.title}</div>
+                    <div className="row-subtitle">
+                      {compactMeta([
+                        group.opportunity?.source,
+                        group.opportunity?.solicitation_number,
+                        group.opportunity?.agency,
+                      ])}
+                    </div>
+                    <div className="work-queue-next-step">
+                      <div className="row-title">{actionMeta.heading}</div>
+                      <div className="panel-subtitle">{actionMeta.detail}</div>
+                    </div>
+                    <div className="work-queue-signal-list">
+                      {supportingLabels.map((type) => (
+                        <span key={`${group.opportunity?.id}-${type}`} className="ingest-code-pill">
+                          {TYPE_LABELS[type] || type}
+                        </span>
+                      ))}
+                    </div>
+                    {group.additionalItems.length > 0 ? (
+                      <div className="panel-subtitle">
+                        Also needs attention: {group.additionalItems.map((entry) => TYPE_LABELS[entry.type] || entry.type).join(', ')}.
+                      </div>
+                    ) : null}
                   </div>
-                  <div className="row-title">{item.title}</div>
-                  <div className="panel-subtitle">{item.subtitle}</div>
-                  <div className="row-subtitle">
-                    {compactMeta([
-                      item.opportunity?.source,
-                      item.opportunity?.solicitation_number,
-                      item.opportunity?.agency,
-                    ])}
+                  <div className="work-queue-actions">
+                    {directActionLabel(item) ? (
+                      <Button
+                        size="sm"
+                        loading={actionLoading(item)}
+                        disabled={item.type === 'QUOTE_FOLLOW_UP_DUE' && !item.meta?.quote_id}
+                        onClick={() => runItemAction(item)}
+                      >
+                        {directActionLabel(item)}
+                      </Button>
+                    ) : null}
+                    <Link className="btn btn-secondary btn-sm" to={item.action_url}>
+                      Open Workspace
+                    </Link>
                   </div>
                 </div>
-                <div className="work-queue-actions">
-                  {directActionLabel(item) ? (
-                    <Button
-                      size="sm"
-                      loading={actionLoading(item)}
-                      disabled={item.type === 'QUOTE_FOLLOW_UP_DUE' && !item.meta?.quote_id}
-                      onClick={() => runItemAction(item)}
-                    >
-                      {directActionLabel(item)}
-                    </Button>
-                  ) : null}
-                  <Link className="btn btn-secondary btn-sm" to={item.action_url}>
-                    {item.action_label || 'Open Workspace'}
-                  </Link>
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
       </Card>

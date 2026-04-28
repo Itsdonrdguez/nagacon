@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError
 
-from app.services.dibbs.session import _click_ok_if_present, _goto_with_retry, dibbs_page
+from app.services.dibbs.session import _click_ok_if_present, _goto_with_retry, dibbs_log, dibbs_page
 
 DIBBS_BASE_URL = "https://www.dibbs.bsm.dla.mil"
 DIBBS_RFQ_URL = "https://www.dibbs.bsm.dla.mil/RFQ/"
@@ -66,33 +66,42 @@ def _looks_like_solicitation(value: str | None) -> bool:
 
 
 def _accept_warning_if_needed(page: Page) -> None:
+    dibbs_log("custom_query.warning.begin", url=page.url)
     _click_ok_if_present(page)
     if page.locator("#butAgree").count() > 0:
+        dibbs_log("custom_query.warning.agree.click", url=page.url)
         page.locator("#butAgree").click()
         page.wait_for_load_state("domcontentloaded", timeout=60000)
         page.wait_for_timeout(1000)
+        dibbs_log("custom_query.warning.agree.done", url=page.url)
+    dibbs_log("custom_query.warning.end", url=page.url)
 
 
 def _submit_fsc_custom_query(page: Page, fsc: str) -> None:
+    dibbs_log("custom_query.submit.begin", fsc=fsc, url=page.url)
     page.select_option("#ctl00_cph1_ddlCategory", "fsc")
     page.fill("#ctl00_cph1_txtValue", str(fsc).strip())
     page.select_option("#ctl00_cph1_ddlScope", "open")
     page.select_option("#ctl00_cph1_ddlSort", "return by date")
+    dibbs_log("custom_query.submit.click", fsc=fsc, url=page.url)
     page.click("#ctl00_cph1_butDbGo")
     page.wait_for_load_state("domcontentloaded", timeout=60000)
     _wait_for_results_grid(page)
     page.wait_for_timeout(1200)
+    dibbs_log("custom_query.submit.done", fsc=fsc, url=page.url)
 
 
 def _wait_for_results_grid(page: Page) -> None:
+    dibbs_log("custom_query.grid.wait.begin", url=page.url)
     try:
         page.wait_for_url(re.compile(r".*/Rfq/RfqRecs\.aspx", re.I), timeout=60000)
     except PlaywrightTimeoutError:
-        pass
+        dibbs_log("custom_query.grid.wait.url_timeout", url=page.url)
     try:
         page.wait_for_selector("table", timeout=30000)
     except PlaywrightTimeoutError:
-        pass
+        dibbs_log("custom_query.grid.wait.table_timeout", url=page.url)
+    dibbs_log("custom_query.grid.wait.end", url=page.url)
 
 
 def _row_links(row) -> list[dict[str, str | None]]:
@@ -180,9 +189,17 @@ def _page_content_with_retry(page: Page, attempts: int = 3) -> str:
         except PlaywrightTimeoutError:
             pass
         try:
+            dibbs_log("custom_query.page_content.begin", attempt=attempt + 1, attempts=attempts, url=page.url)
             return page.content()
         except PlaywrightError as exc:
             last_error = exc
+            dibbs_log(
+                "custom_query.page_content.error",
+                attempt=attempt + 1,
+                attempts=attempts,
+                error=str(exc),
+                url=page.url,
+            )
             if attempt < attempts - 1:
                 page.wait_for_timeout(1500)
                 continue
@@ -203,6 +220,7 @@ def _available_page_numbers(html: str) -> list[int]:
 
 
 def _go_to_page(page: Page, page_number: int) -> bool:
+    dibbs_log("playwright.page.begin", page_number=page_number, url=page.url)
     if page_number <= 1:
         try:
             page.evaluate(
@@ -213,7 +231,9 @@ def _go_to_page(page: Page, page_number: int) -> bool:
             _wait_for_results_grid(page)
             page.wait_for_timeout(1000)
         except PlaywrightError:
+            dibbs_log("playwright.page.error", page_number=page_number, url=page.url)
             return True
+        dibbs_log("playwright.page.done", page_number=page_number, url=page.url)
         return True
     locator = page.locator(f'a[href*="Page${page_number}"]')
     if locator.count() > 0:
@@ -225,27 +245,33 @@ def _go_to_page(page: Page, page_number: int) -> bool:
                 {"target": "ctl00$cph1$grdRfqSearch", "arg": f"Page${page_number}"},
             )
         except PlaywrightError:
+            dibbs_log("playwright.page.error", page_number=page_number, url=page.url)
             return False
     page.wait_for_load_state("domcontentloaded", timeout=60000)
     _wait_for_results_grid(page)
     page.wait_for_timeout(1000)
+    dibbs_log("playwright.page.done", page_number=page_number, url=page.url)
     return True
 
 
 def _go_to_last_page(page: Page) -> bool:
     locator = page.locator('a[href*="Page$Last"]')
     if locator.count() == 0:
+        dibbs_log("playwright.last_page.missing", url=page.url)
         return False
+    dibbs_log("playwright.last_page.begin", url=page.url)
     locator.first.click()
     page.wait_for_load_state("domcontentloaded", timeout=60000)
     _wait_for_results_grid(page)
     page.wait_for_timeout(1200)
+    dibbs_log("playwright.last_page.done", url=page.url)
     return True
 
 
 def _parse_current_result_rows(page: Page, attempts: int = 3) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for attempt in range(max(1, attempts)):
+        dibbs_log("playwright.parse.begin", attempt=attempt + 1, attempts=attempts, url=page.url)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=10000)
         except PlaywrightTimeoutError:
@@ -253,25 +279,27 @@ def _parse_current_result_rows(page: Page, attempts: int = 3) -> list[dict[str, 
         try:
             html = _page_content_with_retry(page)
         except PlaywrightError:
+            dibbs_log("playwright.parse.page_content_error", attempt=attempt + 1, attempts=attempts, url=page.url)
             if attempt < attempts - 1:
                 page.wait_for_timeout(1500)
                 continue
             raise
         rows = _parse_result_rows(html)
         if rows:
+            dibbs_log("playwright.parse.rows", attempt=attempt + 1, attempts=attempts, row_count=len(rows), url=page.url)
             return rows
 
-        # DIBBS is an old ASP.NET site and occasionally serves the page shell
-        # before the grid is hydrated. Give it a short chance before deciding
-        # the FSC truly has no result rows.
         if "No Records Found" in html or "No records found" in html:
+            dibbs_log("playwright.parse.no_records", attempt=attempt + 1, attempts=attempts, url=page.url)
             return []
         if attempt < attempts - 1:
+            dibbs_log("playwright.parse.retry", attempt=attempt + 1, attempts=attempts, url=page.url)
             page.wait_for_timeout(1500)
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightTimeoutError:
                 pass
+    dibbs_log("playwright.parse.end", attempts=attempts, row_count=len(rows), url=page.url)
     return rows
 
 
@@ -283,6 +311,14 @@ def search_dibbs_custom_query_by_fsc(
     all_results: bool = False,
     headless: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    dibbs_log(
+        "search.begin",
+        all_results=all_results,
+        fsc=str(fsc or "").strip(),
+        include_past_due=include_past_due,
+        limit=limit,
+        max_pages=max_pages,
+    )
     today = date.today()
     fsc_value = str(fsc or "").strip()
     diagnostics: dict[str, Any] = {
@@ -297,6 +333,7 @@ def search_dibbs_custom_query_by_fsc(
         "rows_parsed": 0,
         "final_url": None,
         "page_title": None,
+        "transport": "playwright",
     }
     if not fsc_value:
         return [], diagnostics
@@ -305,11 +342,13 @@ def search_dibbs_custom_query_by_fsc(
     seen_solicitations: set[str] = set()
 
     with dibbs_page(headless=headless) as (_, _, page):
+        dibbs_log("playwright_search.begin", fsc=fsc_value, headless=headless)
         _goto_with_retry(page, DIBBS_RFQ_URL)
         _accept_warning_if_needed(page)
         _submit_fsc_custom_query(page, fsc_value)
         diagnostics["final_url"] = page.url
         diagnostics["page_title"] = page.title()
+        dibbs_log("playwright_search.results.ready", fsc=fsc_value, title=diagnostics["page_title"], url=page.url)
 
         if _go_to_last_page(page):
             diagnostics["used_last_page_jump"] = True
@@ -318,11 +357,18 @@ def search_dibbs_custom_query_by_fsc(
 
         initial_html = _page_content_with_retry(page)
         page_numbers = _available_page_numbers(initial_html)
+        dibbs_log(
+            "playwright_search.pages.discovered",
+            fsc=fsc_value,
+            page_numbers=page_numbers,
+            used_last_page_jump=diagnostics["used_last_page_jump"],
+        )
         if all_results:
             last_page = max(page_numbers) if page_numbers else 1
             scan_pages = list(range(last_page, 0, -1))
         else:
             scan_pages = sorted(page_numbers, reverse=True)[: max(1, max_pages)]
+        dibbs_log("playwright_search.pages.selected", fsc=fsc_value, scan_pages=scan_pages)
 
         for index, page_number in enumerate(scan_pages):
             if not (all_results and index == 0 and diagnostics["used_last_page_jump"]):
@@ -331,6 +377,7 @@ def search_dibbs_custom_query_by_fsc(
             diagnostics["pages_scanned"].append(page_number)
             rows = _parse_current_result_rows(page)
             diagnostics["rows_seen"] += len(rows)
+            dibbs_log("playwright_search.page.rows", fsc=fsc_value, page_number=page_number, row_count=len(rows))
 
             for row in rows:
                 return_by_date = row.get("return_by_parsed")
@@ -344,7 +391,9 @@ def search_dibbs_custom_query_by_fsc(
                 collected.append(row)
                 if not all_results and len(collected) >= limit:
                     diagnostics["rows_parsed"] = len(collected)
+                    dibbs_log("playwright_search.done", fsc=fsc_value, rows_parsed=len(collected))
                     return collected, diagnostics
 
     diagnostics["rows_parsed"] = len(collected)
+    dibbs_log("playwright_search.done", fsc=fsc_value, rows_parsed=len(collected))
     return collected, diagnostics

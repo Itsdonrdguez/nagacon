@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterator
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
@@ -11,10 +12,21 @@ DEFAULT_HEADERS = {
 }
 
 
+def dibbs_log(stage: str, **details) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    suffix = ""
+    if details:
+        ordered = " ".join(f"{key}={details[key]!r}" for key in sorted(details))
+        suffix = f" {ordered}"
+    print(f"[DIBBS][{timestamp}] {stage}{suffix}")
+
+
 @contextmanager
 def dibbs_page(headless: bool = True) -> Iterator[tuple[Browser, BrowserContext, Page]]:
+    dibbs_log("browser.launch.begin", headless=headless)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
+        dibbs_log("browser.launch.ok", headless=headless)
         context = browser.new_context(
             extra_http_headers=DEFAULT_HEADERS,
             user_agent=(
@@ -23,12 +35,16 @@ def dibbs_page(headless: bool = True) -> Iterator[tuple[Browser, BrowserContext,
                 "Chrome/123.0.0.0 Safari/537.36"
             ),
         )
+        dibbs_log("browser.context.ok")
         page = context.new_page()
+        dibbs_log("browser.page.ok")
         try:
             yield browser, context, page
         finally:
+            dibbs_log("browser.close.begin")
             context.close()
             browser.close()
+            dibbs_log("browser.close.ok")
 
 
 def _first(page: Page, selectors: list[str]):
@@ -82,9 +98,11 @@ def _click_ok_if_present(page: Page) -> None:
         try:
             loc = page.locator(selector)
             if loc.count() > 0:
+                dibbs_log("warning.ok.click", selector=selector, url=page.url)
                 loc.first.click()
                 page.wait_for_timeout(1200)
                 page.wait_for_load_state("networkidle")
+                dibbs_log("warning.ok.done", selector=selector, url=page.url)
                 return
         except Exception:
             continue
@@ -94,10 +112,13 @@ def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> None:
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
+            dibbs_log("goto.begin", attempt=attempt + 1, attempts=attempts, url=url)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            dibbs_log("goto.ok", attempt=attempt + 1, url=page.url)
             return
         except Exception as exc:
             last_error = exc
+            dibbs_log("goto.error", attempt=attempt + 1, attempts=attempts, error=str(exc), url=url)
             if attempt >= attempts - 1:
                 break
             try:

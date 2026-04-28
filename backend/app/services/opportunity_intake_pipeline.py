@@ -10,6 +10,7 @@ from app.models.opportunity import Opportunity
 from app.repositories.agents import AgentRunRepository
 from app.schemas.agent import AgentRunCreate, AgentRunUpdate
 from app.services.pdf_service import download_pdfs_for_opportunity
+from app.services.file_retention import mark_opportunity_files_processing_complete
 from app.services.providers.pdf_cage_extractor import (
     extract_providers_from_opportunity_pdfs,
     seed_vendor_leads_from_providers,
@@ -205,6 +206,16 @@ def run_opportunity_intake_pipeline(
         "steps": steps,
         "failed_step_count": len(failed),
     }
+    mark_opportunity_files_processing_complete(
+        db,
+        opp.id,
+        completed=not failed,
+        source="opportunity_intake_pipeline",
+        details={
+            "failed_step_count": len(failed),
+            "status": output["status"],
+        },
+    )
     _finish_pipeline_run(
         db,
         repo,

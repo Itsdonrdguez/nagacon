@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
+from app.models.workspace import WorkspaceArtifact
+from app.services.storage import delete_reference
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
+from sqlalchemy.orm import Session, object_session
 
 
 @dataclass
@@ -80,9 +83,146 @@ def classify_opportunity_file_retention(
             prune_eligible=False,
         )
 
+    if not _downstream_processing_complete(file_record, opportunity):
+        return FileRetentionDecision(
+            storage_class=storage_class,
+            retention_status="retain",
+            reason="downstream_processing_incomplete",
+            prune_eligible=False,
+        )
+
     return FileRetentionDecision(
         storage_class=storage_class,
         retention_status="eligible_for_prune",
         reason="archived_and_extracted",
         prune_eligible=True,
     )
+
+
+def mark_opportunity_files_processing_complete(
+    db: Session,
+    opportunity_id: int,
+    *,
+    completed: bool,
+    source: str,
+    details: dict[str, Any] | None = None,
+) -> int:
+    files = (
+        db.query(OpportunityFile)
+        .filter(OpportunityFile.opportunity_id == opportunity_id)
+        .all()
+    )
+    updated = 0
+    for file_record in files:
+        metadata = dict(getattr(file_record, "parsed_metadata", None) or {})
+        retention = dict(metadata.get("_retention") or {})
+        retention.update(
+            {
+                "downstream_complete": bool(completed),
+                "last_checked_at": datetime.utcnow().isoformat(),
+                "source": source,
+            }
+        )
+        if details:
+            retention["details"] = details
+        metadata["_retention"] = retention
+        file_record.parsed_metadata = metadata
+        db.add(file_record)
+        updated += 1
+    if updated:
+        db.commit()
+    return updated
+
+
+def prune_eligible_files_for_system(
+    db: Session,
+    *,
+    limit: int = 100,
+) -> dict[str, Any]:
+    files = (
+        db.query(OpportunityFile)
+        .join(Opportunity, Opportunity.id == OpportunityFile.opportunity_id)
+        .filter(Opportunity.due_at.is_not(None))
+        .filter(Opportunity.due_at < datetime.utcnow() - timedelta(days=30))
+        .order_by(Opportunity.due_at.asc().nullslast(), OpportunityFile.id.asc())
+        .limit(max(min(limit, 1000), 1))
+        .all()
+    )
+
+    pruned_count = 0
+    skipped_count = 0
+    items: list[dict[str, Any]] = []
+
+    for file_record in files:
+        opportunity = getattr(file_record, "opportunity", None)
+        retention = classify_opportunity_file_retention(file_record, opportunity)
+        if not retention.prune_eligible:
+            skipped_count += 1
+            continue
+
+        original_ref = file_record.file_path
+        deleted = delete_reference(original_ref)
+        metadata = dict(getattr(file_record, "parsed_metadata", None) or {})
+        metadata["_retention"] = {
+            **dict(metadata.get("_retention") or {}),
+            "status": "pruned",
+            "reason": retention.reason,
+            "pruned_at": datetime.utcnow().isoformat(),
+            "original_file_path": original_ref,
+            "deleted_from_storage": bool(deleted),
+        }
+        file_record.file_path = f"pruned://opportunity-file/{file_record.id}"
+        file_record.parsed_metadata = metadata
+        db.add(file_record)
+        pruned_count += 1
+        items.append(
+            {
+                "id": file_record.id,
+                "opportunity_id": file_record.opportunity_id,
+                "filename": file_record.filename,
+                "status": "pruned",
+                "reason": retention.reason,
+                "deleted_from_storage": bool(deleted),
+            }
+        )
+
+    if pruned_count:
+        db.commit()
+
+    return {
+        "pruned_count": pruned_count,
+        "skipped_count": skipped_count,
+        "items": items,
+    }
+
+
+def _downstream_processing_complete(
+    file_record: OpportunityFile,
+    opportunity: Opportunity | None = None,
+) -> bool:
+    parsed_metadata = getattr(file_record, "parsed_metadata", None) or {}
+    retention_meta = parsed_metadata.get("_retention") or {}
+    if retention_meta.get("downstream_complete") is True:
+        return True
+
+    pipeline = parsed_metadata.get("_pipeline") or {}
+    if pipeline.get("status") != "completed":
+        return False
+
+    if opportunity is None:
+        return False
+
+    session = object_session(file_record) or object_session(opportunity)
+    if session is None:
+        return False
+
+    artifact_types = {
+        row[0]
+        for row in (
+            session.query(WorkspaceArtifact.artifact_type)
+            .filter(WorkspaceArtifact.opportunity_id == opportunity.id)
+            .all()
+        )
+    }
+    required = {"COMPLIANCE_BRIEF", "SUBMISSION_PACKAGE"}
+    return required.issubset(artifact_types)

@@ -46,6 +46,9 @@ except Exception:
             SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "").lower() in {"1", "true", "yes", "on"}
             AUTO_INGEST_ENABLED = os.getenv("AUTO_INGEST_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
             AUTO_INGEST_POLL_SECONDS = int(os.getenv("AUTO_INGEST_POLL_SECONDS", "900"))
+            AUTO_FILE_PRUNE_ENABLED = os.getenv("AUTO_FILE_PRUNE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+            AUTO_FILE_PRUNE_POLL_SECONDS = int(os.getenv("AUTO_FILE_PRUNE_POLL_SECONDS", "21600"))
+            AUTO_FILE_PRUNE_BATCH_SIZE = int(os.getenv("AUTO_FILE_PRUNE_BATCH_SIZE", "100"))
             SEARCH_JOB_RUNNER = os.getenv("SEARCH_JOB_RUNNER", "thread")
             SEARCH_JOB_POLL_SECONDS = float(os.getenv("SEARCH_JOB_POLL_SECONDS", "2.0"))
             SEARCH_JOB_MAX_CONCURRENCY = int(os.getenv("SEARCH_JOB_MAX_CONCURRENCY", "4"))

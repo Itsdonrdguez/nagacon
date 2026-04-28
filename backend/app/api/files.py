@@ -13,7 +13,7 @@ from app.schemas.files import OpportunityFileOut, OpportunityFileInsightsOut
 from app.services import document_pipeline
 from app.services.document_parser import parse_opportunity_file
 from app.services.document_pipeline import process_opportunity_documents, process_opportunity_file
-from app.services.file_retention import classify_opportunity_file_retention
+from app.services.file_retention import classify_opportunity_file_retention, mark_opportunity_files_processing_complete
 from app.services.intelligence.nsn_intelligence_service import run_nsn_intelligence
 from app.services.pdf_service import download_pdfs_for_opportunity
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs
@@ -338,6 +338,21 @@ def download_pdfs(
             "submission_package": submission_package,
         }
     )
+    mark_opportunity_files_processing_complete(
+        db,
+        opp.id,
+        completed=all(
+            (step or {}).get("status") != "failed"
+            for step in [processing, provider_vendor_sync, nsn_intelligence, submission_package]
+        ),
+        source="download_pdfs_inline",
+        details={
+            "processing": (processing or {}).get("status"),
+            "provider_vendor_sync": (provider_vendor_sync or {}).get("status", "completed"),
+            "nsn_intelligence": (nsn_intelligence or {}).get("status", "completed"),
+            "submission_package": (submission_package or {}).get("status", "completed"),
+        },
+    )
     return out
 
 
@@ -397,6 +412,17 @@ def parse_file(
                 organization_id=org_id,
                 user_id=getattr(current_user, "id", None),
             ).model_dump()
+            mark_opportunity_files_processing_complete(
+                db,
+                opp.id,
+                completed=False,
+                source="parse_file_inline",
+                details={
+                    "processing": result.get("status"),
+                    "provider_vendor_sync": (provider_vendor_sync or {}).get("status", "completed"),
+                    "note": "File parse completed, but full downstream workspace extraction has not been confirmed.",
+                },
+            )
         refreshed = _scoped_file_query(db, org_id).filter(OpportunityFile.id == file_id).first()
         parsed = dict(getattr(refreshed, "parsed_metadata", None) or {})
         if getattr(refreshed, "extracted_text", None) and "text" not in parsed:

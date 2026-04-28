@@ -1157,7 +1157,11 @@ def test_file_retention_marks_archived_complete_pdf_as_prune_eligible():
         file_type="DIBBS_ATTACHMENT",
         file_path="s3://nagacon/test.pdf",
         extracted_text="parsed text",
-        parsed_metadata={"document_type": "SOLICITATION", "_pipeline": {"review_required": False}},
+        parsed_metadata={
+            "document_type": "SOLICITATION",
+            "_pipeline": {"review_required": False},
+            "_retention": {"downstream_complete": True},
+        },
     )
 
     decision = classify_opportunity_file_retention(file_record, opportunity)
@@ -1165,6 +1169,28 @@ def test_file_retention_marks_archived_complete_pdf_as_prune_eligible():
     assert decision.storage_class == "core"
     assert decision.retention_status == "eligible_for_prune"
     assert decision.prune_eligible is True
+
+
+def test_file_retention_keeps_archived_pdf_until_downstream_processing_is_complete():
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from app.services.file_retention import classify_opportunity_file_retention
+
+    opportunity = SimpleNamespace(due_at=datetime.utcnow() - timedelta(days=45))
+    file_record = SimpleNamespace(
+        file_type="DIBBS_ATTACHMENT",
+        file_path="s3://nagacon/test.pdf",
+        extracted_text="parsed text",
+        parsed_metadata={"document_type": "SOLICITATION", "_pipeline": {"review_required": False}},
+    )
+
+    decision = classify_opportunity_file_retention(file_record, opportunity)
+
+    assert decision.storage_class == "core"
+    assert decision.retention_status == "retain"
+    assert decision.reason == "downstream_processing_incomplete"
+    assert decision.prune_eligible is False
 
 
 def test_files_prune_candidates_returns_only_eligible_items(client, monkeypatch):

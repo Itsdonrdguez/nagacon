@@ -264,6 +264,7 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
 
 /* Workspace */
 .workspace-header { margin-bottom: 20px; }
+.workspace-page { min-width: 0; }
 .workspace-hero {
   display: flex;
   align-items: flex-start;
@@ -279,6 +280,8 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
+  min-width: 0;
+  flex: 1 1 0%;
 }
 .workspace-kicker {
   font-size: 0.78rem;
@@ -290,12 +293,15 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
 .workspace-hero-subtitle {
   color: #64748b;
   font-size: 0.95rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 .workspace-hero-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 0.55rem;
   justify-content: flex-end;
+  flex: 0 1 auto;
 }
 .workspace-overview { display: flex; flex-direction: column; gap: 20px; }
 .opp-badges { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
@@ -949,6 +955,7 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   display: flex;
   flex-direction: column;
   gap: 0.85rem;
+  min-width: 0;
 }
 
 .workspace-detail-panel {
@@ -1561,6 +1568,50 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   gap: 1rem;
 }
 
+.workspace-tabs .tabs-content,
+.workspace-tabs .card,
+.workspace-tabs .card-body,
+.workspace-tabs .workspace-action-column,
+.workspace-tabs .workspace-scoring-panel,
+.workspace-tabs .workspace-documents-panel,
+.workspace-tabs .artifact-note-box,
+.workspace-tabs .artifact-history-row,
+.workspace-tabs .summary-inline-section,
+.workspace-tabs .submission-package-panel {
+  min-width: 0;
+}
+
+.workspace-tabs .table-container {
+  width: 100%;
+}
+
+.workspace-tabs .table {
+  min-width: 720px;
+}
+
+.workspace-tabs .row-title,
+.workspace-tabs .row-subtitle,
+.workspace-tabs .panel-subtitle,
+.workspace-tabs .artifact-brief-line,
+.workspace-tabs .artifact-list-item {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1200px) {
+  .workspace-hero {
+    padding: 1.1rem 1.15rem;
+  }
+
+  .workspace-summary-grid,
+  .bid-readiness-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .vendor-grid {
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  }
+}
+
 @media (max-width: 900px) {
   .workspace-summary-grid,
   .bid-readiness-grid,
@@ -1634,5 +1685,115 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
 
   .page-header {
     padding-top: 0.5rem;
+  }
+}
+
+@media (max-width: 720px) {
+  .workspace-page {
+    gap: 0.9rem;
+  }
+
+  .workspace-hero {
+    padding: 1rem;
+    border-radius: 16px;
+  }
+
+  .workspace-kicker {
+    font-size: 0.72rem;
+  }
+
+  .workspace-hero .page-title {
+    font-size: 1.6rem;
+    line-height: 1.15;
+  }
+
+  .workspace-hero-subtitle {
+    font-size: 0.9rem;
+  }
+
+  .workspace-hero-meta {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .workspace-tabs .tabs-content {
+    padding-top: 0.9rem;
+    min-height: 0;
+  }
+
+  .results-toolbar {
+    align-items: flex-start;
+  }
+
+  .results-toolbar > * {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .company-form-actions,
+  .table-action-stack,
+  .pagination-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .company-form-actions > *,
+  .table-action-stack > *,
+  .pagination-bar > * {
+    width: 100%;
+  }
+
+  .summary-inline-section,
+  .submission-package-panel,
+  .bid-readiness-vendors,
+  .artifact-note-box {
+    padding: 0.9rem;
+  }
+
+  .vendor-header,
+  .pipeline-card-header,
+  .pipeline-card-footer,
+  .pipeline-card-meta,
+  .due-item-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .workspace-tabs .table {
+    min-width: 640px;
+  }
+}
+
+@media (max-width: 540px) {
+  .workspace-page {
+    gap: 0.75rem;
+  }
+
+  .workspace-hero {
+    gap: 0.85rem;
+    padding: 0.9rem;
+  }
+
+  .workspace-hero .page-title {
+    font-size: 1.35rem;
+  }
+
+  .workspace-hero-meta > * {
+    max-width: 100%;
+  }
+
+  .workspace-tabs .table {
+    min-width: 560px;
+  }
+
+  .summary-inline-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.2rem;
+  }
+
+  .identifier-row {
+    flex-direction: column;
+    gap: 0.35rem;
   }
 }

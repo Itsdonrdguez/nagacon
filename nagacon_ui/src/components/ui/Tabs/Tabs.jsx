@@ -1,6 +1,13 @@
 import { useState } from 'react'
 
-export default function Tabs({ tabs = [], activeTab: controlledActiveTab = null, onChange = null }) {
+export default function Tabs({
+  tabs = [],
+  activeTab: controlledActiveTab = null,
+  onChange = null,
+  className = '',
+  mobileSelect = false,
+  mobileLabel = 'Section',
+}) {
   const [internalActiveTab, setInternalActiveTab] = useState(0)
   const activeTab = Number.isInteger(controlledActiveTab) ? controlledActiveTab : internalActiveTab
 
@@ -15,7 +22,22 @@ export default function Tabs({ tabs = [], activeTab: controlledActiveTab = null,
   }
 
   return (
-    <div className="tabs-container">
+    <div className={`tabs-container ${className}`.trim()}>
+      {mobileSelect ? (
+        <label className="tabs-mobile-select">
+          <span className="tabs-mobile-select-label">{mobileLabel}</span>
+          <select
+            value={activeTab}
+            onChange={(event) => setActiveTab(Number(event.target.value))}
+          >
+            {tabs.map((tab, idx) => (
+              <option key={idx} value={idx}>
+                {tab.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
       <div className="tabs-nav">
         {tabs.map((tab, idx) => (
           <button

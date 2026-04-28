@@ -3641,7 +3641,7 @@ export default function Workspace() {
   ]
 
   return (
-    <div className="page">
+    <div className="page workspace-page">
       <div className="workspace-header workspace-hero">
         <div className="workspace-hero-copy">
           <div className="workspace-kicker">Opportunity Workspace</div>
@@ -3656,7 +3656,14 @@ export default function Workspace() {
           {opp.set_aside_type ? <Badge label={setAsideBadgeLabel(opp.set_aside_type)} variant={setAsideBadgeVariant(opp.set_aside_type)} /> : null}
         </div>
       </div>
-      <Tabs tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
+      <Tabs
+        tabs={tabs}
+        activeTab={activeTab}
+        onChange={setActiveTab}
+        className="workspace-tabs"
+        mobileSelect
+        mobileLabel="Workspace section"
+      />
     </div>
   )
 }

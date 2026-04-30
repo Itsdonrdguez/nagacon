@@ -18,7 +18,7 @@ from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.services.document_pipeline import process_opportunity_documents
 from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
-from app.services.storage import ensure_dir, file_exists, storage_root, store_bytes, store_text
+from app.services.storage import delete_reference, ensure_dir, file_exists, storage_root, store_bytes, store_text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -36,11 +36,114 @@ def _safe_filename(s: str) -> str:
     return s or "file"
 
 
-def _existing_file_record(db: Session, opportunity_id: int, filename: str) -> OpportunityFile | None:
-    return db.query(OpportunityFile).filter(
+def _normalize_source_url(url: str | None) -> str:
+    return (url or "").strip()
+
+
+def _matching_file_records(
+    db: Session,
+    opportunity_id: int,
+    filename: str,
+    source_url: str | None = None,
+) -> list[OpportunityFile]:
+    normalized_filename = _safe_filename(filename)
+    normalized_source_url = _normalize_source_url(source_url)
+    records = db.query(OpportunityFile).filter(
         OpportunityFile.opportunity_id == opportunity_id,
-        OpportunityFile.filename == filename,
-    ).first()
+    ).all()
+
+    matches: list[OpportunityFile] = []
+    for record in records:
+        same_filename = _safe_filename(getattr(record, "filename", "")) == normalized_filename
+        same_source_url = bool(normalized_source_url) and _normalize_source_url(getattr(record, "source_url", None)) == normalized_source_url
+        if same_filename or same_source_url:
+            matches.append(record)
+    return matches
+
+
+def _record_sort_key(record: OpportunityFile) -> tuple[int, int, int, float]:
+    parsed_score = 1 if getattr(record, "parsed_metadata", None) else 0
+    text_score = 1 if getattr(record, "extracted_text", None) else 0
+    file_score = 1 if getattr(record, "file_path", None) and file_exists(record.file_path) else 0
+    created_score = getattr(record, "created_at", datetime.min).timestamp() if getattr(record, "created_at", None) else 0.0
+    return (parsed_score, text_score, file_score, created_score)
+
+
+def _collapse_duplicate_file_records(
+    db: Session,
+    primary: OpportunityFile,
+    records: list[OpportunityFile],
+) -> OpportunityFile:
+    for record in records:
+        if record.id == primary.id:
+            continue
+        if not getattr(primary, "source_url", None) and getattr(record, "source_url", None):
+            primary.source_url = record.source_url
+        if not getattr(primary, "extracted_text", None) and getattr(record, "extracted_text", None):
+            primary.extracted_text = record.extracted_text
+        if not getattr(primary, "parsed_metadata", None) and getattr(record, "parsed_metadata", None):
+            primary.parsed_metadata = record.parsed_metadata
+        if (
+            (not getattr(primary, "file_path", None) or not file_exists(primary.file_path))
+            and getattr(record, "file_path", None)
+            and file_exists(record.file_path)
+        ):
+            primary.file_path = record.file_path
+        duplicate_ref = getattr(record, "file_path", None)
+        if duplicate_ref and duplicate_ref != getattr(primary, "file_path", None):
+            try:
+                delete_reference(duplicate_ref)
+            except Exception:
+                pass
+        db.delete(record)
+    return primary
+
+
+def dedupe_opportunity_file_records(db: Session, opportunity_id: int) -> int:
+    records = db.query(OpportunityFile).filter(
+        OpportunityFile.opportunity_id == opportunity_id,
+    ).order_by(OpportunityFile.created_at.asc(), OpportunityFile.id.asc()).all()
+    groups: list[list[OpportunityFile]] = []
+    key_to_group: dict[str, list[OpportunityFile]] = {}
+
+    for record in records:
+        keys = []
+        normalized_filename = _safe_filename(getattr(record, "filename", "") or "")
+        normalized_source_url = _normalize_source_url(getattr(record, "source_url", None))
+        if normalized_filename:
+            keys.append(f"filename:{normalized_filename}")
+        if normalized_source_url:
+            keys.append(f"url:{normalized_source_url}")
+        if not keys:
+            continue
+
+        group = None
+        for key in keys:
+            if key in key_to_group:
+                group = key_to_group[key]
+                break
+        if group is None:
+            group = [record]
+            groups.append(group)
+        else:
+            group.append(record)
+        for key in keys:
+            key_to_group[key] = group
+
+    removed = 0
+    changed = False
+    for group in groups:
+        unique_records = list({record.id: record for record in group}.values())
+        if len(unique_records) <= 1:
+            continue
+        primary = sorted(unique_records, key=_record_sort_key, reverse=True)[0]
+        _collapse_duplicate_file_records(db, primary, unique_records)
+        removed += max(0, len(unique_records) - 1)
+        changed = True
+
+    if changed:
+        db.commit()
+    return removed
 
 
 def _compact_solicitation(s: str | None) -> str | None:
@@ -195,8 +298,17 @@ def _save_downloaded_file(
     file_type: str,
 ) -> tuple[int, str]:
     filename = _safe_filename(filename)
-    existing = _existing_file_record(db, opp.id, filename)
+    matching_records = _matching_file_records(db, opp.id, filename, source_url)
+    existing = None
+    if matching_records:
+        existing = sorted(matching_records, key=_record_sort_key, reverse=True)[0]
+        existing = _collapse_duplicate_file_records(db, existing, matching_records)
     if existing is not None and file_exists(existing.file_path):
+        existing.file_type = file_type
+        existing.source_url = source_url or existing.source_url
+        existing.filename = filename
+        db.add(existing)
+        db.commit()
         return 0, filename
     fp = out_dir / filename
     stored_ref = store_bytes(fp, data, content_type="application/pdf" if filename.lower().endswith(".pdf") else None)
@@ -231,7 +343,11 @@ def _write_debug_log(out_dir: Path, opp: Opportunity, payload: dict) -> str:
 def _create_snapshot_pdf(db: Session, opp: Opportunity, page, out_dir: Path) -> tuple[int, int, str | None]:
     sol_clean = _safe_filename(opp.solicitation_number or f"opportunity_{opp.id}")
     fname = f"{sol_clean}_fallback_snapshot.pdf"
-    existing = _existing_file_record(db, opp.id, fname)
+    matching_records = _matching_file_records(db, opp.id, fname, None)
+    existing = None
+    if matching_records:
+        existing = sorted(matching_records, key=_record_sort_key, reverse=True)[0]
+        existing = _collapse_duplicate_file_records(db, existing, matching_records)
     if existing is not None and file_exists(existing.file_path):
         return 0, 1, None
     try:
@@ -564,6 +680,7 @@ def download_pdfs_for_opportunity(
     opp = db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
     if not opp:
         raise ValueError("Opportunity not found")
+    dedupe_opportunity_file_records(db, opportunity_id)
 
     sol = opp.solicitation_number or f"opportunity_{opp.id}"
     sol_compact = _compact_solicitation(opp.solicitation_number) or ""

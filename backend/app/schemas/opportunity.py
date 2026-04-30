@@ -47,6 +47,7 @@ class OpportunityBase(BaseModel):
     place_of_performance: str | None = None
     description: str | None = None
     status: OpportunityStatus = OpportunityStatus.NEW
+    parsed_json: dict[str, Any] | None = None
     raw_payload: dict[str, Any] | None = None
 
 
@@ -76,6 +77,8 @@ class OpportunityUpdate(BaseModel):
 class OpportunityRead(OpportunityBase):
     id: int
     decision_status: str | None = None
+    pipeline_owner: str | None = None
+    target_submit_date: datetime | None = None
 
     @computed_field
     @property
@@ -211,6 +214,33 @@ class OpportunityRead(OpportunityBase):
     @property
     def requested_quantity_display(self) -> str | None:
         return f"Qty: {self.requested_quantity}" if self.requested_quantity else None
+
+    @computed_field
+    @property
+    def prepared_summary(self) -> str | None:
+        parsed = self.parsed_json if isinstance(self.parsed_json, dict) else {}
+        sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed.get("sam_intelligence"), dict) else None
+        if sam_intelligence and sam_intelligence.get("summary"):
+            return str(sam_intelligence.get("summary"))
+        return None
+
+    @computed_field
+    @property
+    def prepared_requirements(self) -> list[str]:
+        parsed = self.parsed_json if isinstance(self.parsed_json, dict) else {}
+        sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed.get("sam_intelligence"), dict) else None
+        if sam_intelligence and isinstance(sam_intelligence.get("requirements"), list):
+            return [str(item) for item in sam_intelligence.get("requirements") if str(item).strip()]
+        return []
+
+    @computed_field
+    @property
+    def prepared_risk_flags(self) -> list[str]:
+        parsed = self.parsed_json if isinstance(self.parsed_json, dict) else {}
+        sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed.get("sam_intelligence"), dict) else None
+        if sam_intelligence and isinstance(sam_intelligence.get("risk_flags"), list):
+            return [str(item) for item in sam_intelligence.get("risk_flags") if str(item).strip()]
+        return []
 
     model_config = {"from_attributes": True}
 

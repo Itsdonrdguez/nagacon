@@ -1403,6 +1403,35 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   gap: 0.75rem;
 }
 
+.checklist-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.checklist-text-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  flex: 1;
+  cursor: pointer;
+}
+
+.checklist-text-block input {
+  margin-top: 0.2rem;
+}
+
+.checklist-text {
+  color: #0f172a;
+  line-height: 1.45;
+}
+
+.checklist-text.completed {
+  color: #64748b;
+  text-decoration: line-through;
+}
+
 .task-card select {
   min-width: 160px;
 }
@@ -1817,6 +1846,36 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   background: #f8fafc;
 }
 
+.sam-brief-grid {
+  align-items: stretch;
+}
+
+.sam-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.sam-chip {
+  padding: 0.55rem 0.8rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #0f172a;
+  font-size: 0.92rem;
+  line-height: 1.35;
+}
+
+.sam-warning-box {
+  border-color: #fbbf24;
+  background: #fff7ed;
+}
+
+.sam-okay-box {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
 .research-warning-box {
   border-color: #fde68a;
   background: #fffbea;
@@ -1981,7 +2040,8 @@ input { width: 100%; padding: 12px 14px; border: 1px solid #cbd5e1; border-radiu
   }
 
   .task-card-row,
-  .checklist-edit-row {
+  .checklist-edit-row,
+  .checklist-toggle-row {
     align-items: flex-start;
     flex-direction: column;
   }

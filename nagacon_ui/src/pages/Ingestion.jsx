@@ -124,6 +124,7 @@ export default function Ingestion() {
   const queryClient = useQueryClient()
   const [query, setQuery] = useState(DEFAULT_MANUAL_DIBBS_FSC)
   const [source, setSource] = useState('DIBBS')
+  const [searchMode, setSearchMode] = useState('quick')
   const [samState, setSamState] = useState('')
   const [samZip, setSamZip] = useState('')
   const [samAgency, setSamAgency] = useState('')
@@ -223,6 +224,14 @@ export default function Ingestion() {
 
   const handleSubmit = async (event) => {
     event.preventDefault()
+    if (searchMode === 'deep') {
+      await runManualSearch({ deep: true })
+      return
+    }
+    if (searchMode === 'pdfs') {
+      await runBulkPdfDownload()
+      return
+    }
     await runManualSearch({ limit: DEFAULT_PER_CODE_SEARCH_SIZE })
   }
 
@@ -230,6 +239,9 @@ export default function Ingestion() {
     setSource(nextSource)
     if (nextSource === 'DIBBS' && !query.trim()) {
       setQuery(DEFAULT_MANUAL_DIBBS_FSC)
+    }
+    if (nextSource !== 'DIBBS' && searchMode === 'pdfs') {
+      setSearchMode('quick')
     }
   }
 
@@ -257,7 +269,31 @@ export default function Ingestion() {
   const profileKeywords = plan?.sam?.keywords || []
   const profileNaics = plan?.sam?.naics_codes || []
   const manualModeLabel = source === 'DIBBS' ? 'DIBBS quick search' : source === 'SAM' ? 'SAM quick search' : 'Combined source search'
-  const isManualBusy = ingestMutation.isPending || (isSearching && (activeAction === 'manual_search' || activeAction === 'manual_deep'))
+  const manualModes = source === 'DIBBS'
+    ? [
+        { id: 'quick', label: 'Quick Search', description: 'Fast pass across the codes you entered so you can review results quickly.' },
+        { id: 'deep', label: 'Deep Search', description: 'Walk every available page for fuller coverage when you do not mind waiting.' },
+        { id: 'pdfs', label: 'Bulk PDF Download', description: 'Pull the main RFQ PDFs for later package review and vendor mining.' },
+      ]
+    : [
+        { id: 'quick', label: 'Quick Search', description: 'Fast pass across the codes you entered so you can review results quickly.' },
+        { id: 'deep', label: 'Deep Search', description: 'Walk every available page for fuller coverage when you do not mind waiting.' },
+      ]
+  const selectedManualMode = manualModes.find((mode) => mode.id === searchMode) || manualModes[0]
+  const manualSubmitLabel =
+    searchMode === 'deep'
+      ? 'Run Deep Search'
+      : searchMode === 'pdfs'
+        ? 'Download RFQ PDFs'
+        : 'Run Search'
+  const manualSubmitLoading =
+    searchMode === 'pdfs'
+      ? pdfDownloadMutation.isPending || (isSearching && activeAction === 'manual_pdfs')
+      : ingestMutation.isPending || (isSearching && activeAction === (searchMode === 'deep' ? 'manual_deep' : 'manual_search'))
+  const manualSubmitDisabled =
+    searchMode === 'pdfs'
+      ? source !== 'DIBBS' || profileIngestMutation.isPending || ingestMutation.isPending || isSearching || !query.trim()
+      : profileIngestMutation.isPending || isSearching
   const searchStateLabel = isSearching
     ? 'Search in progress'
     : result
@@ -343,6 +379,27 @@ export default function Ingestion() {
                 </div>
                 <div className="ingest-mode-badge ingest-mode-badge-muted">Targeted search</div>
               </div>
+              <div className="simple-list">
+                <div className="row-title">Search mode</div>
+                <div className="row-subtitle">Pick the kind of run you want, then use one primary action.</div>
+                <div className="form-action ingest-action-group">
+                  {manualModes.map((mode) => (
+                    <Button
+                      key={mode.id}
+                      type="button"
+                      variant={searchMode === mode.id ? 'primary' : 'secondary'}
+                      onClick={() => setSearchMode(mode.id)}
+                      disabled={isSearching}
+                    >
+                      {mode.label}
+                    </Button>
+                  ))}
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">{selectedManualMode.label}</div>
+                  <div className="row-subtitle">{selectedManualMode.description}</div>
+                </div>
+              </div>
               <Input
                 label={source === 'DIBBS' ? 'DLA FSC Codes' : 'Search Codes'}
                 value={query}
@@ -362,29 +419,10 @@ export default function Ingestion() {
                 <div className="form-action ingest-action-group">
                   <Button
                     type="submit"
-                    variant="secondary"
-                    loading={ingestMutation.isPending || (isSearching && activeAction === 'manual_search')}
-                    disabled={profileIngestMutation.isPending || isSearching}
+                    loading={manualSubmitLoading}
+                    disabled={manualSubmitDisabled}
                   >
-                    Search
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    loading={ingestMutation.isPending || (isSearching && activeAction === 'manual_deep')}
-                    disabled={profileIngestMutation.isPending || isSearching}
-                    onClick={() => runManualSearch({ deep: true })}
-                  >
-                    Deep Search
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    loading={pdfDownloadMutation.isPending || (isSearching && activeAction === 'manual_pdfs')}
-                    disabled={source !== 'DIBBS' || profileIngestMutation.isPending || ingestMutation.isPending || isSearching || !query.trim()}
-                    onClick={runBulkPdfDownload}
-                  >
-                    Bulk Download PDFs
+                    {manualSubmitLabel}
                   </Button>
                 </div>
               </div>
@@ -416,21 +454,11 @@ export default function Ingestion() {
               ) : null}
               <div className="ingest-manual-guidance">
                 <div className="row-subtitle">
-                  Deep Search reviews all available source records for the selected codes and may take significantly longer on DIBBS.
-                </div>
-                <div className="simple-list">
-                  <div className="simple-list-row">
-                    <div className="row-title">Search</div>
-                    <div className="row-subtitle">Runs a quick pass across the codes you entered and keeps the result set small enough to review fast.</div>
-                  </div>
-                  <div className="simple-list-row">
-                    <div className="row-title">Deep Search</div>
-                    <div className="row-subtitle">Keeps going through every available page for those codes. Use it when you want full coverage and do not mind waiting.</div>
-                  </div>
-                  <div className="simple-list-row">
-                    <div className="row-title">Bulk Download PDFs</div>
-                    <div className="row-subtitle">Downloads the main solicitation PDFs for DIBBS results so you can mine vendor and part details later.</div>
-                  </div>
+                  {searchMode === 'deep'
+                    ? 'Deep Search reviews all available source records for the selected codes and may take significantly longer on DIBBS.'
+                    : searchMode === 'pdfs'
+                      ? 'Bulk PDF Download is only for DIBBS and saves the main solicitation package by FSC for later review.'
+                      : 'Quick Search keeps the result set smaller so you can scan what changed without waiting on a full crawl.'}
                 </div>
               </div>
             </div>

@@ -97,6 +97,8 @@ class OpportunityRepository:
         set_aside_type: str | None = None,
         due_window: str | None = None,
         nsn: str | None = None,
+        agency: str | None = None,
+        state: str | None = None,
     ):
         if source:
             query = query.filter(Opportunity.source == source)
@@ -120,6 +122,9 @@ class OpportunityRepository:
                     Opportunity.solicitation_number.ilike(pattern),
                     Opportunity.naics.ilike(pattern),
                     Opportunity.fsc.ilike(pattern),
+                    Opportunity.set_aside.ilike(pattern),
+                    Opportunity.place_of_performance.ilike(pattern),
+                    Opportunity.raw_text.ilike(pattern),
                 )
             )
 
@@ -140,6 +145,12 @@ class OpportunityRepository:
                 query = query.filter(compact_db_nsn.ilike(f"%{normalized}%"))
             else:
                 query = query.filter(Opportunity.solicitation_number.ilike(f"%{nsn.strip()}%"))
+
+        if agency:
+            query = query.filter(Opportunity.agency.ilike(f"%{agency.strip()}%"))
+
+        if state:
+            query = query.filter(Opportunity.place_of_performance.ilike(f"%{state.strip()}%"))
 
         if due_window:
             from datetime import datetime, timedelta
@@ -218,6 +229,8 @@ class OpportunityRepository:
         set_aside_type: str | None = None,
         due_window: str | None = None,
         nsn: str | None = None,
+        agency: str | None = None,
+        state: str | None = None,
     ) -> list[Opportunity]:
         query = self._apply_filters(
             self._scoped_query(),
@@ -226,6 +239,8 @@ class OpportunityRepository:
             set_aside_type=set_aside_type,
             due_window=due_window,
             nsn=nsn,
+            agency=agency,
+            state=state,
         )
         items = query.order_by(Opportunity.id.desc()).offset(offset).limit(limit).all()
         return self._backfill_dibbs_dates(items)
@@ -240,6 +255,8 @@ class OpportunityRepository:
         set_aside_type: str | None = None,
         due_window: str | None = None,
         nsn: str | None = None,
+        agency: str | None = None,
+        state: str | None = None,
         sort_by: str | None = None,
         sort_order: str = "asc",
     ) -> tuple[list[Opportunity], int]:
@@ -250,6 +267,8 @@ class OpportunityRepository:
             set_aside_type=set_aside_type,
             due_window=due_window,
             nsn=nsn,
+            agency=agency,
+            state=state,
         )
         total = base_query.count()
         open_first = case(

@@ -123,6 +123,7 @@ def fetch_dibbs_opportunities(params: Optional[Dict] = None, max_pages: int = 1)
                 include_past_due=include_past_due,
                 all_results=all_results,
                 headless=not debug,
+                debug=debug,
             )
         except Exception:
             use_legacy = True

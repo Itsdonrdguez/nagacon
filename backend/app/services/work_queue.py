@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.models.bid_submission import BidSubmission
 from app.models.opportunity import Opportunity
+from app.models.pipeline_item import PipelineItem
 from app.models.search_job import SearchJob
 from app.models.vendor import VendorLead, VendorQuote
-from app.models.workspace import WorkspaceArtifact
+from app.models.workspace import WorkspaceArtifact, WorkspaceTask
 from app.services.search_jobs import record_search_job, start_search_job
 from app.utils.opportunity_lifecycle import is_archived_opportunity
 
@@ -23,6 +24,18 @@ LOW = "LOW"
 QUEUEABLE_TYPES = {"AWARDEE_ENRICHMENT_READY", "NSN_INTELLIGENCE_REFRESH"}
 QUEUEABLE_JOB_KINDS = {"awardee_enrichment", "nsn_build"}
 COMPLETED_QUEUE_COOLDOWN_HOURS = 12
+
+MISSION_BUCKET_LABELS = {
+    "due_soon": "Due Soon",
+    "needs_suppliers": "Needs Suppliers",
+    "rfq_not_sent": "RFQ Not Sent",
+    "follow_up_due": "Follow-up Due",
+    "ready_to_submit": "Ready to Submit",
+    "submission_prep": "Submission Prep",
+    "closed_intelligence": "Closed Intelligence",
+    "failed": "Failed",
+    "manual_review": "Manual Review",
+}
 
 
 def _scope_org(query, model, organization_id: int | None):
@@ -87,6 +100,64 @@ def _item(
         "action_label": action_label,
         "action_url": f"/workspace/{opp.id}",
         "meta": meta or {},
+    }
+
+
+def _mission_bucket(item_type: str) -> str:
+    normalized = str(item_type or "").upper()
+    if normalized in {"RFQ_CLOSING_SOON"}:
+        return "due_soon"
+    if normalized in {"MISSING_VENDOR_LEADS", "MISSING_PART_FINDER", "NSN_INTELLIGENCE_REFRESH"}:
+        return "needs_suppliers"
+    if normalized in {"RFQ_NOT_SENT"}:
+        return "rfq_not_sent"
+    if normalized in {"QUOTE_FOLLOW_UP_DUE", "QUOTE_REQUESTED_NO_RESPONSE"}:
+        return "follow_up_due"
+    if normalized in {"READY_TO_SUBMIT"}:
+        return "ready_to_submit"
+    if normalized in {
+        "MISSING_SUBMISSION_PACKAGE",
+        "SAM_CHECKLIST_MISSING",
+        "SAM_COMPLIANCE_MATRIX_MISSING",
+        "SAM_CO_EMAIL_MISSING",
+        "SAM_TARGET_SUBMIT_DATE_MISSING",
+        "SAM_TASKS_NOT_SEEDED",
+        "SAM_OPEN_TASKS_MISSING",
+        "SAM_SUBMISSION_PACKAGE_MISSING",
+        "DIBBS_RFQ_PACKAGE_MISSING",
+    }:
+        return "submission_prep"
+    if normalized in {"AWARDEE_ENRICHMENT_READY"}:
+        return "closed_intelligence"
+    return "manual_review"
+
+
+def _display_status(item_type: str, priority: str, *, queue_state: dict[str, Any] | None = None, failed: bool = False) -> str:
+    if failed:
+        return "FAILED"
+    if queue_state:
+        status = str(queue_state.get("status") or "").strip().upper()
+        if status:
+            return status
+    normalized = str(item_type or "").upper()
+    if normalized in {"SAM_COMPLIANCE_MATRIX_MISSING", "SAM_TARGET_SUBMIT_DATE_MISSING", "SAM_OPEN_TASKS_MISSING"}:
+        return "NEEDS REVIEW"
+    if normalized in {"RFQ_NOT_SENT", "READY_TO_SUBMIT"}:
+        return "OPEN"
+    if normalized in {"QUOTE_FOLLOW_UP_DUE"}:
+        return "FOLLOW-UP"
+    if normalized in {"AWARDEE_ENRICHMENT_READY"}:
+        return "CLOSED"
+    return "OPEN" if priority in {HIGH, MEDIUM, LOW} else "PENDING"
+
+
+def _decorate_mission_item(item: dict[str, Any], *, queue_state: dict[str, Any] | None = None, failed: bool = False) -> dict[str, Any]:
+    bucket = _mission_bucket(item.get("type"))
+    return {
+        **item,
+        "mission_bucket": bucket,
+        "mission_bucket_label": MISSION_BUCKET_LABELS.get(bucket, "Manual Review"),
+        "display_status": _display_status(item.get("type"), item.get("priority", ""), queue_state=queue_state, failed=failed),
     }
 
 
@@ -268,9 +339,27 @@ def build_daily_work_queue(
     part_finder_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="PART_FINDER")
     submission_package_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="SUBMISSION_PACKAGE")
     nsn_artifact_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="NSN_INTELLIGENCE")
+    checklist_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="CHECKLIST")
+    co_email_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="CO_EMAIL_DRAFT")
+    compliance_matrix_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="COMPLIANCE_MATRIX")
+    document_counts = _count_by_opportunity(db, WorkspaceArtifact, organization_id, artifact_type="DOCUMENT_PIPELINE")
+    task_counts = _count_by_opportunity(db, WorkspaceTask, organization_id)
+
+    open_task_query = db.query(WorkspaceTask.opportunity_id, func.count(WorkspaceTask.id))
+    open_task_query = _scope_org(open_task_query, WorkspaceTask, organization_id)
+    open_task_rows = (
+        open_task_query
+        .filter(WorkspaceTask.status.in_(("OPEN", "IN_PROGRESS")))
+        .group_by(WorkspaceTask.opportunity_id)
+        .all()
+    )
+    open_task_counts = {int(opp_id): int(count) for opp_id, count in open_task_rows}
 
     submissions_query = db.query(BidSubmission).filter(BidSubmission.opportunity_id.in_(opp_ids))
     submissions = {row.opportunity_id: row for row in submissions_query.all()}
+    pipeline_query = db.query(PipelineItem).filter(PipelineItem.opportunity_id.in_(opp_ids))
+    pipeline_query = _scope_org(pipeline_query, PipelineItem, organization_id)
+    pipelines = {row.opportunity_id: row for row in pipeline_query.all()}
 
     quote_query = db.query(VendorQuote).filter(VendorQuote.opportunity_id.in_(opp_ids))
     quote_query = _scope_org(quote_query, VendorQuote, organization_id)
@@ -313,6 +402,13 @@ def build_daily_work_queue(
         days_left = _days_until(opp.due_at, current_time)
         is_open = days_left is None or days_left >= 0
         nsn = _extract_nsn(opp)
+        opportunity_quotes = [quote for quote in quotes if quote.opportunity_id == opp.id]
+        requested_quotes = [quote for quote in opportunity_quotes if str(getattr(quote, "status", "") or "").strip().upper() == "REQUESTED"]
+        received_quotes = [quote for quote in opportunity_quotes if str(getattr(quote, "status", "") or "").strip().upper() == "RECEIVED"]
+        not_requested_quotes = [quote for quote in opportunity_quotes if str(getattr(quote, "status", "") or "").strip().upper() in {"NOT_REQUESTED", ""}]
+        has_selected_quote = bool(getattr(submissions.get(opp.id), "planned_vendor_quote_id", None)) or bool(
+            getattr(submissions.get(opp.id), "planned_vendor_cage", None)
+        )
         if days_left is not None and 0 <= days_left <= 7:
             priority = HIGH if days_left <= 2 else MEDIUM
             items.append(_item(
@@ -353,7 +449,19 @@ def build_daily_work_queue(
                 meta={"nsn": nsn},
             ))
 
-        if is_open and quote_counts.get(opp.id, 0) > 0 and submission_package_counts.get(opp.id, 0) == 0:
+        if is_open and lead_counts.get(opp.id, 0) > 0 and quote_counts.get(opp.id, 0) == 0:
+            items.append(_item(
+                "RFQ_NOT_SENT",
+                HIGH if days_left is not None and days_left <= 3 else MEDIUM,
+                opp,
+                f"Send RFQ to {lead_counts.get(opp.id, 0)} supplier{'s' if lead_counts.get(opp.id, 0) != 1 else ''}",
+                "Supplier candidates exist, but no RFQ request has been sent yet.",
+                action_label="Open RFQ Draft",
+                meta={"lead_count": lead_counts.get(opp.id, 0), "nsn": nsn},
+                due_at=opp.due_at,
+            ))
+
+        if is_open and quote_counts.get(opp.id, 0) > 0 and not requested_quotes and not received_quotes and submission_package_counts.get(opp.id, 0) == 0:
             items.append(_item(
                 "MISSING_SUBMISSION_PACKAGE",
                 LOW,
@@ -362,6 +470,141 @@ def build_daily_work_queue(
                 "Quote records exist, but no submission package artifact has been saved.",
                 meta={"quote_count": quote_counts.get(opp.id, 0)},
             ))
+
+        if is_open and not_requested_quotes:
+            items.append(_item(
+                "RFQ_NOT_SENT",
+                HIGH if days_left is not None and days_left <= 3 else MEDIUM,
+                opp,
+                f"Send RFQ to {len(not_requested_quotes)} supplier{'s' if len(not_requested_quotes) != 1 else ''}",
+                "Quote records exist, but outreach has not been marked sent yet.",
+                action_label="Open RFQ Draft",
+                meta={
+                    "quote_ids": [quote.id for quote in not_requested_quotes],
+                    "quote_count": len(not_requested_quotes),
+                    "nsn": nsn,
+                },
+                due_at=opp.due_at,
+            ))
+
+        if is_open and (received_quotes or has_selected_quote):
+            items.append(_item(
+                "READY_TO_SUBMIT",
+                HIGH if days_left is not None and days_left <= 3 else MEDIUM,
+                opp,
+                "Prepare submission package",
+                "A quote has been received and the package can move toward submission.",
+                action_label="Open Submission Package",
+                meta={
+                    "received_quote_count": len(received_quotes),
+                    "selected_quote": has_selected_quote,
+                },
+                due_at=opp.due_at,
+            ))
+
+        if str(getattr(opp, "source", "") or "").upper() == "SAM" and is_open:
+            pipeline = pipelines.get(opp.id)
+            if checklist_counts.get(opp.id, 0) == 0:
+                items.append(_item(
+                    "SAM_CHECKLIST_MISSING",
+                    HIGH if days_left is not None and days_left <= 7 else MEDIUM,
+                    opp,
+                    "Start the proposal checklist",
+                    "No proposal checklist artifact is saved for this SAM opportunity yet.",
+                    action_label="Open Proposal Workspace",
+                    meta={"days_left": days_left},
+                    due_at=opp.due_at,
+                ))
+            if checklist_counts.get(opp.id, 0) > 0 and compliance_matrix_counts.get(opp.id, 0) == 0:
+                items.append(_item(
+                    "SAM_COMPLIANCE_MATRIX_MISSING",
+                    HIGH if days_left is not None and days_left <= 10 else MEDIUM,
+                    opp,
+                    "Build the compliance matrix",
+                    "A proposal checklist exists, but the compliance matrix has not been generated yet.",
+                    action_label="Open Proposal Workspace",
+                    meta={"days_left": days_left},
+                    due_at=opp.due_at,
+                ))
+            if co_email_counts.get(opp.id, 0) == 0:
+                items.append(_item(
+                    "SAM_CO_EMAIL_MISSING",
+                    MEDIUM,
+                    opp,
+                    "Draft contracting officer outreach",
+                    "No contracting officer email draft is saved yet for this SAM opportunity.",
+                    action_label="Open CO Draft",
+                    meta={"days_left": days_left},
+                    due_at=opp.due_at,
+                ))
+            if pipeline is None:
+                items.append(_item(
+                    "SAM_PIPELINE_SETUP",
+                    LOW,
+                    opp,
+                    "Create a proposal workspace record",
+                    "No proposal tracking record exists yet for this SAM opportunity.",
+                    action_label="Open Workspace",
+                    meta={},
+                    due_at=opp.due_at,
+                ))
+            if pipeline is not None and getattr(pipeline, "target_submit_date", None) is None:
+                items.append(_item(
+                    "SAM_TARGET_SUBMIT_DATE_MISSING",
+                    MEDIUM,
+                    opp,
+                    "Set the target submit date",
+                    "Proposal tracking exists, but the target submit date is still blank.",
+                    action_label="Open Proposal Workspace",
+                    meta={"decision_status": getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None))},
+                    due_at=opp.due_at,
+                ))
+            if checklist_counts.get(opp.id, 0) > 0 and task_counts.get(opp.id, 0) == 0:
+                items.append(_item(
+                    "SAM_TASKS_NOT_SEEDED",
+                    MEDIUM,
+                    opp,
+                    "Seed proposal tasks",
+                    "The proposal checklist exists, but no workspace tasks have been created yet.",
+                    action_label="Open Proposal Workspace",
+                    meta={"days_left": days_left},
+                    due_at=opp.due_at,
+                ))
+            if pipeline is not None and open_task_counts.get(opp.id, 0) == 0 and getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None)) in {"IN_PROGRESS", "BID"}:
+                items.append(_item(
+                    "SAM_OPEN_TASKS_MISSING",
+                    HIGH if days_left is not None and days_left <= 7 else MEDIUM,
+                    opp,
+                    "Add active proposal tasks",
+                    "This opportunity is in an active proposal stage, but there are no open workspace tasks right now.",
+                    action_label="Open Proposal Workspace",
+                    meta={"days_left": days_left},
+                    due_at=opp.due_at,
+                ))
+            if pipeline is not None and getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None)) in {"IN_PROGRESS", "BID"} and submission_package_counts.get(opp.id, 0) == 0:
+                items.append(_item(
+                    "SAM_SUBMISSION_PACKAGE_MISSING",
+                    HIGH if days_left is not None and days_left <= 5 else MEDIUM,
+                    opp,
+                    "Build the submission package",
+                    "Proposal work is active, but no submission package artifact has been saved yet.",
+                    action_label="Open Submission Package",
+                    meta={"days_left": days_left},
+                    due_at=opp.due_at,
+                ))
+
+        if str(getattr(opp, "source", "") or "").upper() == "DIBBS" and is_open:
+            if document_counts.get(opp.id, 0) == 0:
+                items.append(_item(
+                    "DIBBS_RFQ_PACKAGE_MISSING",
+                    HIGH if days_left is not None and days_left <= 7 else MEDIUM,
+                    opp,
+                    "Download the RFQ package",
+                    "No RFQ package or document pipeline artifact is saved yet for this DIBBS opportunity.",
+                    action_label="Open RFQ Package",
+                    meta={"days_left": days_left, "nsn": nsn},
+                    due_at=opp.due_at,
+                ))
 
         submission = submissions.get(opp.id)
         if days_left is not None and days_left < 0:
@@ -382,10 +625,13 @@ def build_daily_work_queue(
             signature = _job_signature(spec["kind"], spec["payload"]) if spec else None
             if signature and signature in active_queueable_jobs:
                 in_progress_items.append(
-                    {
-                        **candidate,
-                        "queue_state": active_queueable_jobs[signature],
-                    }
+                    _decorate_mission_item(
+                        {
+                            **candidate,
+                            "queue_state": active_queueable_jobs[signature],
+                        },
+                        queue_state=active_queueable_jobs[signature],
+                    )
                 )
             elif (
                 signature
@@ -393,10 +639,13 @@ def build_daily_work_queue(
                 and recent_completed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
             ):
                 recent_completed_items.append(
-                    {
-                        **candidate,
-                        "queue_state": recent_completed_jobs[signature],
-                    }
+                    _decorate_mission_item(
+                        {
+                            **candidate,
+                            "queue_state": recent_completed_jobs[signature],
+                        },
+                        queue_state=recent_completed_jobs[signature],
+                    )
                 )
             elif (
                 signature
@@ -404,10 +653,14 @@ def build_daily_work_queue(
                 and recent_failed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
             ):
                 recent_failed_items.append(
-                    {
-                        **candidate,
-                        "queue_state": recent_failed_jobs[signature],
-                    }
+                    _decorate_mission_item(
+                        {
+                            **candidate,
+                            "queue_state": recent_failed_jobs[signature],
+                        },
+                        queue_state=recent_failed_jobs[signature],
+                        failed=True,
+                    )
                 )
             else:
                 items.append(candidate)
@@ -426,10 +679,13 @@ def build_daily_work_queue(
             signature = _job_signature(spec["kind"], spec["payload"]) if spec else None
             if signature and signature in active_queueable_jobs:
                 in_progress_items.append(
-                    {
-                        **candidate,
-                        "queue_state": active_queueable_jobs[signature],
-                    }
+                    _decorate_mission_item(
+                        {
+                            **candidate,
+                            "queue_state": active_queueable_jobs[signature],
+                        },
+                        queue_state=active_queueable_jobs[signature],
+                    )
                 )
             elif (
                 signature
@@ -437,10 +693,13 @@ def build_daily_work_queue(
                 and recent_completed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
             ):
                 recent_completed_items.append(
-                    {
-                        **candidate,
-                        "queue_state": recent_completed_jobs[signature],
-                    }
+                    _decorate_mission_item(
+                        {
+                            **candidate,
+                            "queue_state": recent_completed_jobs[signature],
+                        },
+                        queue_state=recent_completed_jobs[signature],
+                    )
                 )
             elif (
                 signature
@@ -448,15 +707,20 @@ def build_daily_work_queue(
                 and recent_failed_jobs[signature].get("payload", {}).get("opportunity_fingerprint") == candidate.get("meta", {}).get("opportunity_fingerprint")
             ):
                 recent_failed_items.append(
-                    {
-                        **candidate,
-                        "queue_state": recent_failed_jobs[signature],
-                    }
+                    _decorate_mission_item(
+                        {
+                            **candidate,
+                            "queue_state": recent_failed_jobs[signature],
+                        },
+                        queue_state=recent_failed_jobs[signature],
+                        failed=True,
+                    )
                 )
             else:
                 items.append(candidate)
 
     priority_order = {HIGH: 0, MEDIUM: 1, LOW: 2}
+    items = [_decorate_mission_item(item) for item in items]
     items.sort(key=lambda item: (priority_order.get(item["priority"], 9), item.get("due_at") or "9999", item["type"]))
     in_progress_items.sort(key=lambda item: (item.get("queue_state", {}).get("status") != "running", item["type"], item["title"]))
     recent_completed_items.sort(key=lambda item: (item.get("queue_state", {}).get("completed_at") or "", item["type"], item["title"]), reverse=True)
@@ -465,9 +729,15 @@ def build_daily_work_queue(
     for item in items:
         summary[item["type"]] = summary.get(item["type"], 0) + 1
         summary[item["priority"]] = summary.get(item["priority"], 0) + 1
+        bucket = item.get("mission_bucket")
+        if bucket:
+            summary[bucket] = summary.get(bucket, 0) + 1
     in_progress_summary: dict[str, int] = {}
     for item in in_progress_items:
         in_progress_summary[item["type"]] = in_progress_summary.get(item["type"], 0) + 1
+        bucket = item.get("mission_bucket")
+        if bucket:
+            in_progress_summary[bucket] = in_progress_summary.get(bucket, 0) + 1
         queue_status = str((item.get("queue_state") or {}).get("status") or "").upper()
         if queue_status:
             in_progress_summary[queue_status] = in_progress_summary.get(queue_status, 0) + 1
@@ -478,6 +748,9 @@ def build_daily_work_queue(
     recent_failed_summary: dict[str, int] = {}
     for item in recent_failed_items:
         recent_failed_summary[item["type"]] = recent_failed_summary.get(item["type"], 0) + 1
+        bucket = item.get("mission_bucket")
+        if bucket:
+            recent_failed_summary[bucket] = recent_failed_summary.get(bucket, 0) + 1
         recent_failed_summary["FAILED"] = recent_failed_summary.get("FAILED", 0) + 1
     collection_summary = {
         "queued": in_progress_summary.get("QUEUED", 0),

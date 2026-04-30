@@ -9,6 +9,7 @@ from app.models.opportunity import Opportunity
 from app.schemas.opportunity import RawOpportunity
 from app.services.org_service import ensure_default_organization
 from app.services.opportunities.normalize import safe_parse_datetime
+from app.services.sam_opportunity_intelligence import apply_sam_opportunity_intelligence
 
 _STRING_LIMITS = {
     "source": 50,
@@ -192,6 +193,10 @@ def upsert_raw_opportunity(
         # make every repeated search look like an updated opportunity.
         payload_changed = _copy_raw_payload(existing, raw, allow_refresh=changed)
 
+        if _safe(getattr(existing, "source", None)) == "SAM":
+            apply_sam_opportunity_intelligence(existing)
+            changed = True
+
         if changed:
             db.add(existing)
             db.commit()
@@ -224,6 +229,8 @@ def upsert_raw_opportunity(
         description=_prepare_value("description", getattr(raw, "description", None)),
         raw_payload=getattr(raw, "raw_payload", None),
     )
+    if _safe(getattr(rec, "source", None)) == "SAM":
+        apply_sam_opportunity_intelligence(rec)
     db.add(rec)
     db.commit()
     db.refresh(rec)

@@ -1,11 +1,17 @@
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, API_BASE_URL } from '../api/client'
 import { EmptyState, Tabs, Badge, Card, Button, Input, LoadingState, StatusPill, Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../components/ui'
 import { setAsideBadgeLabel, setAsideBadgeVariant } from '../utils/badges'
 
-const DECISION_OPTIONS = ['NEW', 'IN_PROGRESS', 'BID', 'NO_BID', 'SUBMITTED']
+const PROGRESS_OPTIONS = [
+  { value: 'NEW', label: 'New' },
+  { value: 'IN_PROGRESS', label: 'Reviewing' },
+  { value: 'BID', label: 'Proposal Started' },
+  { value: 'SUBMITTED', label: 'Submitted' },
+  { value: 'NO_BID', label: 'Archived' },
+]
 const TASK_STATUSES = ['OPEN', 'IN_PROGRESS', 'DONE']
 const SUBMISSION_STATUSES = ['DRAFT', 'SUBMITTED', 'AWARDED', 'LOST', 'NO_BID']
 const AGENT_PHASE_LABELS = {
@@ -159,6 +165,20 @@ const formatBriefText = (value, { punctuate = true } = {}) => {
 }
 
 const formatBriefList = (values, options) => Array.from(new Set((values || []).map((item) => formatBriefText(item, options)).filter(Boolean)))
+const normalizeAnalysisList = (values) => Array.from(
+  new Set(
+    (values || [])
+      .map((item) => {
+        if (!item) return ''
+        if (typeof item === 'string') return formatBriefText(item)
+        if (typeof item === 'object') {
+          return formatBriefText(item.detail || item.message || item.label || item.title || '')
+        }
+        return formatBriefText(String(item))
+      })
+      .filter(Boolean)
+  )
+)
 
 const getDocumentStatusLabel = (file) => {
   const raw = String(file?.processing_status || '').toLowerCase()
@@ -231,6 +251,24 @@ const factValue = (facts, key, fallback = '') => {
   return value
 }
 
+const formatWorkspaceTaskType = (taskType, isSamOpportunity = false) => {
+  const raw = String(taskType || '').trim().toUpperCase()
+  if (!raw) return 'Task'
+  if (isSamOpportunity) {
+    const labels = {
+      NOTICE_REVIEW: 'Notice Review',
+      SCOPE_REVIEW: 'Scope Review',
+      PAST_PERFORMANCE: 'Past Performance',
+      CO_OUTREACH: 'CO Outreach',
+      COMPLIANCE_STEP: 'Compliance Step',
+      COMPLIANCE_REVIEW: 'Compliance Review',
+      FINAL_REVIEW: 'Final Review',
+    }
+    if (labels[raw]) return labels[raw]
+  }
+  return humanizeLabel(raw, 'Task')
+}
+
 const BriefDetailsBox = ({ title, items, emptyMessage = 'No details are available yet.' }) => {
   const lines = items.filter(Boolean)
   return (
@@ -259,6 +297,7 @@ const StructuredList = ({ title, items, emptyMessage }) => (
 export default function Workspace() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const queryClient = useQueryClient()
   const [pipelineForm, setPipelineForm] = useState({
     owner: '',
@@ -291,6 +330,7 @@ export default function Workspace() {
   const [checklistDraft, setChecklistDraft] = useState([])
   const [newChecklistItem, setNewChecklistItem] = useState('')
   const [emailDraft, setEmailDraft] = useState({ subject: '', body: '' })
+  const [coEmailDraft, setCoEmailDraft] = useState({ subject: '', body: '' })
   const [selectedArtifactCompare, setSelectedArtifactCompare] = useState(null)
   const [selectedFileId, setSelectedFileId] = useState(null)
   const [activeIntakeJobId, setActiveIntakeJobId] = useState(null)
@@ -309,6 +349,7 @@ export default function Workspace() {
     submissionPackage: 3,
     submission: 4,
   }
+  const requestedTab = String(searchParams.get('tab') || '').trim().toLowerCase()
 
   const needsVendorData = activeTab === tabIndexes.overview || activeTab === tabIndexes.vendors || activeTab === tabIndexes.submissionPackage || activeTab === tabIndexes.submission
   const needsDocumentData = activeTab === tabIndexes.overview || activeTab === tabIndexes.documents || activeTab === tabIndexes.submissionPackage
@@ -561,6 +602,15 @@ export default function Workspace() {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
     },
   })
+  const generateCoEmailMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/workspace/generate/co-email', { opportunity_id: Number(id) })
+      return res.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+    },
+  })
   const generateResearchBriefMutation = useMutation({
     mutationFn: async () => {
       const res = await api.post('/api/workspace/generate/research-brief', { opportunity_id: Number(id) })
@@ -771,6 +821,41 @@ export default function Workspace() {
   const visibleFiles = hasRealDocuments
     ? files.filter((file) => String(file?.file_type || '').toUpperCase() !== 'PDF_FALLBACK_SNAPSHOT')
     : files
+  const opportunitySource = String(opp.source || '').toUpperCase()
+  const isSamOpportunity = opportunitySource === 'SAM'
+  const isDibbsOpportunity = opportunitySource === 'DIBBS'
+  useEffect(() => {
+    if (!requestedTab) return
+    const dibbsTabMap = {
+      overview: 0,
+      'sources-quotes': 1,
+      'rfq-package': 2,
+      'submission-package': 3,
+      submission: 4,
+    }
+    const samTabMap = {
+      overview: 0,
+      planning: 1,
+      compliance: 2,
+      'market-intelligence': 3,
+      submission: 4,
+    }
+    const nextIndex = (isDibbsOpportunity ? dibbsTabMap : samTabMap)[requestedTab]
+    if (Number.isInteger(nextIndex) && nextIndex !== activeTab) {
+      setActiveTab(nextIndex)
+    }
+  }, [requestedTab, isDibbsOpportunity])
+
+  useEffect(() => {
+    const dibbsKeys = ['overview', 'sources-quotes', 'rfq-package', 'submission-package', 'submission']
+    const samKeys = ['overview', 'planning', 'compliance', 'market-intelligence', 'submission']
+    const keys = isDibbsOpportunity ? dibbsKeys : samKeys
+    const nextKey = keys[activeTab] || 'overview'
+    if (searchParams.get('tab') === nextKey) return
+    const nextParams = new URLSearchParams(searchParams)
+    nextParams.set('tab', nextKey)
+    setSearchParams(nextParams, { replace: true })
+  }, [activeTab, isDibbsOpportunity, searchParams, setSearchParams])
   const parsedSummary = data?.parsed_summary || {}
   const normalizedFacts = data?.normalized_facts || {}
   const normalizedPoc = normalizedFacts.poc || {}
@@ -787,10 +872,12 @@ export default function Workspace() {
   const usaspendingHistoryMatchSource = usaspendingResearchQuery.data?.history_match_source || 'none'
   const researchProfile = usaspendingResearchQuery.data?.research_profile || data?.research_profile || {}
   const checklistArtifact = artifacts.find((artifact) => artifact.artifact_type === 'CHECKLIST') || null
+  const complianceMatrixArtifact = artifacts.find((artifact) => artifact.artifact_type === 'COMPLIANCE_MATRIX') || null
   const emailArtifact =
     artifacts.find((artifact) => artifact.artifact_type === 'EMAIL_DRAFT')
     || artifacts.find((artifact) => artifact.artifact_type === 'OUTREACH_PLAN')
     || null
+  const coEmailArtifact = artifacts.find((artifact) => artifact.artifact_type === 'CO_EMAIL_DRAFT') || null
   const vendorListArtifact = artifacts.find((artifact) => artifact.artifact_type === 'VENDOR_LIST') || null
   const researchBriefArtifact = artifacts.find((artifact) => artifact.artifact_type === 'RESEARCH_BRIEF') || null
   const opportunityAnalysisArtifact = artifacts.find((artifact) => artifact.artifact_type === 'OPPORTUNITY_ANALYSIS') || null
@@ -834,6 +921,18 @@ export default function Workspace() {
   const complianceVendorAsks = complianceArtifact?.content_json?.vendor_request_items || []
   const emailVendorAsks = emailArtifact?.content_json?.vendor_request_items || complianceVendorAsks
   const complianceFields = complianceArtifact?.content_json?.compliance_fields || {}
+  const samDocumentSet = complianceArtifact?.content_json?.document_set || {}
+  const samDocumentInventory = samDocumentSet.document_inventory || []
+  const samAmendments = samDocumentSet.amendment_tracker || []
+  const samMergedFields = samDocumentSet.merged_fields || {}
+  const samConflictFlags = samDocumentSet.conflict_flags || []
+  const samScopeMap = samDocumentSet.scope_map || {}
+  const samEvaluationFactors = complianceArtifact?.content_json?.evaluation_factors || samDocumentSet.evaluation_factors || []
+  const samRequiredAttachments = complianceArtifact?.content_json?.required_attachments || samDocumentSet.required_attachments || []
+  const samServiceSignals = samDocumentSet.service_signals || {}
+  const pastPerformanceMap = data?.past_performance_map || {}
+  const pastPerformanceMatches = pastPerformanceMap.matches || []
+  const pastPerformanceGaps = pastPerformanceMap.coverage_gaps || []
   const factSolicitation = factValue(normalizedFacts, 'solicitation_number', opp.solicitation_number || '')
   const factNsn = factValue(normalizedFacts, 'nsn', parsedSummary.nsn || researchProfile.nsn || '')
   const factNomenclature = factValue(normalizedFacts, 'nomenclature', parsedSummary.nomenclature || researchProfile.nomenclature || '')
@@ -869,6 +968,7 @@ export default function Workspace() {
     )
   )
   const outreachPoc = emailArtifact?.content_json?.solicitation_poc || {}
+  const coPoc = coEmailArtifact?.content_json?.solicitation_poc || normalizedPoc || {}
   const bestWorkspaceFile = [...files]
     .sort((a, b) => {
       const aScore = (a.has_extracted_text ? 2 : 0) + (a.has_parsed_metadata ? 1 : 0)
@@ -1255,6 +1355,13 @@ export default function Workspace() {
   }, [emailArtifact?.id, emailArtifact?.content_json])
 
   useEffect(() => {
+    setCoEmailDraft({
+      subject: coEmailArtifact?.content_json?.subject || '',
+      body: coEmailArtifact?.content_json?.body || '',
+    })
+  }, [coEmailArtifact?.id, coEmailArtifact?.content_json])
+
+  useEffect(() => {
     setSubmissionForm({
       status: submission?.status || 'DRAFT',
       submitted_at: submission?.submitted_at ? new Date(submission.submitted_at).toISOString().slice(0, 16) : '',
@@ -1291,6 +1398,25 @@ export default function Workspace() {
       setSelectedFileId(visibleFiles[0].id)
     }
   }, [visibleFiles, selectedFileId])
+
+  useEffect(() => {
+    if (!id || !isDibbsOpportunity) return
+    if (workspaceQuery.isLoading) return
+    if (filesQuery.isLoading) return
+    if (activeIntakeJobId || isIntakeRunning) return
+    if (visibleFiles.length > 0) return
+    if (runIntakeMutation.isPending) return
+    runIntakeMutation.mutate()
+  }, [
+    id,
+    isDibbsOpportunity,
+    workspaceQuery.isLoading,
+    filesQuery.isLoading,
+    activeIntakeJobId,
+    isIntakeRunning,
+    visibleFiles.length,
+    runIntakeMutation.isPending,
+  ])
 
   if (workspaceQuery.isLoading) {
     return (
@@ -1338,9 +1464,54 @@ export default function Workspace() {
   const isArchivedOpportunity = opp.opportunity_lifecycle === 'ARCHIVED'
   const documentFields = opp.document_fields || {}
   const documentSummary = opp.document_summary || {}
+  const preparedSummaryText =
+    formatBriefText(analysis.ai_summary || opp.prepared_summary || '', { punctuate: false })
+  const preparedRequirements = normalizeAnalysisList(analysis.requirements || opp.prepared_requirements || parsedSummary.sam_intelligence?.requirements || [])
+  const preparedRiskFlags = normalizeAnalysisList(analysis.risk_flags || opp.prepared_risk_flags || parsedSummary.sam_intelligence?.risk_flags || [])
+  const capabilityMatch = analysis.capability_match || data.capability_match || {}
+  const capabilitySignals = normalizeAnalysisList(capabilityMatch.signals || [])
+  const capabilityGaps = normalizeAnalysisList(capabilityMatch.gaps || [])
+  const capabilitySummary =
+    formatBriefText(capabilityMatch.summary || '', { punctuate: false }) || 'Capability alignment has not been reviewed yet.'
   const summaryOverviewText =
-    formatBriefText(opp.summary || documentSummary.summary_text || '', { punctuate: false })
+    preparedSummaryText
+    || formatBriefText(opp.summary || documentSummary.summary_text || '', { punctuate: false })
     || 'No contract overview is available yet.'
+  const overviewTitle = isSamOpportunity ? 'Contract Overview' : 'Part Requirement Overview'
+  const requirementsCardTitle = isSamOpportunity ? 'Requirements To Track' : 'Quote Inputs To Track'
+  const risksCardTitle = isSamOpportunity ? 'Risks To Watch' : 'Sourcing Risks'
+  const progressTitle = isSamOpportunity ? 'Opportunity Progress' : 'RFQ Progress'
+  const progressSubtitle = isSamOpportunity
+    ? 'Use this to track where this opportunity stands in your workflow.'
+    : 'Use this to track sourcing, quote, and submission progress for this RFQ.'
+  const readinessCardTitle = isSamOpportunity ? 'Readiness Snapshot' : 'RFQ Readiness'
+  const workspaceProgressCardTitle = isSamOpportunity ? 'Proposal Plan' : 'Opportunity Progress'
+  const workspaceTasksCardTitle = isSamOpportunity ? 'Proposal Tasks' : 'Workspace Tasks'
+  const checklistArtifactTitle = isSamOpportunity ? 'Proposal Checklist' : 'Checklist Artifact'
+  const checklistArtifactEmptySubtitle = isSamOpportunity
+    ? 'Generate a proposal checklist artifact to track scope review, compliance work, outreach, and submission prep.'
+    : 'Generate a checklist artifact to track requirements and bid readiness.'
+  const documentsCardTitle = isSamOpportunity ? 'Documents' : 'RFQ Package'
+  const documentsButtonLabel = isSamOpportunity ? 'Download Documents' : 'Download RFQ Package'
+  const documentsLoadingLabel = isSamOpportunity ? 'Loading documents...' : 'Loading RFQ package...'
+  const documentsEmptyTitle = isSamOpportunity ? 'No documents yet' : 'No RFQ package yet'
+  const documentsEmptySubtitle = isSamOpportunity
+    ? (data.ui_hints?.empty_artifacts_message || 'Use Download Documents to fetch files for this opportunity.')
+    : 'Download the RFQ package to review the solicitation documents, clauses, and source attachments.'
+  const documentsInsightsSubtitle = isSamOpportunity
+    ? 'Document processing is used by the workspace agents and compliance brief.'
+    : 'Package processing is used to extract RFQ facts, sourcing clues, and submission instructions.'
+  const packageReviewCardTitle = isSamOpportunity ? 'Solicitation Brief' : 'RFQ Package Review'
+  const packageReviewEmptyTitle = isSamOpportunity ? 'No solicitation brief yet' : 'No RFQ package review yet'
+  const packageReviewEmptySubtitle = isSamOpportunity
+    ? 'Download documents and let the processing pipeline organize the scope, submission requirements, missing information, and performance details.'
+    : 'Download the RFQ package and let the processing pipeline organize item details, sourcing requirements, and quote instructions.'
+  const packageFactsTitle = isSamOpportunity ? 'Confirmed Facts' : 'Confirmed RFQ Facts'
+
+  const packageBasisTitle = isSamOpportunity ? 'Document Basis' : 'Package Basis'
+  const packageBasisText = isSamOpportunity
+    ? `${factSourceFile || 'Primary source document unavailable'} was used to build this solicitation brief`
+    : `${factSourceFile || 'Primary source document unavailable'} was used to build this RFQ package review`
   const summaryKeyFacts = [
     { label: 'Solicitation', value: factSolicitation },
     { label: 'Due', value: formatDateTime(factReturnBy) !== '-' ? formatDateTime(factReturnBy) : '' },
@@ -1358,6 +1529,9 @@ export default function Workspace() {
   const checklistCompletedCount = checklistDraft.filter((item) => item.done).length
   const checklistTotalCount = checklistDraft.length
   const checklistProgress = checklistTotalCount > 0 ? Math.round((checklistCompletedCount / checklistTotalCount) * 100) : 0
+  const visibleWorkspaceTasks = isSamOpportunity
+    ? tasks.filter((task) => String(task.task_type || '').trim().toUpperCase() !== 'PROPOSAL_STEP')
+    : tasks
 
   const readinessChecks = [
     { label: 'Opportunity parsed', done: Boolean(factNsn || factNomenclature || parsedSummary.approved_source_count) },
@@ -1366,7 +1540,7 @@ export default function Workspace() {
     { label: 'Email draft generated', done: Boolean(emailArtifact) },
     { label: 'Quote tracker seeded', done: vendorQuotes.length > 0 },
     { label: 'Received quote logged', done: quoteComparison.some((quote) => quote.normalized_status === 'RECEIVED') },
-    { label: 'Bid decision recorded', done: Boolean(pipeline?.decision_status && pipeline.decision_status !== 'NEW') },
+    { label: 'Workspace progress updated', done: Boolean(pipeline?.decision_status && pipeline.decision_status !== 'NEW') },
     { label: 'Submission tracked', done: Boolean(submission?.status && submission.status !== 'DRAFT') },
   ]
   const readinessReadyCount = readinessChecks.filter((item) => item.done).length
@@ -1404,7 +1578,7 @@ export default function Workspace() {
 
   const overviewContent = (
     <div className="workspace-overview">
-        <Card title="Opportunity Summary">
+        <Card>
           <div className="summary-lead-grid">
             <div className="workspace-action-column">
               <div className="row-title">{factSolicitation || 'Solicitation unavailable'}</div>
@@ -1471,7 +1645,7 @@ export default function Workspace() {
 
           <div className="summary-brief-layout">
             <div className="artifact-note-box summary-overview-box">
-              <div className="row-title">Contract Overview</div>
+              <div className="row-title">{overviewTitle}</div>
               <div className="structured-copy">{summaryOverviewText}</div>
             </div>
 
@@ -1504,31 +1678,139 @@ export default function Workspace() {
             </div>
           </div>
 
+          {preparedRequirements.length || (!isSamOpportunity && preparedRiskFlags.length) ? (
+            <div className="workspace-summary-grid">
+              <Card title={requirementsCardTitle}>
+                <div className="artifact-list">
+                  {(preparedRequirements.length ? preparedRequirements : ['No clear submission requirements were extracted yet.']).map((item, index) => (
+                    <div key={`prepared-requirement-${index}`} className="artifact-list-item">{item}</div>
+                  ))}
+                </div>
+              </Card>
+              {!isSamOpportunity ? (
+                <Card title={risksCardTitle}>
+                  <div className="artifact-list">
+                    {(preparedRiskFlags.length ? preparedRiskFlags : ['No immediate risks were flagged from the current notice data.']).map((item, index) => (
+                      <div key={`prepared-risk-${index}`} className="artifact-list-item">{item}</div>
+                    ))}
+                  </div>
+                </Card>
+              ) : null}
+            </div>
+          ) : null}
+
+          {isSamOpportunity ? (
+            <div className="workspace-summary-grid">
+              <Card title="Capability Match">
+                <div className="workspace-action-column">
+                  <div className="artifact-note-box">
+                    <div className="row-title">Profile Alignment</div>
+                    <div className="structured-copy">{capabilitySummary}</div>
+                  </div>
+                  <div className="bid-readiness-grid">
+                    <div>
+                      <div className="row-title">What Lines Up</div>
+                      <div className="artifact-list">
+                        {(capabilitySignals.length ? capabilitySignals : ['No clear capability signals have been identified yet.']).map((item, index) => (
+                          <div key={`capability-signal-${index}`} className="artifact-list-item">{item}</div>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="row-title">What Needs Review</div>
+                      <div className="artifact-list">
+                        {(capabilityGaps.length ? capabilityGaps : ['No obvious capability gaps are flagged right now.']).map((item, index) => (
+                          <div key={`capability-gap-${index}`} className="artifact-list-item">{item}</div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+              <Card title="Contact Contracting Officer">
+                {!coEmailArtifact ? (
+                  <EmptyState
+                    title="No CO draft yet"
+                    subtitle="Generate a draft email to introduce your company or ask for clarification."
+                    action={<Button loading={generateCoEmailMutation.isPending} onClick={() => generateCoEmailMutation.mutate()}>Generate CO Draft</Button>}
+                  />
+                ) : (
+                  <div className="workspace-action-column">
+                    <BriefDetailsBox
+                      title="Point of Contact"
+                      items={[
+                        formatDetailLine('Name', coPoc?.contact_name || coEmailArtifact.content_json?.contact_name || '-'),
+                        formatDetailLine('Email', coPoc?.email || coEmailArtifact.content_json?.to || '-'),
+                        formatDetailLine('Phone', coPoc?.phone || coEmailArtifact.content_json?.contact_phone || '-'),
+                        formatDetailLine('Office', coPoc?.submission_office || coEmailArtifact.content_json?.submission_office || '-'),
+                      ]}
+                      emptyMessage="No contracting officer details were extracted yet."
+                    />
+                    <Input
+                      label="Subject"
+                      value={coEmailDraft.subject}
+                      onChange={(event) => setCoEmailDraft((current) => ({ ...current, subject: event.target.value }))}
+                    />
+                    <div className="company-form-stack">
+                      <label className="textarea-label">Body</label>
+                      <textarea
+                        className="textarea-field textarea-tall"
+                        value={coEmailDraft.body}
+                        onChange={(event) => setCoEmailDraft((current) => ({ ...current, body: event.target.value }))}
+                      />
+                    </div>
+                    <div className="company-form-actions">
+                      <Button
+                        loading={updateArtifactMutation.isPending}
+                        onClick={() => updateArtifactMutation.mutateAsync({
+                          artifactId: coEmailArtifact.id,
+                          body: {
+                            content_json: {
+                              ...coEmailArtifact.content_json,
+                              subject: coEmailDraft.subject,
+                              body: coEmailDraft.body,
+                            },
+                          },
+                        })}
+                      >
+                        Save CO Draft
+                      </Button>
+                      <Button variant="secondary" loading={generateCoEmailMutation.isPending} onClick={() => generateCoEmailMutation.mutate()}>
+                        Regenerate
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </Card>
+            </div>
+          ) : null}
+
           <div className="summary-decision-row">
-            <div className="row-title">Bid Decision</div>
+            <div className="row-title">{progressTitle}</div>
             <div className="decision-chip-row">
-              {DECISION_OPTIONS.map((option) => (
+              {PROGRESS_OPTIONS.map((option) => (
                 <button
-                  key={option}
+                  key={option.value}
                   type="button"
-                  className={`set-aside-chip ${(pipeline?.decision_status || analysis.decision_status || 'NEW') === option ? 'selected' : ''}`}
+                  className={`set-aside-chip ${(pipeline?.decision_status || analysis.decision_status || 'NEW') === option.value ? 'selected' : ''}`}
                   disabled={isClosedSolicitation}
-                  onClick={() => updateDecisionStatus(option)}
+                  onClick={() => updateDecisionStatus(option.value)}
                 >
-                  {humanizeLabel(option)}
+                  {option.label}
                 </button>
               ))}
             </div>
             <div className="panel-subtitle">
               {isClosedSolicitation
-                ? 'Decision changes are disabled because this solicitation is closed.'
-                : 'Use this to track Bid / Not Bid status and pipeline progress.'}
+                ? 'Progress changes are disabled because this solicitation is closed.'
+                : progressSubtitle}
             </div>
           </div>
       </Card>
 
-          <div className="workspace-summary-grid">
-            <Card title="Part Finder">
+          {!isSamOpportunity ? (
+            <div className="workspace-summary-grid">
+              <Card title="Part Finder">
               <div className="workspace-action-column">
                 <div className="results-toolbar">
                   <div>
@@ -1608,12 +1890,12 @@ export default function Workspace() {
                   emptyMessage="Refresh Part Finder to generate sourcing actions."
                 />
               </div>
-            </Card>
+              </Card>
 
-            <Card title="Bid Readiness">
+              <Card title={readinessCardTitle}>
               <div className="workspace-action-column">
                 <div className="artifact-note-box">
-                  <div className="row-title">Readiness Snapshot</div>
+                  <div className="row-title">{readinessCardTitle}</div>
                   <div className="structured-copy">
                     {`${readinessReadyCount} of ${readinessChecks.length} readiness signals are in place. ${readinessPendingCount} item${readinessPendingCount === 1 ? '' : 's'} still need attention.`}
                   </div>
@@ -1661,9 +1943,9 @@ export default function Workspace() {
                   </div>
                 </div>
               </div>
-            </Card>
+              </Card>
 
-            <Card title="AI Briefing">
+              <Card title="AI Briefing">
               <div className="workspace-action-column">
                 <div className="company-form-actions">
                   <Button variant="secondary" loading={generateResearchBriefMutation.isPending} onClick={() => generateResearchBriefMutation.mutate()}>
@@ -1698,8 +1980,188 @@ export default function Workspace() {
                   emptyMessage="No next actions are currently suggested."
                 />
               </div>
-            </Card>
+              </Card>
+            </div>
+          ) : null}
+    </div>
+  )
+
+  const samMarketIntelligenceContent = (
+    <div className="workspace-scoring-panel">
+      <Card title="Past Performance Map">
+        <div className="workspace-action-column">
+          <div className="artifact-note-box">
+            <div className="row-title">Relevance Summary</div>
+            <div className="structured-copy">{pastPerformanceMap.summary || 'No past performance map is available yet.'}</div>
           </div>
+          {pastPerformanceMatches.length === 0 ? (
+            <EmptyState
+              title="No strong past performance match yet"
+              subtitle="Add company past performance records so this workspace can map relevant service projects to the solicitation."
+            />
+          ) : (
+            <div className="workspace-summary-grid sam-brief-grid">
+              {pastPerformanceMatches.map((item, index) => (
+                <Card key={`past-performance-${item.id || index}`} className="vendor-card">
+                  <div className="vendor-header">
+                    <div className="vendor-id">{item.project_title || 'Past performance record'}</div>
+                    <StatusPill status={`Score ${item.score || 0}`} />
+                  </div>
+                  <div className="panel-subtitle">
+                    {[
+                      item.client_name || '',
+                      item.naics_code ? `NAICS ${item.naics_code}` : '',
+                      item.project_value ? formatCurrency(item.project_value) : '',
+                    ].filter(Boolean).join(' | ')}
+                  </div>
+                  <div className="structured-copy">
+                    {formatBriefText(item.description || 'No description saved for this past performance record.', { punctuate: false })}
+                  </div>
+                  <div className="sam-chip-list">
+                    {(item.reasons || []).map((reason, reasonIndex) => (
+                      <div key={`past-performance-reason-${index}-${reasonIndex}`} className="sam-chip">{reason}</div>
+                    ))}
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+          {pastPerformanceGaps.length > 0 ? (
+            <div className="artifact-section">
+              <div className="row-title">Coverage Gaps</div>
+              <div className="artifact-list">
+                {pastPerformanceGaps.map((item, index) => (
+                  <div key={`past-performance-gap-${index}`} className="artifact-list-item">{item}</div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </Card>
+
+      <Card title="Market Intelligence">
+        <div className="workspace-action-column">
+          <div className="company-form-actions">
+            <Button
+              variant="secondary"
+              loading={usaspendingResearchQuery.isFetching}
+              onClick={() => usaspendingResearchQuery.refetch()}
+            >
+              Refresh USAspending Research
+            </Button>
+          </div>
+          {usaspendingVendors.length > 0 ? (
+            <div className="panel-subtitle">
+              Showing {Math.min(usaspendingVendors.length, 8)} likely prior awardee{Math.min(usaspendingVendors.length, 8) === 1 ? '' : 's'} from USAspending history.
+            </div>
+          ) : null}
+          {usaspendingHistoryMatchLabel ? (
+            <div className={`settings-summary-box ${usaspendingHistoryMatchSource === 'fallback' ? 'research-warning-box' : ''}`}>
+              <div className="row-title">History Match Quality</div>
+              <div className="row-subtitle">{usaspendingHistoryMatchLabel}</div>
+              <div className="row-subtitle">{usaspendingHistoryMatchQueryLabel || 'No successful query path yet.'}</div>
+            </div>
+          ) : null}
+        </div>
+
+        {storedAwardHistoryRows.length > 0 ? (
+          <div className="vendor-grid">
+            {(storedAwardees.length ? storedAwardees : storedAwardHistoryRows).slice(0, 8).map((awardee, index) => {
+              const relatedAwards = storedAwardHistoryRows.filter((award) =>
+                (awardee.recipient_name && award.recipient_name === awardee.recipient_name)
+                || (awardee.recipient_cage && award.recipient_cage === awardee.recipient_cage)
+              )
+              const firstAward = relatedAwards[0] || awardee
+              return (
+                <Card key={`${awardee.recipient_name || awardee.recipient_cage || index}-sam-awardee`} className="vendor-card">
+                  <div className="vendor-header">
+                    <div className="vendor-id">{awardee.recipient_name || firstAward.recipient_name || 'Awardee unavailable'}</div>
+                    <StatusPill status={awardee.best_confidence || firstAward.match_confidence || 'Award History'} />
+                  </div>
+                  <div className="panel-subtitle">
+                    {compactMeta([
+                      awardee.recipient_cage || firstAward.recipient_cage ? `CAGE ${awardee.recipient_cage || firstAward.recipient_cage}` : '',
+                      awardee.award_count ? `Awards ${awardee.award_count}` : '',
+                      Number(awardee.total_award_amount) ? `Total ${formatCurrency(awardee.total_award_amount)}` : '',
+                      awardee.latest_award_date ? `Latest ${formatDateOnly(awardee.latest_award_date)}` : '',
+                      (awardee.sources || []).join(' + '),
+                    ]) || 'Stored award evidence is available.'}
+                  </div>
+                  <BriefDetailsBox
+                    title="Why This Awardee Matters"
+                    items={[
+                      formatDetailLine('Evidence', `${awardee.best_confidence || firstAward.match_confidence || 'Stored'} match`),
+                      formatDetailLine('Match Score', awardee.best_score || firstAward.match_score || ''),
+                      formatDetailLine('PSC / FSC', firstAward.psc_code || ''),
+                    ]}
+                    emptyMessage="No matching rationale is available yet."
+                  />
+                  {relatedAwards.slice(0, 2).map((award, awardIndex) => (
+                    <div key={`${award.award_id || awardIndex}-sam-award`} className="vendor-award-snippet">
+                      <div className="row-title">{award.award_id || award.piid || 'Award record unavailable'}</div>
+                      <div className="row-subtitle">
+                        {compactMeta([
+                          award.source_system || '',
+                          formatDateOnly(award.award_date),
+                          formatAwardAmount(award.award_amount),
+                        ])}
+                      </div>
+                      <div className="structured-copy">{formatBriefText(award.description || 'No description available', { punctuate: false })}</div>
+                    </div>
+                  ))}
+                </Card>
+              )
+            })}
+          </div>
+        ) : usaspendingResearchQuery.isLoading ? (
+          <LoadingState label="Loading market intelligence..." />
+        ) : usaspendingResearchQuery.error ? (
+          <EmptyState title="USAspending research unavailable" subtitle="Market intelligence could not be loaded for this opportunity." />
+        ) : usaspendingVendors.length === 0 ? (
+          <EmptyState title="No award history yet" subtitle="Run USAspending research to pull likely prior awardees and contract history." />
+        ) : (
+          <div className="vendor-grid">
+            {usaspendingVendors.slice(0, 8).map((vendor, index) => (
+              <Card key={`${vendor.vendor}-${index}`} className="vendor-card">
+                <div className="vendor-header">
+                  <div className="vendor-id">{vendor.vendor}</div>
+                  <StatusPill status="Past Awardee" />
+                </div>
+                <div className="panel-subtitle">
+                  {compactMeta([
+                    `Award Count ${vendor.award_count || 0}`,
+                    Number(vendor.total_award_amount) ? `Total Awards ${formatCurrency(vendor.total_award_amount)}` : '',
+                    vendor.last_award_date ? `Last Award ${formatDateOnly(vendor.last_award_date)}` : '',
+                  ]) || 'Past-award details are still limited.'}
+                </div>
+                <BriefDetailsBox
+                  title="Why This Awardee Matters"
+                  items={formatAwardeeSignalList(vendor.why_matched || [])}
+                  emptyMessage="No matching rationale is available yet."
+                />
+                <BriefDetailsBox
+                  title="Supporting Evidence"
+                  items={formatAwardeeSignalList(vendor.match_reasons || [])}
+                  emptyMessage="No supporting evidence was captured."
+                />
+                {(vendor.sample_awards || []).slice(0, 2).map((award, awardIndex) => (
+                  <div key={`${vendor.vendor}-sam-award-${awardIndex}`} className="vendor-award-snippet">
+                    <div className="row-title">{award.award_id || 'Award record unavailable'}</div>
+                    <div className="row-subtitle">
+                      {compactMeta([
+                        formatDateOnly(award.start_date),
+                        formatAwardAmount(award.award_amount),
+                        formatBriefText(award.awarding_agency || '', { punctuate: false }) || 'Agency unavailable',
+                      ])}
+                    </div>
+                    <div className="structured-copy">{formatBriefText(award.description || 'No description available', { punctuate: false })}</div>
+                  </div>
+                ))}
+              </Card>
+            ))}
+          </div>
+        )}
+      </Card>
     </div>
   )
 
@@ -2205,13 +2667,41 @@ export default function Workspace() {
 
   const documentsContent = (
     <div className="workspace-documents-panel">
-      <Card title="Documents">
+      <Card title={documentsCardTitle}>
         <div className="workspace-action-column">
           <div className="company-form-actions">
             <Button loading={downloadPdfsMutation.isPending || isIntakeRunning} onClick={() => downloadPdfsMutation.mutate()}>
-              Download Documents
+              {documentsButtonLabel}
             </Button>
           </div>
+          {isSamOpportunity && samDocumentInventory.length > 0 ? (
+            <div className="workspace-summary-grid sam-brief-grid">
+              <Card title="Document Set">
+                <div className="artifact-list">
+                  {samDocumentInventory.map((item, index) => (
+                    <div key={`sam-doc-inventory-${item.file_id || index}`} className="artifact-list-item">
+                      <strong>{item.document_type || 'Document'}:</strong> {item.filename}
+                      {item.amendment_number ? ` | ${item.amendment_number}` : ''}
+                    </div>
+                  ))}
+                </div>
+              </Card>
+              <Card title="Amendment Tracker">
+                {samAmendments.length === 0 ? (
+                  <div className="panel-subtitle">No amendments are currently identified in the downloaded document set.</div>
+                ) : (
+                  <div className="artifact-list">
+                    {samAmendments.map((item, index) => (
+                      <div key={`sam-amendment-${index}`} className="artifact-list-item">
+                        <strong>{item.amendment_number || 'Amendment'}:</strong> {item.filename}
+                        {item.return_by ? ` | Due ${formatDateTime(item.return_by)}` : ''}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            </div>
+          ) : null}
           {activeIntakeJob ? (
             <div className="search-progress-box">
               <div className="search-progress-header">
@@ -2248,11 +2738,11 @@ export default function Workspace() {
             </div>
           ) : null}
           {filesQuery.isLoading ? (
-            <LoadingState label="Loading documents..." />
+            <LoadingState label={documentsLoadingLabel} />
           ) : visibleFiles.length === 0 ? (
             <EmptyState
-              title="No documents yet"
-              subtitle={data.ui_hints?.empty_artifacts_message || 'Use Download Documents to fetch files for this opportunity.'}
+              title={documentsEmptyTitle}
+              subtitle={documentsEmptySubtitle}
             />
           ) : isCompactWorkspace ? (
             <div className="workspace-mobile-card-list">
@@ -2350,7 +2840,7 @@ export default function Workspace() {
                 <div>
                   <div className="row-title">{fileInsights?.filename || selectedFile.filename}</div>
                   <div className="row-subtitle">
-                    Document processing is used by the workspace agents and compliance brief.
+                    {documentsInsightsSubtitle}
                   </div>
                 </div>
                 <div className="workspace-action-column">
@@ -2374,17 +2864,72 @@ export default function Workspace() {
         </div>
       </Card>
 
-      <Card title="Compliance Brief">
+      <Card title={packageReviewCardTitle}>
         {!complianceArtifact ? (
           <EmptyState
-            title="No compliance brief yet"
-            subtitle="Download documents and let the processing pipeline organize what the solicitation requires, what is still missing, and what vendors need to answer."
+            title={packageReviewEmptyTitle}
+            subtitle={packageReviewEmptySubtitle}
           />
         ) : (
           <div className="workspace-action-column">
+            {isSamOpportunity ? (
+              <div className="workspace-summary-grid sam-brief-grid">
+                <Card title="Scope Map">
+                  <div className="workspace-action-column">
+                    <div className="artifact-note-box">
+                      <div className="row-title">Service Pursuit Summary</div>
+                      <div className="structured-copy">
+                        {(samScopeMap.scope_summary || []).join(' ')}
+                      </div>
+                    </div>
+                    <div className="artifact-section">
+                      <div className="row-title">Performance Signals</div>
+                      {(samScopeMap.performance_signals || []).length === 0 ? (
+                        <div className="panel-subtitle">No service-performance signals have been extracted yet.</div>
+                      ) : (
+                        <div className="sam-chip-list">
+                          {(samScopeMap.performance_signals || []).map((item, index) => (
+                            <div key={`sam-signal-${index}`} className="sam-chip">{item}</div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </Card>
+                <Card title="Conflict Detection">
+                  {samConflictFlags.length === 0 ? (
+                    <div className="artifact-note-box sam-okay-box">
+                      <div className="row-title">No major document conflicts detected</div>
+                      <div className="panel-subtitle">Due date, submission destination, period of performance, and page-limit signals are currently aligned across the loaded SAM document set.</div>
+                    </div>
+                  ) : (
+                    <div className="workspace-action-column">
+                      <div className="artifact-note-box sam-warning-box">
+                        <div className="row-title">Review these document conflicts before shaping the proposal</div>
+                      </div>
+                      <div className="artifact-list">
+                        {samConflictFlags.map((item, index) => (
+                          <div key={`sam-conflict-${index}`} className="artifact-list-item">{item}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </Card>
+              </div>
+            ) : null}
             <BriefDetailsBox
-              title="Confirmed Facts"
-              items={[
+              title={packageFactsTitle}
+              items={isSamOpportunity ? [
+                formatDetailLine('Solicitation', samMergedFields.solicitation_number || factSolicitation || '-'),
+                formatDetailLine('Agency', opp.agency || '-'),
+                formatDetailLine('NAICS', samMergedFields.naics_code || factNaics || '-'),
+                formatDetailLine('Set-Aside', samMergedFields.set_aside_hint ? setAsideBadgeLabel(samMergedFields.set_aside_hint) : (factSetAside ? setAsideBadgeLabel(factSetAside) : '-')),
+                formatDetailLine('Place of Performance', samServiceSignals.place_of_performance || opp.place_of_performance || '-'),
+                formatDetailLine('Period of Performance', samServiceSignals.period_of_performance || samMergedFields.period_of_performance || '-'),
+                formatDetailLine('Return By', formatDateTime(samMergedFields.return_by || factReturnBy)),
+                formatDetailLine('Submission Office', samMergedFields.submission_office_hint || factSubmissionOffice || '-'),
+                formatDetailLine('Source File', factSourceFile || '-'),
+              ] : [
                 formatDetailLine('Solicitation', factSolicitation || '-'),
                 formatDetailLine('NSN', factNsn || '-'),
                 formatDetailLine('Item', factNomenclature || '-'),
@@ -2397,14 +2942,87 @@ export default function Workspace() {
               ]}
             />
             <div className="artifact-note-box">
-              <div className="row-title">Document Basis</div>
+              <div className="row-title">{packageBasisTitle}</div>
               <div className="structured-copy">
-                {formatBriefText(
-                  `${factSourceFile || 'Primary source document unavailable'} was used to build this compliance brief`,
-                  { punctuate: true }
-                )}
+                {formatBriefText(packageBasisText, { punctuate: true })}
               </div>
             </div>
+            {isSamOpportunity ? (
+              <>
+                <div className="artifact-section">
+                  <div className="row-title">Scope And Performance Signals</div>
+                  <div className="artifact-list">
+                    {(complianceArtifact.content_json?.document_findings || []).length ? (
+                      (complianceArtifact.content_json?.document_findings || []).map((item, index) => (
+                        <div key={`sam-finding-${index}`} className="artifact-list-item">{item}</div>
+                      ))
+                    ) : (
+                      <div className="artifact-list-item">No scope or performance signals were extracted yet.</div>
+                    )}
+                  </div>
+                </div>
+                <div className="artifact-section">
+                  <div className="row-title">Submission Requirements</div>
+                  <div className="artifact-list">
+                    {(complianceActionItems.length ? complianceActionItems : ['No submission requirements were extracted yet.']).map((item, index) => (
+                      <div key={`sam-action-${index}`} className="artifact-list-item">{item}</div>
+                    ))}
+                  </div>
+                </div>
+                <div className="artifact-section">
+                  <div className="row-title">Evaluation Factors</div>
+                  {samEvaluationFactors.length === 0 ? (
+                    <div className="panel-subtitle">No clear evaluation factors have been extracted yet from the current document set.</div>
+                  ) : (
+                    <div className="sam-chip-list">
+                      {samEvaluationFactors.map((item, index) => (
+                        <div key={`sam-eval-${index}`} className="sam-chip">{item}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="artifact-section">
+                  <div className="row-title">Required Attachments</div>
+                  {samRequiredAttachments.length === 0 ? (
+                    <div className="panel-subtitle">No explicit attachment requirements have been extracted yet.</div>
+                  ) : (
+                    <div className="artifact-list">
+                      {samRequiredAttachments.map((item, index) => (
+                        <div key={`sam-attachment-${index}`} className="artifact-list-item">{item}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="artifact-section">
+                  <div className="row-title">Missing Or Unconfirmed Information</div>
+                  {complianceNeedsReview.length === 0 ? (
+                    <div className="panel-subtitle">No major gaps are currently flagged from the loaded documents.</div>
+                  ) : (
+                    <div className="artifact-list">
+                      {complianceNeedsReview.map((item, index) => (
+                        <div key={`sam-review-${index}`} className="artifact-list-item">{item}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="artifact-section">
+                  <div className="row-title">Amendment Notes</div>
+                  {samAmendments.length === 0 ? (
+                    <div className="panel-subtitle">No amendment notes are available yet.</div>
+                  ) : (
+                    <div className="artifact-list">
+                      {samAmendments.flatMap((item, index) =>
+                        (item.likely_changes || []).map((change, changeIndex) => (
+                          <div key={`sam-amendment-note-${index}-${changeIndex}`} className="artifact-list-item">
+                            <strong>{item.amendment_number || 'Amendment'}:</strong> {change}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : null}
           </div>
         )}
       </Card>
@@ -2413,7 +3031,7 @@ export default function Workspace() {
 
   const scoringContent = (
     <div className="workspace-scoring-panel">
-      <Card title="Pipeline Status">
+      <Card title={workspaceProgressCardTitle}>
         {!pipeline ? (
           <EmptyState
             title="No pipeline record yet"
@@ -2422,7 +3040,7 @@ export default function Workspace() {
                   ? 'This archived solicitation stays searchable for sourcing, pricing, documents, and extracted intelligence.'
                   : isClosedSolicitation
                   ? 'This closed solicitation can still be researched, but new active pipeline tracking is disabled.'
-                  : 'Create a workspace record to start tracking Bid / Not Bid decisions.'
+                  : 'Create a workspace record to start tracking review, proposal, and submission progress.'
               }
               action={isArchivedOpportunity ? null : (
                 <Button
@@ -2458,21 +3076,23 @@ export default function Workspace() {
                 </select>
               </div>
               <Input
-                label="Probability of Win"
-                type="number"
-                min="0"
-                max="100"
-                value={pipelineForm.probability_of_win}
-                disabled={isClosedSolicitation}
-                onChange={(event) => setPipelineForm((current) => ({ ...current, probability_of_win: event.target.value }))}
-              />
-              <Input
                 label="Target Submit Date"
                 type="datetime-local"
                 value={pipelineForm.target_submit_date}
                 disabled={isClosedSolicitation}
                 onChange={(event) => setPipelineForm((current) => ({ ...current, target_submit_date: event.target.value }))}
               />
+              {!isSamOpportunity ? (
+                <Input
+                  label="Probability of Win"
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={pipelineForm.probability_of_win}
+                  disabled={isClosedSolicitation}
+                  onChange={(event) => setPipelineForm((current) => ({ ...current, probability_of_win: event.target.value }))}
+                />
+              ) : null}
             </div>
             <div className="company-form-stack">
               <label className="textarea-label">Notes</label>
@@ -2506,7 +3126,7 @@ export default function Workspace() {
 
   const tasksContent = (
     <div className="workspace-scoring-panel">
-      <Card title="Workspace Tasks">
+      <Card title={workspaceTasksCardTitle}>
         <div className="workspace-action-column">
           <div className="company-form-grid">
             <Input
@@ -2550,14 +3170,17 @@ export default function Workspace() {
             ) : null}
           </div>
 
-          {tasks.length === 0 ? (
-            <EmptyState title="No tasks yet" subtitle="Add the next concrete actions for capture, quoting, and submission." />
+          {visibleWorkspaceTasks.length === 0 ? (
+            <EmptyState
+              title={isSamOpportunity ? 'No planning tasks yet' : 'No tasks yet'}
+              subtitle={isSamOpportunity ? 'Structured planning tasks will appear here once the proposal workflow is prepared.' : 'Add the next concrete actions for capture, quoting, and submission.'}
+            />
           ) : (
             <div className="workspace-action-column">
-              {tasks.map((task) => (
+              {visibleWorkspaceTasks.map((task) => (
                 <div key={task.id} className="task-card">
                   <div className="task-card-row">
-                    <div className="row-title">{task.task_type}</div>
+                    <div className="row-title">{formatWorkspaceTaskType(task.task_type, isSamOpportunity)}</div>
                     <select
                       disabled={isClosedSolicitation}
                       value={task.status}
@@ -2596,116 +3219,151 @@ export default function Workspace() {
 
   const artifactsContent = (
     <div className="workspace-scoring-panel">
-      <Card title="Checklist Artifact">
-        {!checklistArtifact ? (
-          <EmptyState
-            title="No checklist yet"
-            subtitle="Generate a checklist artifact to track requirements and bid readiness."
-            action={<Button loading={generateChecklistMutation.isPending} onClick={() => generateChecklistMutation.mutate()}>Generate Checklist</Button>}
-          />
-        ) : (
-          <div className="workspace-action-column">
-            <div className="workspace-summary-grid">
-              <div className="workspace-action-column">
-                <div><strong>Status:</strong> {checklistArtifact.content_json?.solicitation_status || solicitationStatus}</div>
-                <div><strong>Completed:</strong> {checklistCompletedCount} of {checklistTotalCount}</div>
-                <div><strong>Progress:</strong> {checklistProgress}%</div>
+      {!isSamOpportunity ? (
+        <Card title={checklistArtifactTitle}>
+          {!checklistArtifact ? (
+            <EmptyState
+              title="No checklist yet"
+              subtitle={checklistArtifactEmptySubtitle}
+              action={<Button loading={generateChecklistMutation.isPending} onClick={() => generateChecklistMutation.mutate()}>Generate Checklist</Button>}
+            />
+          ) : (
+            <div className="workspace-action-column">
+              <div className="workspace-summary-grid">
+                <div className="workspace-action-column">
+                  <div><strong>Status:</strong> {checklistArtifact.content_json?.solicitation_status || solicitationStatus}</div>
+                  <div><strong>Completed:</strong> {checklistCompletedCount} of {checklistTotalCount}</div>
+                  <div><strong>Progress:</strong> {checklistProgress}%</div>
+                </div>
+                <div className="workspace-action-column">
+                  <div><strong>NSN:</strong> {checklistArtifact.content_json?.nsn || parsedSummary.nsn || '-'}</div>
+                  <div><strong>Solicitation:</strong> {checklistArtifact.content_json?.solicitation || opp.solicitation_number || '-'}</div>
+                  <div><strong>Due:</strong> {formatDateTime(checklistArtifact.content_json?.due_at || opp.due_at)}</div>
+                </div>
               </div>
               <div className="workspace-action-column">
-                <div><strong>NSN:</strong> {checklistArtifact.content_json?.nsn || parsedSummary.nsn || '-'}</div>
-                <div><strong>Solicitation:</strong> {checklistArtifact.content_json?.solicitation || opp.solicitation_number || '-'}</div>
-                <div><strong>Due:</strong> {formatDateTime(checklistArtifact.content_json?.due_at || opp.due_at)}</div>
+                {checklistDraft.map((item, index) => {
+                  const isCustomItem = String(item.id || '').startsWith('custom-')
+                  return (
+                    <div key={item.id || index} className="task-card">
+                      <div className="checklist-toggle-row">
+                        <label className="checklist-text-block">
+                          <input
+                            type="checkbox"
+                            checked={item.done}
+                            onChange={(event) =>
+                              setChecklistDraft((current) =>
+                                current.map((entry, entryIndex) =>
+                                  entryIndex === index ? { ...entry, done: event.target.checked } : entry
+                                )
+                              )
+                            }
+                          />
+                          <span className={item.done ? 'checklist-text completed' : 'checklist-text'}>{item.text}</span>
+                        </label>
+                        {isCustomItem ? (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() =>
+                              setChecklistDraft((current) => current.filter((_, entryIndex) => entryIndex !== index))
+                            }
+                          >
+                            Remove
+                          </Button>
+                        ) : null}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
-            </div>
-            {checklistDraft.map((item, index) => (
-              <div key={item.id || index} className="checklist-edit-row">
-                <input
-                  type="checkbox"
-                  checked={item.done}
-                  onChange={(event) =>
-                    setChecklistDraft((current) =>
-                      current.map((entry, entryIndex) =>
-                        entryIndex === index ? { ...entry, done: event.target.checked } : entry
-                      )
-                    )
-                  }
-                />
+              <div className="checklist-add-row">
                 <Input
-                  value={item.text}
-                  onChange={(event) =>
-                    setChecklistDraft((current) =>
-                      current.map((entry, entryIndex) =>
-                        entryIndex === index ? { ...entry, text: event.target.value } : entry
-                      )
-                    )
-                  }
+                  placeholder="Add a custom checklist item..."
+                  value={newChecklistItem}
+                  onChange={(event) => setNewChecklistItem(event.target.value)}
                 />
                 <Button
-                  size="sm"
                   variant="secondary"
-                  onClick={() =>
-                    setChecklistDraft((current) => current.filter((_, entryIndex) => entryIndex !== index))
-                  }
+                  onClick={() => {
+                    const nextText = newChecklistItem.trim()
+                    if (!nextText) return
+                    setChecklistDraft((current) => [
+                      ...current,
+                      {
+                        id: `custom-${Date.now()}`,
+                        text: nextText,
+                        done: false,
+                      },
+                    ])
+                    setNewChecklistItem('')
+                  }}
                 >
-                  Remove
+                  Add Item
                 </Button>
               </div>
-            ))}
-            <div className="checklist-add-row">
-              <Input
-                placeholder="Add a custom checklist item..."
-                value={newChecklistItem}
-                onChange={(event) => setNewChecklistItem(event.target.value)}
-              />
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  const nextText = newChecklistItem.trim()
-                  if (!nextText) return
-                  setChecklistDraft((current) => [
-                    ...current,
-                    {
-                      id: `custom-${Date.now()}`,
-                      text: nextText,
-                      done: false,
-                    },
-                  ])
-                  setNewChecklistItem('')
-                }}
-              >
-                Add Item
-              </Button>
-            </div>
-            <div className="company-form-actions">
-              <Button
-                loading={updateArtifactMutation.isPending}
-                onClick={async () => {
-                  await updateArtifactMutation.mutateAsync({
-                    artifactId: checklistArtifact.id,
-                    body: {
-                      content_json: {
-                        ...checklistArtifact.content_json,
-                        solicitation_status: checklistArtifact.content_json?.solicitation_status || solicitationStatus,
-                        checklist: checklistDraft.map((item) => ({ id: item.id, text: item.text, done: item.done })),
+              <div className="company-form-actions">
+                <Button
+                  loading={updateArtifactMutation.isPending}
+                  onClick={async () => {
+                    await updateArtifactMutation.mutateAsync({
+                      artifactId: checklistArtifact.id,
+                      body: {
+                        content_json: {
+                          ...checklistArtifact.content_json,
+                          solicitation_status: checklistArtifact.content_json?.solicitation_status || solicitationStatus,
+                          checklist: checklistDraft.map((item) => ({ id: item.id, text: item.text, done: item.done })),
+                        },
                       },
-                    },
-                  })
-                }}
-              >
-                Save Checklist
-              </Button>
-              <Button
-                variant="secondary"
-                loading={generateChecklistMutation.isPending}
-                onClick={() => generateChecklistMutation.mutate()}
-              >
-                Regenerate
-              </Button>
+                    })
+                  }}
+                >
+                  Save Checklist
+                </Button>
+                <Button
+                  variant="secondary"
+                  loading={generateChecklistMutation.isPending}
+                  onClick={() => generateChecklistMutation.mutate()}
+                >
+                  Regenerate
+                </Button>
+              </div>
             </div>
-          </div>
-        )}
-      </Card>
+          )}
+        </Card>
+      ) : null}
 
+      {isSamOpportunity ? (
+        <Card title="Compliance Matrix">
+          {!complianceMatrixArtifact ? (
+            <EmptyState
+              title="No compliance matrix yet"
+              subtitle="Download the solicitation package and the workspace will organize requirements, review items, and missing information here."
+            />
+          ) : (
+            <div className="workspace-action-column">
+              <div className="panel-subtitle">
+                Source file: {complianceMatrixArtifact.content_json?.source_file || 'Not captured yet'}
+              </div>
+              <div className="artifact-list">
+                {(complianceMatrixArtifact.content_json?.matrix_rows || []).map((row, index) => (
+                  <div key={row.id || `matrix-row-${index}`} className="artifact-list-item">
+                    <strong>{row.category || 'Requirement'}:</strong> {row.requirement}
+                    {row.due_at ? ` | Due ${formatDateOnly(row.due_at)}` : ''}
+                    {row.owner_hint ? ` | ${row.owner_hint}` : ''}
+                  </div>
+                ))}
+                {!(complianceMatrixArtifact.content_json?.matrix_rows || []).length ? (
+                  <div className="artifact-list-item">No compliance rows were generated yet.</div>
+                ) : null}
+              </div>
+            </div>
+          )}
+        </Card>
+      ) : null}
+
+      {!isSamOpportunity ? (
+        <>
         <Card title="Email Draft Artifact">
           {!emailArtifact ? (
             <EmptyState
@@ -3102,6 +3760,8 @@ export default function Workspace() {
           </div>
         )}
       </Card>
+        </>
+      ) : null}
     </div>
   )
 
@@ -3676,37 +4336,52 @@ export default function Workspace() {
     </div>
   )
 
-  const tabs = [
-    { label: 'Overview', content: overviewContent },
-    { label: 'Vendors', content: vendorsContent },
-    { label: 'Documents', content: documentsContent },
-    { label: 'Submission Package', content: submissionPackageContent },
-    { label: 'Submission', content: submissionContent },
-  ]
+  const tabs = isDibbsOpportunity
+    ? [
+        { label: 'Overview', content: overviewContent },
+        { label: 'Sources & Quotes', content: vendorsContent },
+        { label: 'RFQ Package', content: documentsContent },
+        { label: 'Submission Package', content: submissionPackageContent },
+        { label: 'Submission', content: submissionContent },
+      ]
+    : [
+        { label: 'Overview', content: overviewContent },
+        {
+          label: 'Planning',
+          content: (
+            <div className="workspace-action-column">
+              {scoringContent}
+            </div>
+          ),
+        },
+        {
+          label: 'Compliance',
+          content: (
+            <div className="workspace-action-column">
+              {artifactsContent}
+              {documentsContent}
+            </div>
+          ),
+        },
+        { label: 'Market Intelligence', content: samMarketIntelligenceContent },
+        {
+          label: 'Submission',
+          content: (
+            <div className="workspace-action-column">
+              {submissionPackageContent}
+              {submissionContent}
+            </div>
+          ),
+        },
+      ]
 
   return (
     <div className="page workspace-page">
-      <div className="workspace-header workspace-hero">
-        <div className="workspace-hero-copy">
-          <div className="workspace-kicker">Opportunity Workspace</div>
-          <h1 className="page-title">{opp.display_title || opp.title || 'Opportunity Workspace'}</h1>
-          <div className="workspace-hero-subtitle">
-            {opp.agency || 'Agency unavailable'} | {opp.source || 'Source unavailable'} | Due {formatDateOnly(factReturnBy)}
-          </div>
-        </div>
-        <div className="workspace-hero-meta">
-          <StatusPill status={solicitationStatus || 'UNKNOWN'} />
-          {opp.source ? <Badge label={opp.source} variant={opp.source === 'SAM' ? 'success' : 'info'} /> : null}
-          {opp.set_aside_type ? <Badge label={setAsideBadgeLabel(opp.set_aside_type)} variant={setAsideBadgeVariant(opp.set_aside_type)} /> : null}
-        </div>
-      </div>
       <Tabs
         tabs={tabs}
         activeTab={activeTab}
         onChange={setActiveTab}
         className="workspace-tabs"
-        mobileSelect
-        mobileLabel="Workspace section"
       />
     </div>
   )

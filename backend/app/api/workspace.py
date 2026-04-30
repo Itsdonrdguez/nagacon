@@ -11,6 +11,7 @@ from app.models.opportunity_file import OpportunityFile
 from app.models.vendor import VendorLead
 from app.models.workspace import WorkspaceArtifact, WorkspaceTask
 from app.repositories.agents import AgentRunRepository
+from app.repositories.company import CompanyRepository
 from app.repositories.vendor_matches import VendorMatchRepository
 from app.repositories.pipeline import PipelineRepository
 from app.schemas.agent import AgentRunCreate, AgentRunUpdate
@@ -20,6 +21,7 @@ from app.services.agents.workspace_agents import PHASE_AGENT_MAP, run_workspace_
 from app.services.bid_submission_service import get_submission
 from app.services.recommendation_engine import build_workspace_recommendation
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
+from app.services.sam_capability_match import build_sam_capability_match
 from app.services.research.usaspending_research_service import search_usaspending_for_opportunity, seed_usaspending_vendors_into_leads
 from app.services.intelligence.nsn_intelligence_service import get_nsn_intelligence, run_nsn_intelligence
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs, seed_vendor_leads_from_providers
@@ -27,7 +29,7 @@ from app.services.vendor_service import promote_vendor_lead_to_quote_request, sy
 from app.services.vendor_email_automation import generate_quote_request_email
 from app.services.vendor_email_automation import send_email_message
 from app.services.vendors.discovery import discover_vendors_for_opportunity
-from app.services.workspace_service import build_normalized_facts, build_research_profile, create_artifact, ensure_parsed, generate_checklist, generate_quote_email, generate_research_brief, generate_submission_package, generate_vendor_shortlist, get_best_processed_document_data
+from app.services.workspace_service import build_normalized_facts, build_research_profile, build_sam_past_performance_map, create_artifact, ensure_parsed, generate_checklist, generate_compliance_matrix, generate_contracting_officer_email, generate_quote_email, generate_research_brief, generate_submission_package, generate_vendor_shortlist, get_best_processed_document_data, seed_proposal_tasks
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
 from app.utils.solicitation_status import derive_solicitation_status
 from app.utils.title_normalizer import build_summary_text
@@ -350,6 +352,17 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             compliance_json = dict(getattr(compliance_artifact, "content_json", None) or {})
         except Exception:
             _safe_session_call(db, "rollback")
+    if str(getattr(opp, "source", "") or "").upper() == "SAM":
+        try:
+            checklist_artifact = next((artifact for artifact in artifacts if artifact.artifact_type == "CHECKLIST"), None)
+            if checklist_artifact is None:
+                generate_checklist(db, opp)
+            if compliance_json:
+                generate_compliance_matrix(db, opp)
+            seed_proposal_tasks(db, opp)
+            artifacts = artifacts_query.order_by(WorkspaceArtifact.created_at.desc()).all()
+        except Exception:
+            _safe_session_call(db, "rollback")
     tasks_query = db.query(WorkspaceTask).filter(WorkspaceTask.opportunity_id == opp_id)
     if org_id is not None:
         tasks_query = tasks_query.filter(WorkspaceTask.organization_id == org_id)
@@ -362,12 +375,18 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     submission = get_submission(db, opp_id)
 
     parsed = getattr(opp, "parsed_json", None) or {}
+    sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed, dict) else {}
+    if not isinstance(sam_intelligence, dict):
+        sam_intelligence = {}
     if not parsed:
         try:
             parsed = ensure_parsed(db, opp)
         except Exception:
             _safe_session_call(db, "rollback")
             parsed = getattr(opp, "parsed_json", None) or {}
+        sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed, dict) else {}
+        if not isinstance(sam_intelligence, dict):
+            sam_intelligence = {}
     parsed_summary = {
         "nsn": document_data.get("fields", {}).get("nsn") or parsed.get("nsn"),
         "nomenclature": document_data.get("fields", {}).get("nomenclature") or document_data.get("summary", {}).get("title") or parsed.get("nomenclature") or parsed.get("item_description"),
@@ -379,9 +398,13 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
         "document_source_file": document_data.get("filename"),
         "document_type": document_data.get("pipeline", {}).get("document_type"),
         "document_summary": document_data.get("summary") or {},
+        "sam_intelligence": sam_intelligence,
     }
     normalized_facts = build_normalized_facts(opp, parsed, document_data, compliance_json)
     research_profile = build_research_profile(opp, parsed)
+    company_profile = CompanyRepository(db).get_first_profile()
+    capability_match = build_sam_capability_match(opp, company_profile) if str(getattr(opp, "source", "")).upper() == "SAM" else {}
+    past_performance_map = build_sam_past_performance_map(db, opp) if str(getattr(opp, "source", "")).upper() == "SAM" else {}
     try:
         recommendation = build_workspace_recommendation(
             db,
@@ -403,6 +426,9 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     opportunity_payload["document_fields"] = document_data.get("fields") or {}
     opportunity_payload["document_source_file"] = document_data.get("filename")
     opportunity_payload["document_requirements_count"] = len(document_data.get("requirements") or [])
+    opportunity_payload["prepared_summary"] = getattr(analysis, "ai_summary", None) or sam_intelligence.get("summary")
+    opportunity_payload["prepared_requirements"] = sam_intelligence.get("requirements") or []
+    opportunity_payload["prepared_risk_flags"] = (getattr(analysis, "risk_flags", None) if analysis else None) or sam_intelligence.get("risk_flags") or []
 
     recent_activity = []
     if pipeline_item and getattr(pipeline_item, "updated_at", None):
@@ -463,10 +489,14 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             "risk_flags": recommendation.get("risk_flags") or (getattr(analysis, "risk_flags", []) if analysis else []),
             "fit_score": (recommendation.get("score_breakdown") or {}).get("strategic_fit") or (getattr(analysis, "fit_score", 0) if analysis else 0),
             "ai_summary": recommendation.get("summary") or (getattr(analysis, "ai_summary", None) if analysis else None),
+            "requirements": sam_intelligence.get("requirements") or [],
             "decision_status": getattr(opp, "decision_status", None),
             "recommendation": recommendation,
+            "capability_match": capability_match,
         },
         "recommendation": recommendation,
+        "capability_match": capability_match,
+        "past_performance_map": past_performance_map,
         "vendor_matches": vendor_matches,
         "artifacts": [_artifact_payload(artifact) for artifact in artifacts],
         "tasks": [
@@ -794,6 +824,24 @@ def generate_email(payload: GenerateIn, db: Session = Depends(get_db), current_o
     artifact = generate_quote_email(db, opp)
     return {
         "status": "email_generated",
+        "opportunity_id": opp.id,
+        "display_title": getattr(opp, "display_title", opp.title),
+        "artifact": {
+            "id": artifact.id,
+            "artifact_type": artifact.artifact_type,
+            "title": artifact.title,
+            "content_json": artifact.content_json,
+        },
+    }
+
+
+@router.post("/generate/co-email")
+def generate_co_email(payload: GenerateIn, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+    opp_id = payload.opportunity_id
+    opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
+    artifact = generate_contracting_officer_email(db, opp)
+    return {
+        "status": "co_email_generated",
         "opportunity_id": opp.id,
         "display_title": getattr(opp, "display_title", opp.title),
         "artifact": {

@@ -12,6 +12,7 @@ from app.services.dibbs.session import (
     _click_ok_if_present,
     _goto_with_retry,
     capture_dibbs_page_state,
+    dibbs_debug_scope,
     dibbs_log,
     dibbs_page,
 )
@@ -73,13 +74,11 @@ def _looks_like_solicitation(value: str | None) -> bool:
 
 def _accept_warning_if_needed(page: Page) -> None:
     dibbs_log("custom_query.warning.begin", url=page.url)
-    _click_ok_if_present(page)
-    if page.locator("#butAgree").count() > 0:
-        dibbs_log("custom_query.warning.agree.click", url=page.url)
-        page.locator("#butAgree").click()
-        page.wait_for_load_state("domcontentloaded", timeout=60000)
-        page.wait_for_timeout(1000)
-        dibbs_log("custom_query.warning.agree.done", url=page.url)
+    accepted = _click_ok_if_present(page)
+    if accepted:
+        dibbs_log("custom_query.warning.accepted", url=page.url)
+    else:
+        dibbs_log("custom_query.warning.not_present", url=page.url)
     dibbs_log("custom_query.warning.end", url=page.url)
 
 
@@ -322,94 +321,96 @@ def search_dibbs_custom_query_by_fsc(
     include_past_due: bool = False,
     all_results: bool = False,
     headless: bool = True,
+    debug: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    dibbs_log(
-        "search.begin",
-        all_results=all_results,
-        fsc=str(fsc or "").strip(),
-        include_past_due=include_past_due,
-        limit=limit,
-        max_pages=max_pages,
-    )
-    today = date.today()
-    fsc_value = str(fsc or "").strip()
-    diagnostics: dict[str, Any] = {
-        "request_fsc": fsc_value,
-        "request_limit": limit,
-        "max_pages": max_pages,
-        "all_results": all_results,
-        "mode": "custom_query_fsc",
-        "pages_scanned": [],
-        "rows_seen": 0,
-        "rows_filtered_past_due": 0,
-        "rows_parsed": 0,
-        "final_url": None,
-        "page_title": None,
-        "transport": "playwright",
-    }
-    if not fsc_value:
-        return [], diagnostics
+    with dibbs_debug_scope(debug):
+        dibbs_log(
+            "search.begin",
+            all_results=all_results,
+            fsc=str(fsc or "").strip(),
+            include_past_due=include_past_due,
+            limit=limit,
+            max_pages=max_pages,
+        )
+        today = date.today()
+        fsc_value = str(fsc or "").strip()
+        diagnostics: dict[str, Any] = {
+            "request_fsc": fsc_value,
+            "request_limit": limit,
+            "max_pages": max_pages,
+            "all_results": all_results,
+            "mode": "custom_query_fsc",
+            "pages_scanned": [],
+            "rows_seen": 0,
+            "rows_filtered_past_due": 0,
+            "rows_parsed": 0,
+            "final_url": None,
+            "page_title": None,
+            "transport": "playwright",
+        }
+        if not fsc_value:
+            return [], diagnostics
 
-    collected: list[dict[str, Any]] = []
-    seen_solicitations: set[str] = set()
+        collected: list[dict[str, Any]] = []
+        seen_solicitations: set[str] = set()
 
-    with dibbs_page(headless=headless) as (_, _, page):
-        try:
-            dibbs_log("playwright_search.begin", fsc=fsc_value, headless=headless)
-            _goto_with_retry(page, DIBBS_RFQ_URL)
-            _accept_warning_if_needed(page)
-            _submit_fsc_custom_query(page, fsc_value)
-            diagnostics["final_url"] = page.url
-            diagnostics["page_title"] = page.title()
-            dibbs_log("playwright_search.results.ready", fsc=fsc_value, title=diagnostics["page_title"], url=page.url)
+        with dibbs_page(headless=headless) as (_, _, page):
+            try:
+                dibbs_log("playwright_search.begin", fsc=fsc_value, headless=headless)
+                _goto_with_retry(page, DIBBS_RFQ_URL)
+                _accept_warning_if_needed(page)
+                _submit_fsc_custom_query(page, fsc_value)
+                diagnostics["final_url"] = page.url
+                diagnostics["page_title"] = page.title()
+                dibbs_log("playwright_search.results.ready", fsc=fsc_value, title=diagnostics["page_title"], url=page.url)
 
-            if _go_to_last_page(page):
-                diagnostics["used_last_page_jump"] = True
-            else:
-                diagnostics["used_last_page_jump"] = False
+                if _go_to_last_page(page):
+                    diagnostics["used_last_page_jump"] = True
+                else:
+                    diagnostics["used_last_page_jump"] = False
 
-            initial_html = _page_content_with_retry(page)
-            page_numbers = _available_page_numbers(initial_html)
-            dibbs_log(
-                "playwright_search.pages.discovered",
-                fsc=fsc_value,
-                page_numbers=page_numbers,
-                used_last_page_jump=diagnostics["used_last_page_jump"],
-            )
-            if all_results:
-                last_page = max(page_numbers) if page_numbers else 1
-                scan_pages = list(range(last_page, 0, -1))
-            else:
-                scan_pages = sorted(page_numbers, reverse=True)[: max(1, max_pages)]
-            dibbs_log("playwright_search.pages.selected", fsc=fsc_value, scan_pages=scan_pages)
+                initial_html = _page_content_with_retry(page)
+                page_numbers = _available_page_numbers(initial_html)
+                dibbs_log(
+                    "playwright_search.pages.discovered",
+                    fsc=fsc_value,
+                    page_numbers=page_numbers,
+                    used_last_page_jump=diagnostics["used_last_page_jump"],
+                )
+                if all_results:
+                    last_page = max(page_numbers) if page_numbers else 1
+                    scan_pages = list(range(last_page, 0, -1))
+                else:
+                    scan_pages = sorted(page_numbers, reverse=True)[: max(1, max_pages)]
+                dibbs_log("playwright_search.pages.selected", fsc=fsc_value, scan_pages=scan_pages)
 
-            for index, page_number in enumerate(scan_pages):
-                if not (all_results and index == 0 and diagnostics["used_last_page_jump"]):
-                    if not _go_to_page(page, page_number):
-                        continue
-                diagnostics["pages_scanned"].append(page_number)
-                rows = _parse_current_result_rows(page)
-                diagnostics["rows_seen"] += len(rows)
-                dibbs_log("playwright_search.page.rows", fsc=fsc_value, page_number=page_number, row_count=len(rows))
+                for index, page_number in enumerate(scan_pages):
+                    if not (all_results and index == 0 and diagnostics["used_last_page_jump"]):
+                        if not _go_to_page(page, page_number):
+                            continue
+                    diagnostics["pages_scanned"].append(page_number)
+                    rows = _parse_current_result_rows(page)
+                    diagnostics["rows_seen"] += len(rows)
+                    dibbs_log("playwright_search.page.rows", fsc=fsc_value, page_number=page_number, row_count=len(rows))
 
-                for row in rows:
-                    return_by_date = row.get("return_by_parsed")
-                    if not include_past_due and return_by_date and return_by_date < today:
-                        diagnostics["rows_filtered_past_due"] += 1
-                        continue
-                    sol_key = row.get("normalized_solicitation_number") or row.get("solicitation_number") or row.get("detail_url")
-                    if sol_key in seen_solicitations:
-                        continue
-                    seen_solicitations.add(sol_key)
-                    collected.append(row)
-                    if not all_results and len(collected) >= limit:
-                        diagnostics["rows_parsed"] = len(collected)
-                        dibbs_log("playwright_search.done", fsc=fsc_value, rows_parsed=len(collected))
-                        return collected, diagnostics
-        except Exception as exc:
-            capture_dibbs_page_state(page, "playwright_search_exception", fsc=fsc_value, error=str(exc))
-            raise
+                    for row in rows:
+                        return_by_date = row.get("return_by_parsed")
+                        if not include_past_due and return_by_date and return_by_date < today:
+                            diagnostics["rows_filtered_past_due"] += 1
+                            continue
+                        sol_key = row.get("normalized_solicitation_number") or row.get("solicitation_number") or row.get("detail_url")
+                        if sol_key in seen_solicitations:
+                            continue
+                        seen_solicitations.add(sol_key)
+                        collected.append(row)
+                        if not all_results and len(collected) >= limit:
+                            diagnostics["rows_parsed"] = len(collected)
+                            dibbs_log("playwright_search.done", fsc=fsc_value, rows_parsed=len(collected))
+                            return collected, diagnostics
+            except Exception as exc:
+                capture_dibbs_page_state(page, "playwright_search_exception", fsc=fsc_value, error=str(exc))
+                raise
 
-    diagnostics["rows_parsed"] = len(collected)
-    dibbs_log("playwright_search.done", fsc=fsc_value, rows_parsed=len(collected))
-    return collected, diagnostics
+        diagnostics["rows_parsed"] = len(collected)
+        dibbs_log("playwright_search.done", fsc=fsc_value, rows_parsed=len(collected))
+        return collected, diagnostics

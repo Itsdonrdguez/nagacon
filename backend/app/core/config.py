@@ -53,6 +53,7 @@ except Exception:
             SEARCH_JOB_POLL_SECONDS = float(os.getenv("SEARCH_JOB_POLL_SECONDS", "2.0"))
             SEARCH_JOB_MAX_CONCURRENCY = int(os.getenv("SEARCH_JOB_MAX_CONCURRENCY", "4"))
             DIBBS_FETCH_TIMEOUT_SECONDS = float(os.getenv("DIBBS_FETCH_TIMEOUT_SECONDS", "90"))
+            DIBBS_DEBUG = os.getenv("DIBBS_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
             STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
             STORAGE_LOCAL_ROOT = os.getenv("STORAGE_LOCAL_ROOT", "")
             S3_BUCKET = os.getenv("S3_BUCKET", os.getenv("R2_BUCKET", ""))

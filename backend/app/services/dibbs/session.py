@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -8,14 +9,35 @@ from typing import Iterator
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
+from app.core.config import settings
+
 DIBBS_RFQ_FSC_URL = "https://www.dibbs.bsm.dla.mil/Rfq/RfqFsc.aspx"
 DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 ARTIFACT_ROOT = Path("audit_reports") / "dibbs_debug"
+_DIBBS_DEBUG_ENABLED: ContextVar[bool] = ContextVar("dibbs_debug_enabled", default=False)
+
+
+def dibbs_debug_enabled(explicit: bool | None = None) -> bool:
+    if explicit is not None:
+        return explicit
+    return _DIBBS_DEBUG_ENABLED.get() or bool(getattr(settings, "DIBBS_DEBUG", False))
+
+
+@contextmanager
+def dibbs_debug_scope(enabled: bool | None = None) -> Iterator[bool]:
+    active = dibbs_debug_enabled(enabled)
+    token = _DIBBS_DEBUG_ENABLED.set(active)
+    try:
+        yield active
+    finally:
+        _DIBBS_DEBUG_ENABLED.reset(token)
 
 
 def dibbs_log(stage: str, **details) -> None:
+    if not dibbs_debug_enabled():
+        return
     timestamp = datetime.now(timezone.utc).isoformat()
     suffix = ""
     if details:
@@ -30,6 +52,8 @@ def _sanitize_stage_label(value: str) -> str:
 
 
 def capture_dibbs_page_state(page: Page, stage: str, **details) -> dict[str, str]:
+    if not dibbs_debug_enabled():
+        return {}
     ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     prefix = f"{stamp}_{_sanitize_stage_label(stage)}"
@@ -58,46 +82,48 @@ def capture_dibbs_page_state(page: Page, stage: str, **details) -> dict[str, str
 
 
 @contextmanager
-def dibbs_page(headless: bool = True) -> Iterator[tuple[Browser, BrowserContext, Page]]:
-    dibbs_log("browser.launch.begin", headless=headless)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        dibbs_log("browser.launch.ok", headless=headless)
-        context = browser.new_context(
-            extra_http_headers=DEFAULT_HEADERS,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-        )
-        dibbs_log("browser.context.ok")
-        page = context.new_page()
-        page.on(
-            "request",
-            lambda request: dibbs_log(
-                "network.request",
-                method=request.method,
-                resource_type=request.resource_type,
-                url=request.url,
-            ),
-        )
-        page.on(
-            "response",
-            lambda response: dibbs_log(
-                "network.response",
-                status=response.status,
-                url=response.url,
-            ),
-        )
-        dibbs_log("browser.page.ok")
-        try:
-            yield browser, context, page
-        finally:
-            dibbs_log("browser.close.begin")
-            context.close()
-            browser.close()
-            dibbs_log("browser.close.ok")
+def dibbs_page(headless: bool = True, debug: bool | None = None) -> Iterator[tuple[Browser, BrowserContext, Page]]:
+    with dibbs_debug_scope(debug) as debug_enabled:
+        dibbs_log("browser.launch.begin", headless=headless)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            dibbs_log("browser.launch.ok", headless=headless)
+            context = browser.new_context(
+                extra_http_headers=DEFAULT_HEADERS,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+            )
+            dibbs_log("browser.context.ok")
+            page = context.new_page()
+            if debug_enabled:
+                page.on(
+                    "request",
+                    lambda request: dibbs_log(
+                        "network.request",
+                        method=request.method,
+                        resource_type=request.resource_type,
+                        url=request.url,
+                    ),
+                )
+                page.on(
+                    "response",
+                    lambda response: dibbs_log(
+                        "network.response",
+                        status=response.status,
+                        url=response.url,
+                    ),
+                )
+            dibbs_log("browser.page.ok")
+            try:
+                yield browser, context, page
+            finally:
+                dibbs_log("browser.close.begin")
+                context.close()
+                browser.close()
+                dibbs_log("browser.close.ok")
 
 
 def _first(page: Page, selectors: list[str]):
@@ -109,6 +135,27 @@ def _first(page: Page, selectors: list[str]):
         except Exception:
             continue
     return None
+
+
+def _is_dod_warning_page(page: Page) -> bool:
+    url = (page.url or "").lower()
+    if "dodwarning.aspx" in url:
+        return True
+
+    selectors = [
+        "#butAgree",
+        "form[action*='dodwarning.aspx' i]",
+        "input[name*='butAgree' i]",
+        "input[id*='butAgree' i]",
+    ]
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _select_fsc_option(page: Page, fsc: str) -> bool:
@@ -140,11 +187,22 @@ def _select_fsc_option(page: Page, fsc: str) -> bool:
     return False
 
 
-def _click_ok_if_present(page: Page) -> None:
+def _click_ok_if_present(page: Page) -> bool:
+    if not _is_dod_warning_page(page):
+        dibbs_log("warning.ok.skip", reason="not_warning_page", url=page.url)
+        return False
+
     selectors = [
-        "text=OK",
+        "#butAgree",
+        "input[type='submit'][value*='I Agree' i]",
+        "input[type='submit'][value*='Agree' i]",
         "input[value='OK']",
+        "input[type='submit'][value='OK' i]",
+        "button:has-text('I Agree')",
+        "button:has-text('Agree')",
         "button:has-text('OK')",
+        "a:has-text('I Agree')",
+        "a:has-text('Agree')",
         "a:has-text('OK')",
     ]
     for selector in selectors:
@@ -160,9 +218,11 @@ def _click_ok_if_present(page: Page) -> None:
                     pass
                 page.wait_for_timeout(1200)
                 dibbs_log("warning.ok.done", selector=selector, url=page.url)
-                return
+                return True
         except Exception:
             continue
+    dibbs_log("warning.ok.missing", url=page.url)
+    return False
 
 
 def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> None:

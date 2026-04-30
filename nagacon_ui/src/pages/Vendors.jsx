@@ -15,6 +15,49 @@ import {
   TableHead,
   TableCell,
 } from '../components/ui'
+import { Link } from 'react-router-dom'
+
+function buildVendorReadiness(todayContext, providerData, awardData) {
+  const providerCount = Number((providerData?.items || []).length)
+  const awardCount = Number((awardData?.results || []).length)
+  const missing = []
+  const nextSteps = []
+
+  if (todayContext?.nsn && providerCount === 0) {
+    missing.push('Provider matches')
+    nextSteps.push('Search providers')
+  }
+  if (todayContext?.agency && awardCount === 0) {
+    missing.push('Past award signals')
+    nextSteps.push('Search USAspending')
+  }
+
+  if (missing.length === 0 && (providerCount > 0 || awardCount > 0)) {
+    return {
+      status: 'READY TO REVIEW',
+      tone: 'success',
+      summary: 'Vendor research is loaded and ready for comparison.',
+      missing,
+      nextSteps: ['Review providers', 'Review past awardees'],
+    }
+  }
+  if (missing.length > 0) {
+    return {
+      status: 'PARTIAL',
+      tone: 'warning',
+      summary: 'This research thread has context, but it still needs more vendor evidence.',
+      missing,
+      nextSteps,
+    }
+  }
+  return {
+    status: 'START RESEARCH',
+    tone: 'info',
+    summary: 'Search by provider, NSN, FSC, or agency to continue vendor research.',
+    missing: [],
+    nextSteps: ['Search providers', 'Search USAspending'],
+  }
+}
 
 export default function Vendors() {
   const [searchParams] = useSearchParams()
@@ -37,6 +80,7 @@ export default function Vendors() {
   const todayContext = useMemo(() => {
     if (searchParams.get('source') !== 'today') return null
     return {
+      opportunityId: searchParams.get('opportunity_id') || '',
       title: searchParams.get('title') || '',
       solicitation: searchParams.get('sol') || '',
       agency: searchParams.get('agency') || '',
@@ -45,6 +89,10 @@ export default function Vendors() {
       q: searchParams.get('q') || '',
     }
   }, [searchParams])
+  const readiness = useMemo(
+    () => buildVendorReadiness(todayContext, providerData, data),
+    [todayContext, providerData, data],
+  )
 
   async function executeSearch(nextForm = form) {
     setError('')
@@ -150,6 +198,30 @@ export default function Vendors() {
           </div>
         </Card>
       ) : null}
+
+      <Card title="Research Status" className={readiness.tone === 'warning' ? 'research-warning-box' : ''}>
+        <div className="workspace-action-column">
+          <div className="company-form-actions">
+            <Badge label={readiness.status} variant={readiness.tone === 'success' ? 'success' : readiness.tone === 'warning' ? 'warning' : 'info'} />
+            {todayContext?.opportunityId ? (
+              <Link className="btn btn-secondary btn-sm" to={`/workspace/${todayContext.opportunityId}`}>
+                Open Workspace
+              </Link>
+            ) : null}
+          </div>
+          <div className="row-title">{readiness.summary}</div>
+          <div className="row-subtitle">
+            {readiness.missing.length ? `Missing: ${readiness.missing.join(' | ')}` : 'Use this page to compare providers and past awardees.'}
+          </div>
+          <div className="simple-list">
+            {readiness.nextSteps.map((step, index) => (
+              <div className="simple-list-row" key={`vendor-next-step-${index}`}>
+                <div className="row-title">{step}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
 
       <Card title="USAspending Search">
         <form className="form-grid" onSubmit={runSearch}>

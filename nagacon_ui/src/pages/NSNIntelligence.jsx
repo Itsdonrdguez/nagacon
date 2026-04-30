@@ -51,6 +51,56 @@ function SectionList({ items, empty }) {
   )
 }
 
+function buildReadinessModel(data, publogStatus) {
+  const confidence = data?.confidence || {}
+  const missing = []
+  const nextSteps = []
+
+  if (!confidence.has_catalog_record) {
+    missing.push('Catalog identity')
+    nextSteps.push('Build intelligence')
+  }
+  if (!confidence.has_reference_records) {
+    missing.push('Catalog references')
+    nextSteps.push(publogStatus === 'ready' ? 'Refresh catalog package' : 'Wait for catalog package')
+  }
+  if (!confidence.has_vendor_recommendations) {
+    missing.push('Vendor candidates')
+    nextSteps.push('Seed providers')
+  }
+  if (!confidence.has_pricing_signals) {
+    missing.push('Pricing signals')
+    nextSteps.push('Refresh awards and pricing')
+  }
+
+  const uniqueNextSteps = Array.from(new Set(nextSteps))
+  if (missing.length === 0) {
+    return {
+      tone: 'success',
+      status: 'READY TO WORK',
+      summary: 'Catalog identity, vendor candidates, and pricing signals are all present.',
+      missing,
+      nextSteps: ['Review vendor candidates', 'Open provider records'],
+    }
+  }
+  if (missing.length <= 2) {
+    return {
+      tone: 'warning',
+      status: 'PARTIAL',
+      summary: 'Some useful intelligence is here, but the record still has gaps.',
+      missing,
+      nextSteps: uniqueNextSteps,
+    }
+  }
+  return {
+    tone: 'error',
+    status: 'NOT READY',
+    summary: 'This NSN still needs more intelligence before it becomes a confident sourcing record.',
+    missing,
+    nextSteps: uniqueNextSteps,
+  }
+}
+
 export default function NSNIntelligence() {
   const queryClient = useQueryClient()
   const [searchParams] = useSearchParams()
@@ -219,6 +269,10 @@ export default function NSNIntelligence() {
     { label: 'Awards', value: numberLabel(awardSignalCount), subtitle: snapshotUsaspending ? `${numberLabel(snapshotUsaspending.awards_found)} refresh hits` : awardSignalCount ? 'Persisted evidence' : 'Run refresh' },
     { label: 'Unit Price Avg', value: pricing.unit_average ? money(pricing.unit_average) : 'Not available', subtitle: pricing.count ? `${numberLabel(pricing.count)} price facts` : 'No pricing yet' },
   ]), [recommendations.length, references.length, awardSignalCount, pricing.unit_average, pricing.count, data?.confidence, snapshotUsaspending, publogStatusQuery.data?.status])
+  const readiness = useMemo(
+    () => buildReadinessModel(data, publogStatusQuery.data?.status),
+    [data, publogStatusQuery.data?.status],
+  )
 
   const handleSearch = (event) => {
     event.preventDefault()
@@ -247,6 +301,67 @@ export default function NSNIntelligence() {
           </div>
           <div className="panel-subtitle">
             We carried the NSN over from Today so you can keep researching without starting over.
+          </div>
+        </Card>
+      ) : null}
+
+      {cleanNsn.length === 13 && data ? (
+        <Card title="Readiness Status" className={readiness.tone === 'error' ? 'research-warning-box' : ''}>
+          <div className="workspace-action-column">
+            <div className="company-form-actions">
+              <StatusPill status={readiness.status} />
+            </div>
+            <div className="row-title">{readiness.summary}</div>
+            <div className="row-subtitle">
+              Missing: {readiness.missing.length ? readiness.missing.join(' | ') : 'Nothing critical missing'}
+            </div>
+            <div className="simple-list">
+              {readiness.nextSteps.map((step, index) => (
+                <div className="simple-list-row" key={`next-step-${index}`}>
+                  <div className="row-title">{step}</div>
+                </div>
+              ))}
+            </div>
+            <div className="company-form-actions">
+              {readiness.nextSteps.includes('Build intelligence') ? (
+                <Button
+                  type="button"
+                  loading={buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
+                  disabled={cleanNsn.length !== 13 || buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
+                  onClick={() => buildMutation.mutate()}
+                >
+                  Build Intelligence
+                </Button>
+              ) : null}
+              {readiness.nextSteps.includes('Seed providers') ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  loading={seedMutation.isPending}
+                  disabled={!data || seedMutation.isPending}
+                  onClick={() => seedMutation.mutate()}
+                >
+                  Seed Providers
+                </Button>
+              ) : null}
+              {readiness.nextSteps.includes('Refresh awards and pricing') || readiness.nextSteps.includes('Refresh catalog package') ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  loading={refreshMutation.isPending || importPublogMutation.isPending}
+                  disabled={!data || refreshMutation.isPending || importPublogMutation.isPending}
+                  onClick={() => {
+                    if (!data?.confidence?.has_reference_records && publogStatusQuery.data?.status === 'ready') {
+                      importPublogMutation.mutate()
+                      return
+                    }
+                    refreshMutation.mutate({ seedProviders: false })
+                  }}
+                >
+                  Refresh Signals
+                </Button>
+              ) : null}
+            </div>
           </div>
         </Card>
       ) : null}

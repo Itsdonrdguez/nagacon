@@ -15,7 +15,7 @@ from app.services.document_parser import parse_opportunity_file
 from app.services.document_pipeline import process_opportunity_documents, process_opportunity_file
 from app.services.file_retention import classify_opportunity_file_retention, mark_opportunity_files_processing_complete
 from app.services.intelligence.nsn_intelligence_service import run_nsn_intelligence
-from app.services.pdf_service import download_pdfs_for_opportunity
+from app.services.pdf_service import dedupe_opportunity_file_records, download_pdfs_for_opportunity
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs
 from app.services.search_jobs import start_search_job
 from app.services.storage import delete_reference, download_response as build_storage_download_response, file_exists, local_temp_path
@@ -112,6 +112,7 @@ def list_files(opportunity_id: int, db: Session = Depends(get_db), current_org=D
     opp = _scoped_opportunity_query(db, opportunity_id, org_id).first()
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
+    dedupe_opportunity_file_records(db, opportunity_id)
     file_query = _scoped_file_query(db, org_id).filter(OpportunityFile.opportunity_id == opportunity_id)
     files = file_query.order_by(OpportunityFile.id.asc()).all()
     return [_file_out(file_record) for file_record in files]

@@ -61,6 +61,10 @@ export default function Opportunities() {
   const [submittedSearch, setSubmittedSearch] = useState('')
   const [nsnFilter, setNsnFilter] = useState('')
   const [submittedNsn, setSubmittedNsn] = useState('')
+  const [agencyFilter, setAgencyFilter] = useState('')
+  const [submittedAgency, setSubmittedAgency] = useState('')
+  const [stateFilter, setStateFilter] = useState('')
+  const [submittedState, setSubmittedState] = useState('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
   const [awardJobId, setAwardJobId] = useState(null)
@@ -75,7 +79,7 @@ export default function Opportunities() {
   })
 
   const opportunitiesQuery = useQuery({
-    queryKey: ['opportunities-search', submittedSearch, submittedNsn, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, page, pageSize],
+    queryKey: ['opportunities-search', submittedSearch, submittedNsn, submittedAgency, submittedState, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, page, pageSize],
     queryFn: async () => {
       const res = await api.get('/api/opportunities/search', {
         params: {
@@ -83,6 +87,8 @@ export default function Opportunities() {
           page_size: pageSize,
           q: submittedSearch || undefined,
           nsn: submittedNsn || undefined,
+          agency: submittedAgency || undefined,
+          state: submittedState || undefined,
           source: filters.source === 'all' ? undefined : filters.source,
           set_aside_type: filters.setAside === 'all' ? undefined : filters.setAside,
           due_window: filters.dueWindow === 'all' ? undefined : filters.dueWindow,
@@ -134,10 +140,9 @@ export default function Opportunities() {
   const data = opportunitiesQuery.data?.items || []
   const total = opportunitiesQuery.data?.total || 0
   const totalPages = Math.max(Math.ceil(total / pageSize), 1)
-
   useEffect(() => {
     setPage(1)
-  }, [submittedSearch, submittedNsn, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, pageSize])
+  }, [submittedSearch, submittedNsn, submittedAgency, submittedState, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, pageSize])
 
   const sortedData = useMemo(() => {
     if (sortBy !== 'due_at') {
@@ -187,6 +192,8 @@ export default function Opportunities() {
     event.preventDefault()
     setSubmittedSearch(searchTerm.trim())
     setSubmittedNsn(nsnFilter.trim())
+    setSubmittedAgency(agencyFilter.trim())
+    setSubmittedState(stateFilter.trim())
   }
 
   const resetFilters = () => {
@@ -194,6 +201,10 @@ export default function Opportunities() {
     setSubmittedSearch('')
     setNsnFilter('')
     setSubmittedNsn('')
+    setAgencyFilter('')
+    setSubmittedAgency('')
+    setStateFilter('')
+    setSubmittedState('')
     setPageSize(25)
     setSortBy('due_at')
     setSortOrder('asc')
@@ -209,6 +220,8 @@ export default function Opportunities() {
     filters.dueWindow !== 'all' ? `Status: ${statusOptions.find((item) => item.value === filters.dueWindow)?.label || filters.dueWindow}` : null,
     submittedSearch ? `Search: "${submittedSearch}"` : null,
     submittedNsn ? `NSN: ${submittedNsn}` : null,
+    submittedAgency ? `Agency: ${submittedAgency}` : null,
+    submittedState ? `State: ${submittedState}` : null,
   ].filter(Boolean)
 
   const startRecord = total === 0 ? 0 : (page - 1) * pageSize + 1
@@ -264,6 +277,20 @@ export default function Opportunities() {
               placeholder="6520-01-123-4567"
               value={nsnFilter}
               onChange={(event) => setNsnFilter(event.target.value)}
+            />
+            <Input
+              label="Agency"
+              type="text"
+              placeholder="VA, Army, GSA..."
+              value={agencyFilter}
+              onChange={(event) => setAgencyFilter(event.target.value)}
+            />
+            <Input
+              label="State / POP"
+              type="text"
+              placeholder="TX, CA, Virginia..."
+              value={stateFilter}
+              onChange={(event) => setStateFilter(event.target.value)}
             />
             <div className="filter-select">
               <label className="input-label">Source</label>
@@ -367,7 +394,7 @@ export default function Opportunities() {
                 <TableHead>Source</TableHead>
                 <TableHead>Agency</TableHead>
                 <TableHead>Set-Aside</TableHead>
-                <TableHead>Status</TableHead>
+                <TableHead>Signal</TableHead>
                 <TableHead>NAICS/FSC</TableHead>
                 <TableHead sortable sortDirection={sortBy === 'due_at' ? sortOrder : null} onSort={() => toggleSort('due_at')}>
                   Due Date
@@ -385,6 +412,12 @@ export default function Opportunities() {
                       {opp.workflow_label ? ` | ${opp.workflow_label}` : ''}
                       {opportunitySignalLabel(opp) ? ` | ${opportunitySignalLabel(opp)}` : ''}
                     </div>
+                    {opp.source === 'SAM' && (opp.prepared_summary || (opp.prepared_risk_flags || []).length) ? (
+                      <div className="row-subtitle">
+                        {opp.prepared_summary || 'Prepared summary available'}
+                        {(opp.prepared_risk_flags || []).length ? ` | ${opp.prepared_risk_flags.length} risk flag${opp.prepared_risk_flags.length === 1 ? '' : 's'}` : ''}
+                      </div>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     <Badge label={opp.source} variant={opp.source === 'SAM' ? 'success' : 'info'} />
@@ -398,11 +431,18 @@ export default function Opportunities() {
                     )}
                   </TableCell>
                   <TableCell>
-                    <StatusPill status={opp.solicitation_status || 'OPEN'} />
+                    <div className="workspace-action-column">
+                      <StatusPill status={opp.solicitation_status || 'OPEN'} />
+                      {opp.decision_status ? <StatusPill status={opp.decision_status} /> : null}
+                      {opp.pipeline_owner ? <div className="row-subtitle">Owner: {opp.pipeline_owner}</div> : null}
+                    </div>
                   </TableCell>
                   <TableCell>{opp.naics_code || opp.fsc_code || '-'}</TableCell>
                   <TableCell className="due-date-cell">
                     <span className={opp.due_at ? 'due-date' : ''}>{formatDueDate(opp.due_at)}</span>
+                    {opp.target_submit_date ? (
+                      <div className="row-subtitle">Target submit: {formatAwardDate(opp.target_submit_date)}</div>
+                    ) : null}
                     {opp.solicitation_status === 'CLOSED' ? (
                       <div className="row-subtitle">
                         {opp.days_since_close ?? 0}d closed

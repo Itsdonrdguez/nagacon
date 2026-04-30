@@ -5,6 +5,26 @@ import { api } from '../api/client'
 import { StatCard, EmptyState, Badge, Card, Button, LoadingState, StatusPill } from '../components/ui'
 import { sourceIcon } from '../utils/badges'
 
+const WORK_PRIORITY_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2 }
+const WORK_TYPE_LABELS = {
+  QUOTE_FOLLOW_UP_DUE: 'Follow up with vendor',
+  QUOTE_REQUESTED_NO_RESPONSE: 'Check quote progress',
+  RFQ_CLOSING_SOON: 'Review RFQ now',
+  MISSING_VENDOR_LEADS: 'Start vendor research',
+  MISSING_PART_FINDER: 'Analyze the NSN',
+  MISSING_SUBMISSION_PACKAGE: 'Prepare submission package',
+  AWARDEE_ENRICHMENT_READY: 'Review closed intelligence',
+  NSN_INTELLIGENCE_REFRESH: 'Build NSN intelligence',
+  SAM_CHECKLIST_MISSING: 'Start proposal checklist',
+  SAM_COMPLIANCE_MATRIX_MISSING: 'Build compliance matrix',
+  SAM_CO_EMAIL_MISSING: 'Draft CO outreach',
+  SAM_TARGET_SUBMIT_DATE_MISSING: 'Set target submit date',
+  SAM_TASKS_NOT_SEEDED: 'Seed proposal tasks',
+  SAM_OPEN_TASKS_MISSING: 'Add active proposal tasks',
+  SAM_SUBMISSION_PACKAGE_MISSING: 'Build submission package',
+  DIBBS_RFQ_PACKAGE_MISSING: 'Download RFQ package',
+}
+
 const formatDueDate = (dueAt) => {
   if (!dueAt) return '-'
 
@@ -35,6 +55,31 @@ const formatCurrency = (value) => {
   }).format(value)
 }
 
+const groupPriorityActions = (items) => {
+  const groups = new Map()
+  for (const item of items || []) {
+    const oppId = item?.opportunity?.id || item?.id
+    if (!oppId) continue
+    const current = groups.get(oppId) || []
+    current.push(item)
+    groups.set(oppId, current)
+  }
+  return Array.from(groups.values())
+    .map((itemsForOpp) => {
+      const sorted = [...itemsForOpp].sort((a, b) => {
+        const priorityGap = (WORK_PRIORITY_ORDER[a.priority] ?? 9) - (WORK_PRIORITY_ORDER[b.priority] ?? 9)
+        if (priorityGap !== 0) return priorityGap
+        return String(a.due_at || '9999').localeCompare(String(b.due_at || '9999'))
+      })
+      return sorted[0]
+    })
+    .sort((a, b) => {
+      const priorityGap = (WORK_PRIORITY_ORDER[a.priority] ?? 9) - (WORK_PRIORITY_ORDER[b.priority] ?? 9)
+      if (priorityGap !== 0) return priorityGap
+      return String(a.due_at || '9999').localeCompare(String(b.due_at || '9999'))
+    })
+}
+
 export default function Dashboard() {
   const opportunitiesQuery = useQuery({
     queryKey: ['dashboard-opps'],
@@ -63,9 +108,21 @@ export default function Dashboard() {
     retry: 1,
   })
 
+  const workQueueQuery = useQuery({
+    queryKey: ['dashboard-work-queue'],
+    queryFn: async () => {
+      const res = await api.get('/api/work-queue/today')
+      return res.data
+    },
+    retry: 1,
+    staleTime: 30000,
+  })
+
   const opps = opportunitiesQuery.data || []
   const recentOpenOpps = recentOpenQuery.data || []
   const company = companyQuery.data || null
+  const workQueue = workQueueQuery.data || {}
+  const priorityActions = groupPriorityActions(workQueue.items || []).slice(0, 3)
 
   const samCount = opps.filter((opp) => opp.source === 'SAM').length
   const dibbsCount = opps.filter((opp) => opp.source === 'DIBBS').length
@@ -147,6 +204,48 @@ export default function Dashboard() {
           <div className="page-subtitle">Track opportunity flow, due-date pressure, and company readiness from one clean overview.</div>
         </div>
       </div>
+
+      <Card title="Start Work">
+        <div className="workspace-action-column">
+          <div className="company-form-actions">
+            <Link className="btn btn-sm" to="/work-queue">Go to Today Queue</Link>
+            {priorityActions[0]?.action_url ? (
+              <Link className="btn btn-secondary btn-sm" to={priorityActions[0].action_url}>
+                Resume Top Workspace
+              </Link>
+            ) : null}
+          </div>
+          {workQueueQuery.isLoading ? (
+            <LoadingState label="Loading priorities..." />
+          ) : priorityActions.length === 0 ? (
+            <EmptyState title="No urgent work queued" subtitle="Mission Control will surface the next steps once opportunities need attention." />
+          ) : (
+            <div className="simple-list">
+              {priorityActions.map((item, index) => (
+                <div key={`priority-${item.id}`} className="simple-list-row">
+                  <div className="list-item-content">
+                    <div className="row-title">
+                      {index + 1}. {item.opportunity?.title || item.title}
+                    </div>
+                    <div className="row-meta">
+                      <Badge label={item.priority || 'LOW'} variant={item.priority === 'HIGH' ? 'error' : item.priority === 'MEDIUM' ? 'warning' : 'info'} />
+                      <span className="agency-inline">{item.opportunity?.source || 'Source unavailable'}</span>
+                      <span className="agency-inline">{item.opportunity?.solicitation_number || 'Solicitation unavailable'}</span>
+                      {item.due_at ? <span className="agency-inline">{formatDueDate(item.due_at)}</span> : null}
+                    </div>
+                    <div className="row-subtitle">
+                      {WORK_TYPE_LABELS[item.type] || item.action_label || 'Open workspace'}
+                    </div>
+                  </div>
+                  <Link className="action-btn-small" to={item.action_url || `/workspace/${item.opportunity?.id || ''}`}>
+                    {item.action_label || 'Open Workspace'}
+                  </Link>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Card>
 
       <div className="stats-grid">
         <StatCard label="Total Opportunities" value={opps.length} subtitle={`${samCount} SAM | ${dibbsCount} DIBBS`} />

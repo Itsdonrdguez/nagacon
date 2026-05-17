@@ -43,39 +43,11 @@ def enrich_dibbs_opportunities_after_ingest(
 
     for opportunity_id in ids:
         try:
-            opp = _get_opportunity(db, opportunity_id, organization_id=organization_id)
-            if not opp:
-                errors.append({"opportunity_id": opportunity_id, "error": "Opportunity not found"})
-                continue
-            result = find_part_for_opportunity(db, opportunity_id, organization_id=organization_id)
-            artifact = _persist_part_finder_artifact(db, opportunity_id, result)
-            vendor_leads = seed_vendor_leads_from_part_finder_result(
+            item = run_part_finder_enrichment_for_opportunity(
                 db,
-                opp,
-                result,
+                opportunity_id,
                 organization_id=organization_id,
-            ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "candidate_count": 0}
-            quote_seed = seed_quotes_from_part_finder_leads(
-                db,
-                opp,
-                organization_id=organization_id,
-            ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "seedable_count": 0}
-            email_drafts = create_email_drafts_for_part_finder_quotes(
-                db,
-                opp,
-                quote_seed,
-            ) if result.get("status") == "ok" else {"created": 0, "skipped": 0, "errors": []}
-            item = {
-                "opportunity_id": opportunity_id,
-                "status": result.get("status"),
-                "nsn": (result.get("part") or {}).get("nsn"),
-                "quantity": (result.get("part") or {}).get("quantity"),
-                "item_name": (result.get("part") or {}).get("item_name"),
-                "artifact_id": getattr(artifact, "id", None),
-                "vendor_leads": vendor_leads,
-                "quote_seed": quote_seed,
-                "email_drafts": email_drafts,
-            }
+            )
             if queue_nsn_build and item["nsn"]:
                 from app.services.search_jobs import start_search_job
 
@@ -104,6 +76,52 @@ def enrich_dibbs_opportunities_after_ingest(
         "queued_nsn_build_jobs": queued_jobs,
         "errors": errors,
         "items": items,
+    }
+
+
+def run_part_finder_enrichment_for_opportunity(
+    db: Session,
+    opportunity_id: int,
+    *,
+    organization_id: int | None = None,
+    force_wbparts_refresh: bool = False,
+) -> dict[str, Any]:
+    opp = _get_opportunity(db, opportunity_id, organization_id=organization_id)
+    if not opp:
+        raise ValueError("Opportunity not found")
+    result = find_part_for_opportunity(
+        db,
+        opportunity_id,
+        organization_id=organization_id,
+        force_wbparts_refresh=force_wbparts_refresh,
+    )
+    artifact = _persist_part_finder_artifact(db, opportunity_id, result)
+    vendor_leads = seed_vendor_leads_from_part_finder_result(
+        db,
+        opp,
+        result,
+        organization_id=organization_id,
+    ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "candidate_count": 0}
+    quote_seed = seed_quotes_from_part_finder_leads(
+        db,
+        opp,
+        organization_id=organization_id,
+    ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "seedable_count": 0}
+    email_drafts = create_email_drafts_for_part_finder_quotes(
+        db,
+        opp,
+        quote_seed,
+    ) if result.get("status") == "ok" else {"created": 0, "skipped": 0, "errors": []}
+    return {
+        "opportunity_id": opportunity_id,
+        "status": result.get("status"),
+        "nsn": (result.get("part") or {}).get("nsn"),
+        "quantity": (result.get("part") or {}).get("quantity"),
+        "item_name": (result.get("part") or {}).get("item_name"),
+        "artifact_id": getattr(artifact, "id", None),
+        "vendor_leads": vendor_leads,
+        "quote_seed": quote_seed,
+        "email_drafts": email_drafts,
     }
 
 

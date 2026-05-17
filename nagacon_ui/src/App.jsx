@@ -6,21 +6,36 @@ import Sidebar from './components/layout/Sidebar/Sidebar'
 import RouteErrorBoundary from './components/RouteErrorBoundary'
 import { Button, LoadingState } from './components/ui'
 
+const LOCAL_MODE = String(import.meta.env.VITE_LOCAL_MODE ?? 'true').toLowerCase() !== 'false'
+const LOCAL_SESSION = {
+  authenticated: true,
+  user: {
+    full_name: 'Local Operator',
+    email: 'owner@nagacon.local',
+    role: 'OWNER',
+  },
+  organization: {
+    name: 'NagaCon Local',
+  },
+}
+
 export default function App() {
   const location = useLocation()
   const queryClient = useQueryClient()
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const authQuery = useQuery({
     queryKey: ['auth-me'],
+    enabled: !LOCAL_MODE,
     queryFn: async () => {
       const res = await api.get('/api/auth/me')
       return res.data
     },
     retry: 1,
   })
+  const authData = LOCAL_MODE ? LOCAL_SESSION : authQuery.data
   const notificationsQuery = useQuery({
     queryKey: ['notifications'],
-    enabled: Boolean(authQuery.data?.authenticated),
+    enabled: Boolean(authData?.authenticated),
     queryFn: async () => {
       const res = await api.get('/api/notifications')
       return res.data
@@ -43,7 +58,7 @@ export default function App() {
     setMobileNavOpen(false)
   }, [location.pathname])
 
-  if (authQuery.isLoading) {
+  if (!LOCAL_MODE && authQuery.isLoading) {
     return (
       <div className="auth-shell">
         <div className="auth-card">
@@ -53,7 +68,7 @@ export default function App() {
     )
   }
 
-  if (!authQuery.data?.authenticated) {
+  if (!LOCAL_MODE && !authQuery.data?.authenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />
   }
 
@@ -70,6 +85,7 @@ export default function App() {
         onNavigate={() => setMobileNavOpen(false)}
         onLogout={() => logoutMutation.mutate()}
         logoutLoading={logoutMutation.isPending}
+        showLogout={!LOCAL_MODE}
       />
       <main className="main-content">
         <div className="app-topbar">
@@ -87,11 +103,12 @@ export default function App() {
             </button>
             <div>
               <div className="row-title">
-                {authQuery.data?.organization?.name || 'Workspace'}
+                {authData?.organization?.name || 'Workspace'}
               </div>
               <div className="row-subtitle">
-                {authQuery.data?.user?.full_name || authQuery.data?.user?.email || 'Current user'}
-                {authQuery.data?.user?.role ? ` | ${authQuery.data.user.role}` : ''}
+                {authData?.user?.full_name || authData?.user?.email || 'Current user'}
+                {authData?.user?.role ? ` | ${authData.user.role}` : ''}
+                {LOCAL_MODE ? ' | local mode' : ''}
               </div>
             </div>
           </div>
@@ -99,9 +116,11 @@ export default function App() {
             <Link className="topbar-notification-link" to="/work-queue">
               {notificationsQuery.data?.unread_count || 0} alerts
             </Link>
-            <Button className="topbar-logout-button" variant="secondary" size="sm" loading={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
-              Log Out
-            </Button>
+            {!LOCAL_MODE ? (
+              <Button className="topbar-logout-button" variant="secondary" size="sm" loading={logoutMutation.isPending} onClick={() => logoutMutation.mutate()}>
+                Log Out
+              </Button>
+            ) : null}
           </div>
         </div>
         <RouteErrorBoundary>

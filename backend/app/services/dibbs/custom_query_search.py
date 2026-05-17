@@ -16,6 +16,7 @@ from app.services.dibbs.session import (
     dibbs_log,
     dibbs_page,
 )
+from app.services.dibbs.structured_detail_parser import extract_dibbs_set_aside_type_from_node
 
 DIBBS_BASE_URL = "https://www.dibbs.bsm.dla.mil"
 DIBBS_RFQ_URL = "https://www.dibbs.bsm.dla.mil/RFQ/"
@@ -181,6 +182,7 @@ def _parse_result_row(row) -> dict[str, Any] | None:
         "return_by_date": return_by,
         "return_by_parsed": _parse_mmddyyyy(return_by),
         "detail_url": nsn_link["href"] if nsn_link else None,
+        "set_aside_type": extract_dibbs_set_aside_type_from_node(row),
     }
 
 

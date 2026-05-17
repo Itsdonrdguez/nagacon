@@ -24,6 +24,85 @@ def _clean(v: str | None) -> str | None:
     return s or None
 
 
+def _clean_limited(v: str | None, max_len: int) -> str | None:
+    clean = _clean(v)
+    if not clean:
+        return None
+    return clean[:max_len].strip() or None
+
+
+def _compact_nsn(value: str | None) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _sanitize_part_number(part_number: str | None, *, nsn: str | None = None) -> str | None:
+    clean = _clean(part_number)
+    if not clean:
+        return None
+    compact = _compact_nsn(clean)
+    if len(compact) == 13 and nsn and compact == _compact_nsn(nsn):
+        return None
+    return clean
+
+
+def _sanitize_company_name(company_name: str | None, *, cage: str | None = None, part_number: str | None = None) -> str | None:
+    clean = _clean(company_name)
+    if not clean:
+        return None
+    if cage:
+        marker = clean.upper().find(str(cage).upper())
+        if marker > 2:
+            clean = clean[:marker].strip(" -|,;/")
+    if part_number:
+        marker = clean.upper().find(str(part_number).upper())
+        if marker > 2:
+            clean = clean[:marker].strip(" -|,;/")
+    clean = " ".join(clean.split())
+    return clean[:200].strip() or None
+
+
+def _find_existing_vendor_lead(
+    db: Session,
+    *,
+    opportunity_id: int,
+    organization_id: int | None,
+    cage: str | None,
+    company_name: str | None,
+    part_number: str | None,
+) -> VendorLead | None:
+    base_query = db.query(VendorLead).filter(VendorLead.opportunity_id == opportunity_id)
+    base_query = _scope_vendor_leads(base_query, organization_id)
+
+    if cage:
+        cage_query = base_query.filter(VendorLead.cage == cage)
+        if part_number:
+            found = cage_query.filter(VendorLead.part_number == part_number).first()
+            if found:
+                return found
+        else:
+            found = cage_query.filter(VendorLead.part_number.is_(None)).first()
+            if found:
+                return found
+        fallback = (
+            cage_query
+            .order_by(VendorLead.part_number.is_(None), VendorLead.confidence.desc().nullslast(), VendorLead.id.desc())
+            .first()
+        )
+        if fallback:
+            return fallback
+
+    company_query = base_query
+    if company_name:
+        company_query = company_query.filter(func.coalesce(VendorLead.company_name, "") == company_name)
+    else:
+        company_query = company_query.filter(VendorLead.company_name.is_(None))
+    if part_number:
+        company_query = company_query.filter(VendorLead.part_number == part_number)
+    else:
+        company_query = company_query.filter(VendorLead.part_number.is_(None))
+    return company_query.first()
+
+
 def _scope_vendor_leads(query, organization_id: int | None):
     if organization_id is not None:
         query = query.filter(
@@ -120,27 +199,20 @@ def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, in
     updated = 0
 
     for s in sources:
-        company_name = _clean(s.get("company_name"))
-        cage = _clean(s.get("cage"))
-        part_number = _clean(s.get("part_number"))
+        cage = _clean_limited(s.get("cage"), 10)
+        part_number = _sanitize_part_number(s.get("part_number"), nsn=nsn)
+        company_name = _sanitize_company_name(s.get("company_name"), cage=cage, part_number=part_number)
         raw_text = _clean(s.get("raw_text"))
         confidence = 90 if cage and company_name else 80 if cage or company_name else 60 if part_number else 40
 
-        q = db.query(VendorLead).filter(VendorLead.opportunity_id == opp.id)
-        if cage:
-            q = q.filter(VendorLead.cage == cage)
-        else:
-            q = q.filter(VendorLead.cage.is_(None))
-        if company_name:
-            q = q.filter(func.coalesce(VendorLead.company_name, "") == company_name)
-        else:
-            q = q.filter(VendorLead.company_name.is_(None))
-        if part_number:
-            q = q.filter(VendorLead.part_number == part_number)
-        else:
-            q = q.filter(VendorLead.part_number.is_(None))
-
-        rec = q.first()
+        rec = _find_existing_vendor_lead(
+            db,
+            opportunity_id=opp.id,
+            organization_id=getattr(opp, "organization_id", None),
+            cage=cage,
+            company_name=company_name,
+            part_number=part_number,
+        )
         if rec:
             touched = False
             if rec.organization_id is None and getattr(opp, "organization_id", None) is not None:

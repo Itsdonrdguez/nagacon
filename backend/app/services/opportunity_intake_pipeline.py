@@ -5,12 +5,17 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.agent_run import AgentType
 from app.models.opportunity import Opportunity
 from app.repositories.agents import AgentRunRepository
 from app.schemas.agent import AgentRunCreate, AgentRunUpdate
 from app.services.pdf_service import download_pdfs_for_opportunity
-from app.services.file_retention import mark_opportunity_files_processing_complete
+from app.services.file_retention import (
+    mark_opportunity_files_processing_complete,
+    prune_closed_opportunity_files_and_storage,
+)
+from app.services.ingest_enrichment import run_part_finder_enrichment_for_opportunity
 from app.services.providers.pdf_cage_extractor import (
     extract_providers_from_opportunity_pdfs,
     seed_vendor_leads_from_providers,
@@ -26,19 +31,24 @@ from app.services.workspace_service import (
     generate_submission_package,
     generate_vendor_shortlist,
 )
+from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
 
 
 def _short_error(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {exc}"
 
 
-def _run_step(steps: list[dict[str, Any]], name: str, fn):
+def _run_step(db: Session, steps: list[dict[str, Any]], name: str, fn):
     started = datetime.now(timezone.utc).isoformat()
     try:
         output = fn()
         steps.append({"name": name, "status": "success", "started_at": started, "output": output})
         return output
     except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         steps.append({"name": name, "status": "failed", "started_at": started, "error": _short_error(exc)})
         return None
 
@@ -77,6 +87,21 @@ def _create_pipeline_run(db: Session, opp_id: int) -> tuple[AgentRunRepository |
     except Exception:
         db.rollback()
         return None, None
+
+
+def _has_part_finder_target(opp: Opportunity, parsed: dict[str, Any] | None = None) -> bool:
+    parsed_payload = parsed or {}
+    raw_payload = getattr(opp, "raw_payload", None) if isinstance(getattr(opp, "raw_payload", None), dict) else {}
+    dibbs_row = raw_payload.get("dibbs_search_row") if isinstance(raw_payload.get("dibbs_search_row"), dict) else {}
+    candidates = [
+        parsed_payload.get("nsn"),
+        parsed_payload.get("compact_nsn"),
+        raw_payload.get("nsn"),
+        dibbs_row.get("nsn"),
+        getattr(opp, "solicitation_number", None),
+        getattr(opp, "source_opportunity_id", None),
+    ]
+    return any(str(candidate or "").strip() for candidate in candidates)
 
 
 def _finish_pipeline_run(
@@ -129,6 +154,7 @@ def run_opportunity_intake_pipeline(
     step_names.extend(
         [
             "parse_opportunity",
+            "generate_part_finder",
             "extract_providers_and_vendor_leads",
             "sync_parsed_vendor_leads",
             "sync_provider_vendor_leads",
@@ -152,7 +178,7 @@ def run_opportunity_intake_pipeline(
     def run_and_progress(name: str, fn):
         nonlocal completed_steps
         _emit_progress(progress_callback, label=name, completed_steps=completed_steps, total_steps=total_steps)
-        output = _run_step(steps, name, fn)
+        output = _run_step(db, steps, name, fn)
         completed_steps += 1
         raw_rows = None
         if isinstance(output, dict):
@@ -167,6 +193,18 @@ def run_opportunity_intake_pipeline(
         )
 
     parsed = run_and_progress("parse_opportunity", lambda: ensure_parsed(db, opp)) or {}
+    run_and_progress(
+        "generate_part_finder",
+        lambda: (
+            run_part_finder_enrichment_for_opportunity(
+                db,
+                opp.id,
+                organization_id=organization_id,
+            )
+            if _has_part_finder_target(opp, parsed)
+            else {"status": "skipped", "reason": "no_nsn_target"}
+        ),
+    )
 
     run_and_progress(
         "extract_providers_and_vendor_leads",
@@ -224,4 +262,15 @@ def run_opportunity_intake_pipeline(
         output=output,
         error="; ".join(step["error"] for step in failed[:3]) if failed else None,
     )
+    if (
+        not failed
+        and bool(getattr(settings, "AUTO_CLOSED_WORKSPACE_STORAGE_CLEANUP_ENABLED", True))
+        and derive_opportunity_lifecycle(getattr(opp, "due_at", None)) in {"RECENTLY_CLOSED", "ARCHIVED"}
+    ):
+        output["closed_storage_cleanup"] = prune_closed_opportunity_files_and_storage(
+            db,
+            opp.id,
+            require_closed=True,
+            source="closed_workspace_cleanup",
+        )
     return output

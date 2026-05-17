@@ -259,6 +259,7 @@ def _build_part_finder_candidates(result: dict[str, Any], *, limit: int = 25) ->
     part = result.get("part") or {}
     nsn = _clean(part.get("nsn"))
     first_part_number = _first(part.get("part_numbers") or [])
+    wbparts = result.get("wbparts") or {}
     candidates: dict[tuple[str, str | None], dict[str, Any]] = {}
 
     def merge_candidate(row: dict[str, Any]) -> None:
@@ -331,6 +332,29 @@ def _build_part_finder_candidates(result: dict[str, Any], *, limit: int = 25) ->
             }
         )
 
+    for row in (wbparts.get("cross_references") or [])[:limit]:
+        part_number = _clean(row.get("part_number"), 80) or first_part_number
+        manufacturer = _clean(row.get("manufacturer"), 200)
+        cage = _clean(row.get("cage"), 10)
+        if not manufacturer and not cage:
+            continue
+        merge_candidate(
+            {
+                "company_name": manufacturer or (f"CAGE {cage}" if cage else None),
+                "cage": cage,
+                "part_number": part_number,
+                "confidence": min(max(int(row.get("confidence") or 66), 60), 82),
+                "is_approved_source": False,
+                "evidence_type": "PART_FINDER_WBPARTS",
+                "notes": (
+                    f"WBParts cross reference for NSN {nsn}. "
+                    f"Part: {part_number or 'not stated'}. "
+                    f"Manufacturer: {manufacturer or 'not stated'}."
+                ),
+                "raw_text": f"WBParts cross reference; nsn={nsn}; part={part_number}; cage={cage}; manufacturer={manufacturer}",
+            }
+        )
+
     output: list[dict[str, Any]] = []
     for item in candidates.values():
         evidence_types = sorted(item.pop("evidence_types"))
@@ -359,7 +383,25 @@ def _find_existing_lead(db: Session, opportunity_id: int, candidate: dict[str, A
         query = query.filter(VendorLead.part_number == part_number)
     else:
         query = query.filter(VendorLead.part_number.is_(None))
-    return query.first()
+    found = query.first()
+    if found:
+        return found
+
+    fallback = db.query(VendorLead).filter(VendorLead.opportunity_id == opportunity_id)
+    if cage:
+        fallback = fallback.filter(func.upper(func.coalesce(VendorLead.cage, "")) == cage.upper())
+    elif company_name:
+        fallback = fallback.filter(func.lower(func.coalesce(VendorLead.company_name, "")) == company_name.lower())
+    else:
+        return None
+    nsn = candidate.get("nsn")
+    if nsn:
+        fallback = fallback.filter(or_(VendorLead.nsn == nsn, VendorLead.nsn.is_(None)))
+    return (
+        fallback
+        .order_by(VendorLead.part_number.is_(None), VendorLead.confidence.desc().nullslast(), VendorLead.id.desc())
+        .first()
+    )
 
 
 def _find_existing_quote(
@@ -486,6 +528,8 @@ def _source_type_from_evidence(evidence_types: list[str]) -> str:
         return "PART_FINDER_PROVIDER_AWARDEE"
     if "PART_FINDER_AWARDEE" in evidence_types:
         return "PART_FINDER_AWARDEE"
+    if "PART_FINDER_WBPARTS" in evidence_types:
+        return "PART_FINDER_WBPARTS"
     return "PART_FINDER_PROVIDER"
 
 
@@ -495,6 +539,9 @@ def _combine_source_types(left: str | None, right: str | None) -> str:
         values.discard("PART_FINDER_PROVIDER")
         values.discard("PART_FINDER_AWARDEE")
         values.add("PART_FINDER_PROVIDER_AWARDEE")
+    if "PART_FINDER_WBPARTS" in values and "PART_FINDER_PROVIDER_AWARDEE" in values:
+        values.discard("PART_FINDER_WBPARTS")
+        values.add("PART_FINDER_PROVIDER_AWARDEE+PART_FINDER_WBPARTS")
     return "+".join(sorted(values)) if values else "PART_FINDER_PROVIDER"
 
 

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
-import { Card, Button, EmptyState, Input, LoadingState, Badge, Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../components/ui'
+import { Card, Button, EmptyState, Input, LoadingState, Badge, Table, TableHeader, TableBody, TableRow, TableHead, TableCell, MultiSelect } from '../components/ui'
+import { FSC_CODE_OPTIONS, NAICS_CODE_OPTIONS, withCustomOptions } from '../data/codeCatalogs'
 
 const SET_ASIDE_OPTIONS = [
   'Small Business',
@@ -31,15 +32,15 @@ const EMPTY_FORM = {
   state: '',
   postal_code: '',
   country: 'United States',
-  naics_codes: '',
+  naics_codes: [],
   certifications: [],
   capability_statement_url: '',
   core_competencies: '',
   differentiators: '',
   past_performance_summary: '',
   annual_revenue: '',
-  preferred_dibbs_fsc_codes: DEFAULT_DIBBS_FSC_CODES.join(', '),
-  preferred_sam_naics_codes: DEFAULT_SAM_NAICS_CODES.join(', '),
+  preferred_dibbs_fsc_codes: DEFAULT_DIBBS_FSC_CODES,
+  preferred_sam_naics_codes: DEFAULT_SAM_NAICS_CODES,
   preferred_sam_keywords: DEFAULT_SAM_KEYWORDS.join(', '),
   preferred_sam_agencies: '',
   preferred_sam_states: '',
@@ -77,15 +78,15 @@ function formFromProfile(profile) {
     state: profile.state || '',
     postal_code: profile.postal_code || '',
     country: profile.country || 'United States',
-    naics_codes: (profile.naics_codes || []).join(', '),
+    naics_codes: profile.naics_codes || [],
     certifications: profile.certifications || [],
     capability_statement_url: profile.capability_statement_url || '',
     core_competencies: profile.core_competencies || '',
     differentiators: profile.differentiators || '',
     past_performance_summary: profile.past_performance_summary || '',
     annual_revenue: profile.annual_revenue ?? '',
-    preferred_dibbs_fsc_codes: (profile.preferred_dibbs_fsc_codes || DEFAULT_DIBBS_FSC_CODES).join(', '),
-    preferred_sam_naics_codes: (profile.preferred_sam_naics_codes || DEFAULT_SAM_NAICS_CODES).join(', '),
+    preferred_dibbs_fsc_codes: profile.preferred_dibbs_fsc_codes || DEFAULT_DIBBS_FSC_CODES,
+    preferred_sam_naics_codes: profile.preferred_sam_naics_codes || DEFAULT_SAM_NAICS_CODES,
     preferred_sam_keywords: (profile.preferred_sam_keywords || DEFAULT_SAM_KEYWORDS).join(', '),
     preferred_sam_agencies: (profile.preferred_sam_agencies || []).join(', '),
     preferred_sam_states: (profile.preferred_sam_states || (profile.state ? [profile.state] : [])).join(', '),
@@ -194,6 +195,14 @@ export default function Company() {
   })
 
   const selectedSetAsides = form.certifications
+  const naicsCodeOptions = useMemo(
+    () => withCustomOptions(NAICS_CODE_OPTIONS, [...(form.naics_codes || []), ...(form.preferred_sam_naics_codes || [])], 'naics'),
+    [form.naics_codes, form.preferred_sam_naics_codes],
+  )
+  const fscCodeOptions = useMemo(
+    () => withCustomOptions(FSC_CODE_OPTIONS, form.preferred_dibbs_fsc_codes || [], 'fsc'),
+    [form.preferred_dibbs_fsc_codes],
+  )
 
   const payload = useMemo(() => ({
     legal_name: form.legal_name.trim(),
@@ -209,15 +218,15 @@ export default function Company() {
     state: form.state.trim() || null,
     postal_code: form.postal_code.trim() || null,
     country: form.country.trim() || null,
-    naics_codes: parseCsv(form.naics_codes),
+    naics_codes: form.naics_codes,
     certifications: selectedSetAsides,
     capability_statement_url: form.capability_statement_url.trim() || null,
     core_competencies: form.core_competencies.trim() || null,
     differentiators: form.differentiators.trim() || null,
     past_performance_summary: form.past_performance_summary.trim() || null,
     annual_revenue: form.annual_revenue === '' ? null : Number(form.annual_revenue),
-    preferred_dibbs_fsc_codes: parseCsv(form.preferred_dibbs_fsc_codes),
-    preferred_sam_naics_codes: parseCsv(form.preferred_sam_naics_codes),
+    preferred_dibbs_fsc_codes: form.preferred_dibbs_fsc_codes,
+    preferred_sam_naics_codes: form.preferred_sam_naics_codes,
     preferred_sam_keywords: parseCsv(form.preferred_sam_keywords),
     preferred_sam_agencies: parseCsv(form.preferred_sam_agencies),
     preferred_sam_states: parseCsv(form.preferred_sam_states),
@@ -307,7 +316,17 @@ export default function Company() {
             <Input label="Country" value={form.country} onChange={(event) => setForm({ ...form, country: event.target.value })} placeholder="Country" />
           </div>
 
-          <Input label="NAICS Codes" value={form.naics_codes} onChange={(event) => setForm({ ...form, naics_codes: event.target.value })} placeholder="541512, 541519, 236220" helperText="Use commas to separate multiple NAICS codes." />
+          <MultiSelect
+            label="NAICS Codes"
+            value={form.naics_codes}
+            options={naicsCodeOptions}
+            onChange={(next) => setForm({ ...form, naics_codes: next })}
+            placeholder="Search NAICS codes"
+            helperText="Search and select one or more NAICS codes for your company profile."
+            allowCustom
+            customTypeLabel="NAICS code"
+            normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 6)}
+          />
 
           <div className="company-section">
             <div className="company-section-label">Set-Asides / Certifications</div>
@@ -354,17 +373,27 @@ export default function Company() {
               </div>
             </div>
             <div className="company-form-grid">
-              <Input
+              <MultiSelect
                 label="DIBBS FSC Codes"
                 value={form.preferred_dibbs_fsc_codes}
-                onChange={(event) => setForm({ ...form, preferred_dibbs_fsc_codes: event.target.value })}
-                helperText="Comma-separated FSC codes used for DIBBS ingestion."
+                options={fscCodeOptions}
+                onChange={(next) => setForm({ ...form, preferred_dibbs_fsc_codes: next })}
+                placeholder="Search FSC codes"
+                helperText="Search and select the FSC codes used for DIBBS ingestion."
+                allowCustom
+                customTypeLabel="FSC code"
+                normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 4)}
               />
-              <Input
+              <MultiSelect
                 label="SAM NAICS Codes"
                 value={form.preferred_sam_naics_codes}
-                onChange={(event) => setForm({ ...form, preferred_sam_naics_codes: event.target.value })}
-                helperText="Comma-separated NAICS filters for SAM opportunities."
+                options={naicsCodeOptions}
+                onChange={(next) => setForm({ ...form, preferred_sam_naics_codes: next })}
+                placeholder="Search NAICS codes"
+                helperText="Search and select the NAICS filters used for SAM opportunities."
+                allowCustom
+                customTypeLabel="NAICS code"
+                normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 6)}
               />
               <Input
                 label="SAM Keywords"

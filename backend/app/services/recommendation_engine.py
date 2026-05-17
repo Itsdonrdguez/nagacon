@@ -35,10 +35,71 @@ def _replace_underscores(value: str | None) -> str:
     return str(value or "").replace("_", " ").strip()
 
 
+def _guidance_posture_label(posture: str | None) -> str:
+    posture_key = _clean_text(posture).lower()
+    labels = {
+        "pursue_now": "ready to move",
+        "pursue_with_gaps": "move with gaps",
+        "hold_for_compliance": "needs compliance work",
+        "hold_for_capability": "needs capability review",
+        "do_not_bid": "low-confidence fit",
+        "research_only": "research only",
+        "needs_review": "needs review",
+        "bid": "ready to move",
+    }
+    return labels.get(posture_key, "needs review")
+
+
 def _days_until_due(due_at: datetime | None) -> int | None:
     if due_at is None:
         return None
     return int((due_at - datetime.utcnow()).total_seconds() // 86400)
+
+
+def _human_vendor_name(row: dict[str, Any]) -> str | None:
+    return _clean_text(
+        row.get("display_company_name")
+        or row.get("sam_company_name")
+        or row.get("company_name")
+        or row.get("candidate_label")
+        or row.get("cage")
+    )
+
+
+def _build_supplier_evidence(
+    publog_rows: list[dict[str, Any]] | None,
+    leads: list[VendorLead],
+    quotes: list[VendorQuote],
+) -> dict[str, Any]:
+    publog_rows = list(publog_rows or [])
+    unique_publog_cages = {str(row.get("cage") or "").strip() for row in publog_rows if str(row.get("cage") or "").strip()}
+    sam_matched_cages = {
+        str(row.get("cage") or "").strip()
+        for row in publog_rows
+        if str(row.get("cage") or "").strip() and bool(row.get("sam_match"))
+    }
+    lead_cages = {str(getattr(lead, "cage", "") or "").strip() for lead in leads if str(getattr(lead, "cage", "") or "").strip()}
+    quote_cages = {str(getattr(quote, "cage", "") or "").strip() for quote in quotes if str(getattr(quote, "cage", "") or "").strip()}
+    overlapped_cages = {cage for cage in unique_publog_cages if cage in lead_cages or cage in quote_cages}
+    top_candidates = []
+    for row in publog_rows[:5]:
+        label = _human_vendor_name(row)
+        if not label:
+            continue
+        descriptor_bits = []
+        if row.get("cage"):
+            descriptor_bits.append(f"CAGE {row['cage']}")
+        if row.get("part_number"):
+            descriptor_bits.append(f"Part {row['part_number']}")
+        if row.get("sam_match"):
+            descriptor_bits.append("SAM matched")
+        top_candidates.append(f"{label}{' | ' + ' | '.join(descriptor_bits) if descriptor_bits else ''}")
+    return {
+        "publog_candidate_count": len(unique_publog_cages),
+        "sam_matched_candidate_count": len(sam_matched_cages),
+        "workspace_overlap_count": len(overlapped_cages),
+        "top_candidates": top_candidates,
+    }
 
 
 def _compute_strategic_fit(
@@ -103,6 +164,7 @@ def _compute_capability_fit(
     quotes: list[VendorQuote],
     submission: BidSubmission | None,
     compliance_fields: dict[str, Any],
+    supplier_evidence: dict[str, Any],
 ) -> tuple[int, list[str]]:
     score = 35
     reasons: list[str] = []
@@ -129,6 +191,18 @@ def _compute_capability_fit(
     if submission and (submission.planned_vendor_quote_id or submission.planned_vendor_cage or submission.planned_vendor_name):
         score += 10
         reasons.append("A planned submission vendor has already been selected.")
+    if int(supplier_evidence.get("publog_candidate_count") or 0) > 0:
+        score += 8
+        reasons.append(
+            f"PUB LOG shows {int(supplier_evidence.get('publog_candidate_count') or 0)} manufacturer candidate"
+            f"{'' if int(supplier_evidence.get('publog_candidate_count') or 0) == 1 else 's'}."
+        )
+    if int(supplier_evidence.get("sam_matched_candidate_count") or 0) > 0:
+        score += 7
+        reasons.append("At least one PUB LOG candidate is backed by a SAM entity match.")
+    if int(supplier_evidence.get("workspace_overlap_count") or 0) > 0:
+        score += 10
+        reasons.append("Current workspace sourcing already overlaps with PUB LOG / SAM supplier evidence.")
     if compliance_fields.get("nsn") and compliance_fields.get("quantity"):
         score += 5
 
@@ -202,6 +276,7 @@ def _compute_execution_feasibility(
     quotes: list[VendorQuote],
     submission: BidSubmission | None,
     review_flags: list[str],
+    supplier_evidence: dict[str, Any],
 ) -> tuple[int, list[str]]:
     score = 45
     reasons: list[str] = []
@@ -245,6 +320,9 @@ def _compute_execution_feasibility(
     if submission and (submission.planned_vendor_quote_id or submission.planned_vendor_cage or submission.planned_vendor_name):
         score += 10
         reasons.append("The workspace already has a planned submission vendor.")
+    if int(supplier_evidence.get("workspace_overlap_count") or 0) > 0:
+        score += 8
+        reasons.append("Supplier evidence already overlaps with current workspace vendors.")
     if review_flags:
         score -= min(20, len(review_flags) * 5)
 
@@ -258,6 +336,7 @@ def _compute_risk(
     quotes: list[VendorQuote],
     missing_information: list[str],
     review_flags: list[str],
+    supplier_evidence: dict[str, Any],
 ) -> tuple[int, list[str]]:
     score = 25
     reasons: list[str] = []
@@ -282,6 +361,12 @@ def _compute_risk(
     if not priced_quotes:
         score += 10
         reasons.append("No priced vendor quote is available yet.")
+    if not int(supplier_evidence.get("publog_candidate_count") or 0):
+        score += 8
+        reasons.append("PUB LOG has not surfaced manufacturer candidates for this item yet.")
+    elif not int(supplier_evidence.get("sam_matched_candidate_count") or 0):
+        score += 5
+        reasons.append("PUB LOG candidates are not yet reinforced by SAM entity matches.")
     if due_days is not None and due_days <= 3 and not priced_quotes:
         score += 20
         reasons.append("The due date is close and sourcing is still incomplete.")
@@ -295,6 +380,42 @@ def _compute_risk(
     return _clamp(score), reasons
 
 
+def _sam_proposal_signals(
+    *,
+    procurement_profile: dict[str, Any],
+    capability_match: dict[str, Any],
+    past_performance_map: dict[str, Any],
+    pipeline_item: Any,
+) -> dict[str, Any]:
+    attachment_count = int(procurement_profile.get("required_attachment_count") or 0)
+    amendment_count = int(procurement_profile.get("amendment_count") or 0)
+    review_flag_count = int(procurement_profile.get("review_flag_count") or 0)
+    missing_information_count = int(procurement_profile.get("missing_information_count") or 0)
+    proposal_burden = str(procurement_profile.get("proposal_burden") or "low").lower()
+    capability_gaps = _clean_list(capability_match.get("gaps"))
+    capability_signals = _clean_list(capability_match.get("signals"))
+    past_matches = list(past_performance_map.get("matches") or [])
+    past_gaps = _clean_list(past_performance_map.get("coverage_gaps"))
+    decision_status = _clean_text(getattr(pipeline_item, "decision_status", None))
+    target_submit_date = getattr(pipeline_item, "target_submit_date", None)
+
+    return {
+        "attachment_count": attachment_count,
+        "amendment_count": amendment_count,
+        "review_flag_count": review_flag_count,
+        "missing_information_count": missing_information_count,
+        "proposal_burden": proposal_burden,
+        "capability_gap_count": len(capability_gaps),
+        "capability_signal_count": len(capability_signals),
+        "past_performance_match_count": len(past_matches),
+        "past_performance_gap_count": len(past_gaps),
+        "decision_status": decision_status,
+        "has_target_submit_date": bool(target_submit_date),
+        "needs_compliance_work": attachment_count > 0 or review_flag_count > 0 or missing_information_count > 0 or amendment_count > 0,
+        "needs_capability_work": len(capability_gaps) > 0 or len(past_matches) == 0,
+    }
+
+
 def build_workspace_recommendation(
     db: Session,
     opp: Opportunity,
@@ -304,6 +425,12 @@ def build_workspace_recommendation(
     leads: list[VendorLead] | None = None,
     quotes: list[VendorQuote] | None = None,
     submission: BidSubmission | None = None,
+    publog_rows: list[dict[str, Any]] | None = None,
+    capability_match: dict[str, Any] | None = None,
+    past_performance_map: dict[str, Any] | None = None,
+    procurement_profile: dict[str, Any] | None = None,
+    pipeline_item: Any = None,
+    solicitation_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parsed = parsed or ensure_parsed(db, opp)
     files = files if files is not None else (
@@ -334,6 +461,9 @@ def build_workspace_recommendation(
     profile = CompanyRepository(db).get_first_profile()
     research_profile = build_research_profile(opp, parsed)
     document_data = get_best_processed_document_data(opp, files=files)
+    capability_match = capability_match or {}
+    past_performance_map = past_performance_map or {}
+    procurement_profile = procurement_profile or {}
 
     from app.services.document_pipeline import _build_compliance_artifact_content
 
@@ -342,13 +472,43 @@ def build_workspace_recommendation(
     required_actions = _clean_list(compliance.get("required_actions") or compliance.get("submission_requirements"))
     missing_information = _clean_list(compliance.get("missing_information"))
     review_flags = _clean_list(compliance.get("review_flags"))
+    supplier_evidence = _build_supplier_evidence(publog_rows, leads, quotes)
+    sam_signals = _sam_proposal_signals(
+        procurement_profile=procurement_profile,
+        capability_match=capability_match,
+        past_performance_map=past_performance_map,
+        pipeline_item=pipeline_item,
+    ) if _clean_text(getattr(opp, "source", None)).upper() == "SAM" else {}
 
     strategic_fit, strategic_reasons = _compute_strategic_fit(opp, profile, research_profile, document_data)
-    capability_fit, capability_reasons = _compute_capability_fit(research_profile, leads, quotes, submission, compliance_fields)
+    capability_fit, capability_reasons = _compute_capability_fit(
+        research_profile,
+        leads,
+        quotes,
+        submission,
+        compliance_fields,
+        supplier_evidence,
+    )
     complexity, complexity_notes = _compute_complexity(files, document_data, required_actions, review_flags)
     commercial_attractiveness, commercial_reasons = _compute_commercial_attractiveness(opp, research_profile, quotes)
-    execution_feasibility, execution_reasons = _compute_execution_feasibility(opp, files, leads, quotes, submission, review_flags)
-    risk, risk_reasons = _compute_risk(opp, files, leads, quotes, missing_information, review_flags)
+    execution_feasibility, execution_reasons = _compute_execution_feasibility(
+        opp,
+        files,
+        leads,
+        quotes,
+        submission,
+        review_flags,
+        supplier_evidence,
+    )
+    risk, risk_reasons = _compute_risk(
+        opp,
+        files,
+        leads,
+        quotes,
+        missing_information,
+        review_flags,
+        supplier_evidence,
+    )
 
     recommendation_score = _clamp(
         strategic_fit * 0.24
@@ -392,6 +552,9 @@ def build_workspace_recommendation(
                 "Download and process the solicitation documents." if not files else None,
                 "Review the PDF-derived compliance flags and confirm any missing facts." if review_flags or missing_information else None,
                 "Run vendor research and seed the quote tracker." if not leads else None,
+                "Review PUB LOG manufacturer candidates and reconcile them with current workspace leads."
+                if int(supplier_evidence.get("publog_candidate_count") or 0) > 0 and not int(supplier_evidence.get("workspace_overlap_count") or 0)
+                else None,
                 "Request pricing and lead time from targeted vendors." if not quotes else None,
                 "Select the planned submission vendor and finalize submission pricing."
                 if quotes and not (submission and (submission.planned_vendor_quote_id or submission.planned_vendor_cage or submission.planned_vendor_name))
@@ -404,8 +567,49 @@ def build_workspace_recommendation(
     )
     next_actions = [item for item in next_actions if item]
 
+    if _clean_text(getattr(opp, "source", None)).upper() == "SAM":
+        next_actions = list(
+            dict.fromkeys(
+                [
+                    "Confirm the compliance matrix, required attachments, and open review flags."
+                    if sam_signals.get("needs_compliance_work")
+                    else None,
+                    "Review capability gaps against the company profile and past performance coverage."
+                    if sam_signals.get("needs_capability_work")
+                    else None,
+                    "Set the internal target submit date and proposal decision status."
+                    if not sam_signals.get("has_target_submit_date")
+                    else None,
+                    "Seed or update proposal tasks so the workspace reflects current execution work."
+                    if not sam_signals.get("decision_status")
+                    or sam_signals.get("decision_status") in {"NEW", "REVIEW"}
+                    else None,
+                    *next_actions,
+                ]
+            )
+        )
+        next_actions = [item for item in next_actions if item]
+
     due_status = derive_solicitation_status(getattr(opp, "due_at", None))
-    if due_status == "CLOSED":
+    if _clean_text(getattr(opp, "source", None)).upper() == "SAM":
+        if due_status == "CLOSED":
+            recommendation = "NO_BID"
+        elif recommendation_score < 45 or (strategic_fit < 35 and capability_fit < 45):
+            recommendation = "NO_BID"
+        elif sam_signals.get("needs_capability_work") and capability_fit < 60:
+            recommendation = "HOLD_FOR_CAPABILITY"
+        elif sam_signals.get("needs_compliance_work") and (risk >= 55 or execution_feasibility < 60):
+            recommendation = "HOLD_FOR_COMPLIANCE"
+        elif (
+            recommendation_score >= 68
+            and execution_feasibility >= 55
+            and risk <= 55
+            and sam_signals.get("past_performance_match_count", 0) > 0
+        ):
+            recommendation = "PURSUE_NOW"
+        else:
+            recommendation = "PURSUE_WITH_GAPS"
+    elif due_status == "CLOSED":
         recommendation = "DO_NOT_BID"
     elif recommendation_score < 45 or (strategic_fit < 35 and capability_fit < 45):
         recommendation = "DO_NOT_BID"
@@ -418,6 +622,25 @@ def build_workspace_recommendation(
         recommendation = "BID"
     else:
         recommendation = "NEEDS_REVIEW"
+
+    memory = dict(solicitation_memory or {})
+    memory_notes = _clean_list(memory.get("pattern_notes"))
+    top_memory_outcome = _clean_text(memory.get("top_outcome_pattern")).upper()
+    response_counts = memory.get("response_quality_counts") or {}
+    if top_memory_outcome == "AWARDED":
+        strengths.append("Similar local opportunities have produced awarded outcomes before.")
+        recommendation_score += 4
+    elif top_memory_outcome == "NO_BID":
+        blockers.append("Similar local opportunities were often dropped before submission.")
+        risk = _clamp(risk + 6)
+        recommendation_score -= 6
+    if int(response_counts.get("strong") or 0) > 0:
+        strengths.append("Local history shows strong vendor response on similar opportunities.")
+        recommendation_score += 3
+    elif int(response_counts.get("pending") or 0) > 0 and not quotes:
+        blockers.append("Similar opportunities often needed quote follow-up before they became actionable.")
+        recommendation_score -= 2
+    recommendation_score = _clamp(recommendation_score)
 
     confidence = _clamp(
         45
@@ -433,6 +656,11 @@ def build_workspace_recommendation(
         "BID": "bid",
         "NEEDS_REVIEW": "needs_review",
         "DO_NOT_BID": "research_only" if due_status == "CLOSED" else "do_not_bid",
+        "PURSUE_NOW": "pursue_now",
+        "PURSUE_WITH_GAPS": "pursue_with_gaps",
+        "HOLD_FOR_COMPLIANCE": "hold_for_compliance",
+        "HOLD_FOR_CAPABILITY": "hold_for_capability",
+        "NO_BID": "research_only" if due_status == "CLOSED" else "do_not_bid",
     }[recommendation]
 
     reason_pool = []
@@ -440,19 +668,29 @@ def build_workspace_recommendation(
         reason_pool.extend(strengths[:2])
     if blockers:
         reason_pool.extend(blockers[:2])
+    if memory_notes:
+        reason_pool.extend(memory_notes[:2])
     reasons = list(dict.fromkeys([item for item in reason_pool if item]))[:4]
 
-    recommendation_label = _replace_underscores(recommendation).title()
-    summary_parts = [recommendation_label]
-    if reasons:
-        summary_parts.append(": ")
-        summary_parts.append(" ".join(reasons[:2]))
-    summary = "".join(summary_parts).strip()
+    summary = " ".join(reasons[:2]).strip() if reasons else ""
+    if not summary:
+        summary = f"Current posture is {_guidance_posture_label(bid_posture)}."
 
     risk_flags = [
         {"severity": "high" if recommendation == "DO_NOT_BID" else "medium", "detail": item}
         for item in blockers[:6]
     ]
+    next_step = next_actions[0] if next_actions else (
+        "Prepare the final submission package."
+        if recommendation in {"BID", "PURSUE_NOW"}
+        else "Review the workspace and choose the next action."
+    )
+    vendor_signal_summary = (
+        f"{supplier_evidence['publog_candidate_count']} PUB LOG candidate"
+        f"{'' if supplier_evidence['publog_candidate_count'] == 1 else 's'}"
+        f", {supplier_evidence['sam_matched_candidate_count']} SAM matched"
+        f", {supplier_evidence['workspace_overlap_count']} already in the workspace"
+    )
 
     return {
         "recommendation": recommendation,
@@ -472,7 +710,14 @@ def build_workspace_recommendation(
         "blockers": blockers,
         "reasons": reasons,
         "next_actions": next_actions,
+        "next_step": next_step,
         "risk_flags": risk_flags,
+        "supplier_evidence": {
+            **supplier_evidence,
+            "summary": vendor_signal_summary,
+        },
+        "solicitation_memory": memory,
+        "sam_proposal_signals": sam_signals,
         "workspace_signals": {
             "document_count": len(files),
             "processed_document": document_data.get("filename"),
@@ -484,6 +729,9 @@ def build_workspace_recommendation(
                 1 for quote in quotes if _clean_text(getattr(quote, "status", None)).upper() == "RECEIVED"
             ),
             "approved_source_count": int(research_profile.get("approved_source_count") or 0),
+            "publog_candidate_count": int(supplier_evidence.get("publog_candidate_count") or 0),
+            "sam_matched_candidate_count": int(supplier_evidence.get("sam_matched_candidate_count") or 0),
+            "workspace_overlap_count": int(supplier_evidence.get("workspace_overlap_count") or 0),
         },
     }
 

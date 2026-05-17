@@ -5,7 +5,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.api.scrapers import run_multi_source_search
@@ -16,6 +16,7 @@ from app.repositories.company import CompanyRepository
 from app.services.awardee_enrichment import enrich_awardees_for_opportunity
 from app.services.company_profile_ingest import run_company_profile_ingest
 from app.services.dibbs.pdf_bulk_export import export_dibbs_pdfs_for_fscs
+from app.services.master_catalog_export import write_master_catalog_export
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.publog_sync import sync_publog_package
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
@@ -24,7 +25,20 @@ from app.services.worker_traceback_report import write_worker_traceback_report
 
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
-_executor: ThreadPoolExecutor | None = None
+_executors: dict[str, ThreadPoolExecutor] = {}
+
+QUEUE_LANE = "queue"
+VENDOR_LANE = "vendor"
+DEFAULT_LANE = "default"
+
+QUEUE_LANE_KINDS = {
+    "workspace_intake",
+    "awardee_enrichment",
+}
+
+VENDOR_LANE_KINDS = {
+    "provider_backfill",
+}
 
 
 def _runner_mode() -> str:
@@ -42,12 +56,36 @@ def _max_concurrency() -> int:
         return 4
 
 
-def _thread_executor() -> ThreadPoolExecutor:
-    global _executor
+def job_lane(kind: str | None) -> str:
+    normalized = str(kind or "").strip().lower()
+    if normalized in QUEUE_LANE_KINDS:
+        return QUEUE_LANE
+    if normalized in VENDOR_LANE_KINDS:
+        return VENDOR_LANE
+    return DEFAULT_LANE
+
+
+def _lane_concurrency(lane: str) -> int:
+    try:
+        if lane == QUEUE_LANE:
+            return max(1, int(getattr(settings, "SEARCH_JOB_QUEUE_MAX_CONCURRENCY", 2) or 2))
+        if lane == VENDOR_LANE:
+            return max(1, int(getattr(settings, "SEARCH_JOB_VENDOR_MAX_CONCURRENCY", 2) or 2))
+    except Exception:
+        pass
+    return _max_concurrency()
+
+
+def _thread_executor(lane: str) -> ThreadPoolExecutor:
     with _lock:
-        if _executor is None:
-            _executor = ThreadPoolExecutor(max_workers=_max_concurrency(), thread_name_prefix="nagacon-search")
-        return _executor
+        executor = _executors.get(lane)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=_lane_concurrency(lane),
+                thread_name_prefix=f"nagacon-{lane}",
+            )
+            _executors[lane] = executor
+        return executor
 
 
 def _now() -> str:
@@ -63,6 +101,13 @@ def _parse_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         return None
+
+
+def _progress_with_heartbeat(progress: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+    payload = dict(progress or {})
+    payload.update(extra)
+    payload["heartbeat_at"] = _now()
+    return payload
 
 
 def _json_safe(value: Any) -> Any:
@@ -116,6 +161,7 @@ def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": job["id"],
         "kind": job["kind"],
+        "worker_lane": job.get("worker_lane") or job_lane(job.get("kind")),
         "user_id": job.get("user_id"),
         "status": job["status"],
         "progress": dict(job.get("progress") or {}),
@@ -129,13 +175,15 @@ def _snapshot(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _db_snapshot(row: SearchJob) -> dict[str, Any]:
+    payload = dict(row.payload or {})
     return {
         "id": row.id,
         "kind": row.kind,
+        "worker_lane": payload.get("worker_lane") or job_lane(row.kind),
         "user_id": row.user_id,
         "status": row.status,
         "progress": dict(row.progress or {}),
-        "payload": row.payload,
+        "payload": payload,
         "result": row.result,
         "error": row.error,
         "started_at": row.started_at.isoformat() if row.started_at else None,
@@ -175,6 +223,10 @@ def _update_job(job_id: str, **updates: Any) -> None:
         job = _jobs.get(job_id)
         if not job:
             return
+        if "progress" in updates:
+            updates["progress"] = _progress_with_heartbeat(updates.get("progress"))
+        elif job.get("status") in {"queued", "running"}:
+            job["progress"] = _progress_with_heartbeat(job.get("progress"))
         job.update(updates)
         snapshot = dict(job)
     if snapshot:
@@ -197,6 +249,7 @@ def _append_progress(job_id: str, event: dict[str, Any]) -> None:
             "current_source": event.get("source"),
             "current_label": event.get("label"),
             "last_raw_rows": event.get("raw_rows"),
+            "heartbeat_at": _now(),
         }
         job.setdefault("events", []).append(
             {
@@ -216,7 +269,17 @@ def _append_progress(job_id: str, event: dict[str, Any]) -> None:
 def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
     db = SessionLocal()
     try:
-        _update_job(job_id, status="running", started_at=_now())
+        _update_job(
+            job_id,
+            status="running",
+            started_at=_now(),
+            progress=_progress_with_heartbeat(
+                _jobs.get(job_id, {}).get("progress") or {},
+                completed_steps=0,
+                total_steps=0,
+                percent=0,
+            ),
+        )
         if kind == "profile":
             profile = CompanyRepository(db).get_first_profile()
             if not profile:
@@ -321,12 +384,18 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
         final_status = "partial_success" if result_summary.get("has_errors") else "success"
         if isinstance(result, dict):
             result = {**result, "_job_summary": result_summary}
+        export_status = _maybe_refresh_master_catalog_export(db, kind, payload)
+        if isinstance(result, dict) and export_status:
+            result["_master_catalog_export"] = export_status
         _update_job(
             job_id,
             status=final_status,
             result=result,
             completed_at=_now(),
-            progress={**(_jobs.get(job_id, {}).get("progress") or {}), "percent": 100},
+            progress=_progress_with_heartbeat(
+                _jobs.get(job_id, {}).get("progress") or {},
+                percent=100,
+            ),
         )
     except Exception as exc:
         traceback_text = traceback.format_exc()
@@ -358,15 +427,90 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
         db.close()
 
 
+def _maybe_refresh_master_catalog_export(db, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if kind not in {"workspace_intake", "provider_backfill", "nsn_build", "awardee_enrichment", "publog_sync"}:
+        return None
+    try:
+        return write_master_catalog_export(db, organization_id=payload.get("organization_id"))
+    except Exception as exc:
+        db.rollback()
+        return {"written": False, "reason": f"{exc.__class__.__name__}: {exc}"}
+
+
 def _queued_job_query(db):
     return db.query(SearchJob).filter(SearchJob.status == "queued").order_by(SearchJob.created_at.asc(), SearchJob.id.asc())
 
 
-def claim_next_queued_job() -> dict[str, Any] | None:
+def _stale_cutoff() -> datetime:
+    stale_seconds = max(60, int(getattr(settings, "SEARCH_JOB_STALE_SECONDS", 1800) or 1800))
+    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=stale_seconds)
+
+
+def _heartbeat_dt(row: SearchJob) -> datetime | None:
+    progress = row.progress if isinstance(row.progress, dict) else {}
+    return (
+        _parse_dt(progress.get("heartbeat_at"))
+        or getattr(row, "updated_at", None)
+        or row.started_at
+    )
+
+
+def recover_stale_running_jobs() -> int:
+    db = SessionLocal()
+    recovered = 0
+    cutoff = _stale_cutoff()
+    now_value = _now()
+    try:
+        rows = db.query(SearchJob).filter(SearchJob.status == "running").all()
+        for row in rows:
+            heartbeat = _heartbeat_dt(row)
+            if heartbeat and heartbeat >= cutoff:
+                continue
+            progress = dict(row.progress or {})
+            progress["recovered_at"] = now_value
+            progress["recovery_reason"] = "stale_worker"
+            progress["heartbeat_at"] = now_value
+            events = list(row.events or [])
+            events.append(
+                {
+                    "timestamp": now_value,
+                    "label": "Recovered stale running job",
+                    "source": "worker",
+                }
+            )
+            row.status = "queued"
+            row.error = "Recovered after worker heartbeat went stale"
+            row.progress = progress
+            row.events = events[-20:]
+            row.started_at = None
+            row.completed_at = None
+            db.add(row)
+            recovered += 1
+        if recovered:
+            db.commit()
+        else:
+            db.rollback()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+    return recovered
+
+
+def claim_next_queued_job(*, lane: str | None = None) -> dict[str, Any] | None:
+    recover_stale_running_jobs()
     db = SessionLocal()
     try:
         while True:
-            row = _queued_job_query(db).first()
+            rows = _queued_job_query(db).limit(50).all()
+            row = next(
+                (
+                    candidate
+                    for candidate in rows
+                    if lane is None or (dict(candidate.payload or {}).get("worker_lane") or job_lane(candidate.kind)) == lane
+                ),
+                None,
+            )
             if not row:
                 return None
             started_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -378,6 +522,12 @@ def claim_next_queued_job() -> dict[str, Any] | None:
                         SearchJob.status: "running",
                         SearchJob.started_at: started_at,
                         SearchJob.error: None,
+                        SearchJob.progress: _progress_with_heartbeat(
+                            dict(row.progress or {}),
+                            completed_steps=int((row.progress or {}).get("completed_steps") or 0),
+                            total_steps=int((row.progress or {}).get("total_steps") or 0),
+                            percent=int((row.progress or {}).get("percent") or 0),
+                        ),
                     },
                     synchronize_session=False,
                 )
@@ -390,10 +540,11 @@ def claim_next_queued_job() -> dict[str, Any] | None:
                     _jobs[row.id] = {
                         "id": row.id,
                         "kind": row.kind,
+                        "worker_lane": dict(row.payload or {}).get("worker_lane") or job_lane(row.kind),
                         "organization_id": row.organization_id,
                         "user_id": row.user_id,
                         "status": row.status,
-                        "progress": dict(row.progress or {"completed_steps": 0, "total_steps": 0, "percent": 0}),
+                        "progress": dict(row.progress or {"completed_steps": 0, "total_steps": 0, "percent": 0, "heartbeat_at": _now()}),
                         "payload": dict(row.payload or {}),
                         "result": row.result,
                         "error": row.error,
@@ -421,8 +572,8 @@ def run_claimed_job(job_id: str) -> dict[str, Any] | None:
     return get_search_job(job_id)
 
 
-def run_one_queued_job() -> dict[str, Any] | None:
-    claimed = claim_next_queued_job()
+def run_one_queued_job(*, lane: str | None = None) -> dict[str, Any] | None:
+    claimed = claim_next_queued_job(lane=lane)
     if not claimed:
         return None
     return run_claimed_job(claimed["id"])
@@ -431,13 +582,16 @@ def run_one_queued_job() -> dict[str, Any] | None:
 def start_search_job(kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     payload = dict(payload or {})
+    lane = payload.get("worker_lane") or job_lane(kind)
+    payload["worker_lane"] = lane
     job = {
         "id": job_id,
         "kind": kind,
+        "worker_lane": lane,
         "organization_id": payload.get("organization_id"),
         "user_id": payload.get("user_id"),
         "status": "queued",
-        "progress": {"completed_steps": 0, "total_steps": 0, "percent": 0},
+        "progress": _progress_with_heartbeat({"completed_steps": 0, "total_steps": 0, "percent": 0}),
         "payload": payload,
         "result": None,
         "error": None,
@@ -450,7 +604,7 @@ def start_search_job(kind: str, payload: dict[str, Any] | None = None) -> dict[s
     _persist_job(job)
     if uses_external_worker():
         return _snapshot(job)
-    _thread_executor().submit(_run_job, job_id, kind, payload)
+    _thread_executor(lane).submit(_run_job, job_id, kind, payload)
     return _snapshot(job)
 
 
@@ -471,7 +625,7 @@ def record_search_job(
         "organization_id": payload.get("organization_id"),
         "user_id": payload.get("user_id"),
         "status": status,
-        "progress": dict(progress or {}),
+        "progress": _progress_with_heartbeat(dict(progress or {})),
         "payload": payload,
         "result": result,
         "error": error,
@@ -499,10 +653,15 @@ def get_search_job(job_id: str) -> dict[str, Any] | None:
 
 
 def worker_loop(*, poll_seconds: float | None = None, max_jobs: int | None = None) -> int:
+    return worker_loop_for_lane(lane=None, poll_seconds=poll_seconds, max_jobs=max_jobs)
+
+
+def worker_loop_for_lane(*, lane: str | None = None, poll_seconds: float | None = None, max_jobs: int | None = None) -> int:
     delay = float(poll_seconds if poll_seconds is not None else getattr(settings, "SEARCH_JOB_POLL_SECONDS", 2.0))
     processed = 0
     while True:
-        result = run_one_queued_job()
+        recover_stale_running_jobs()
+        result = run_one_queued_job(lane=lane)
         if result:
             processed += 1
             if max_jobs is not None and processed >= max_jobs:

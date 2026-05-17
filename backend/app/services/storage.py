@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -68,6 +69,16 @@ class _LocalStorage:
             target.unlink(missing_ok=True)
             return True
         return False
+
+    def delete_tree(self, reference: str | Path) -> bool:
+        target = self._normalize(reference)
+        if not target.exists():
+            return False
+        if target.is_file():
+            target.unlink(missing_ok=True)
+            return True
+        shutil.rmtree(target, ignore_errors=True)
+        return not target.exists()
 
     @contextmanager
     def local_path(self, reference: str, suffix: str | None = None) -> Iterator[Path]:
@@ -155,6 +166,28 @@ class _S3Storage:
         self.client.delete_object(Bucket=bucket, Key=key)
         return True
 
+    def delete_tree(self, reference: str | Path) -> bool:
+        bucket, prefix = self._split_reference(str(reference))
+        prefix = prefix.rstrip("/") + "/"
+        continuation_token = None
+        deleted_any = False
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = self.client.list_objects_v2(**kwargs)
+            objects = response.get("Contents") or []
+            if objects:
+                deleted_any = True
+                self.client.delete_objects(
+                    Bucket=bucket,
+                    Delete={"Objects": [{"Key": obj["Key"]} for obj in objects], "Quiet": True},
+                )
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+        return deleted_any
+
     @contextmanager
     def local_path(self, reference: str, suffix: str | None = None) -> Iterator[Path]:
         bucket, key = self._split_reference(reference)
@@ -226,6 +259,21 @@ def delete_reference(reference: str | None) -> bool:
     if _looks_like_local_reference(reference):
         return _LocalStorage().delete(str(reference))
     return get_storage().delete(str(reference))
+
+
+def delete_reference_tree(reference: str | Path | None) -> bool:
+    if not reference:
+        return False
+    ref = str(reference)
+    if ref.startswith("pruned://"):
+        return False
+    if _looks_like_local_reference(ref):
+        return _LocalStorage().delete_tree(ref)
+    storage = get_storage()
+    delete_tree = getattr(storage, "delete_tree", None)
+    if callable(delete_tree):
+        return bool(delete_tree(ref))
+    return False
 
 
 @contextmanager

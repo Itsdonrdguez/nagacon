@@ -6,6 +6,8 @@ import { Card, Button, EmptyState, Input, LoadingState, StatusPill } from '../co
 export default function Settings() {
   const queryClient = useQueryClient()
   const [externalApiKeysCsv, setExternalApiKeysCsv] = useState('')
+  const [pdfDownloadPath, setPdfDownloadPath] = useState('')
+  const [masterCatalogExportPath, setMasterCatalogExportPath] = useState('')
   const [providerForm, setProviderForm] = useState({
     sam_api_key: '',
     openai_api_key: '',
@@ -36,6 +38,8 @@ export default function Settings() {
   useEffect(() => {
     if (integrationSettingsQuery.data) {
       setExternalApiKeysCsv('')
+      setPdfDownloadPath(integrationSettingsQuery.data.pdf_download_path || '')
+      setMasterCatalogExportPath(integrationSettingsQuery.data.master_catalog_export_path || '')
     }
   }, [integrationSettingsQuery.data])
 
@@ -125,6 +129,9 @@ export default function Settings() {
             <div className="settings-summary-box">
               <div className="row-title">SAM</div>
               <StatusPill status={providerSettingsQuery.data?.sam_configured ? 'Configured' : 'Missing'} />
+              <div className="row-subtitle">
+                Source: {providerSettingsQuery.data?.sam_api_key_source || 'missing'}
+              </div>
             </div>
             <div className="settings-summary-box">
               <div className="row-title">OpenAI</div>
@@ -182,11 +189,21 @@ export default function Settings() {
             >
               Save Personal Provider Settings
             </Button>
+            <Button
+              variant="secondary"
+              loading={saveProviderMutation.isPending}
+              onClick={() => saveProviderMutation.mutate({ ...providerForm, sam_api_key: '', clear_sam_api_key: true })}
+            >
+              Clear Saved SAM Key
+            </Button>
             {saveProviderMutation.data ? <span className="form-success">Personal provider settings saved.</span> : null}
             {saveProviderMutation.error ? <span className="form-error">{saveProviderMutation.error.message || 'Failed to save provider settings.'}</span> : null}
           </div>
           <div className="panel-subtitle">
             Secret values are hidden after saving. Leave a key blank to keep the current value.
+          </div>
+          <div className="panel-subtitle">
+            If SAM enrichment starts returning unauthorized errors, clearing the saved SAM key will make local mode fall back to the backend environment key when one is configured.
           </div>
           <div className="panel-subtitle">
             Recommended low-cost starting model for NagaCon agent tests: <code>gpt-4o-mini</code>
@@ -220,14 +237,56 @@ export default function Settings() {
               Use commas to separate multiple keys. Leave blank to keep existing keys.
             </div>
           </div>
+          <div className="company-form-grid">
+            <Input
+              label="PDF Download Path"
+              value={pdfDownloadPath}
+              onChange={(event) => setPdfDownloadPath(event.target.value)}
+              placeholder="C:\\NagaCon\\pdfs"
+            />
+            <Input
+              label="Master Catalog Export Path"
+              value={masterCatalogExportPath}
+              onChange={(event) => setMasterCatalogExportPath(event.target.value)}
+              placeholder="C:\\NagaCon\\exports\\master_catalog.csv"
+            />
+          </div>
+          <div className="panel-subtitle">
+            Set a local folder where opportunity PDFs and notice files should be downloaded. Leave blank to use the default local storage root.
+          </div>
+          <div className="panel-subtitle">
+            The master catalog export keeps an updatable flat file of FSC, NSN, vendor, and part number records using the best CAGE-enriched vendor names we have.
+          </div>
           <div className="company-form-actions">
             <Button
               loading={saveIntegrationMutation.isPending}
-              onClick={() => saveIntegrationMutation.mutate({ external_api_keys_csv: externalApiKeysCsv })}
+              onClick={() => saveIntegrationMutation.mutate({
+                external_api_keys_csv: externalApiKeysCsv,
+                pdf_download_path: pdfDownloadPath,
+                master_catalog_export_path: masterCatalogExportPath,
+              })}
             >
-              Save External API Keys
+              Save Integration Settings
             </Button>
-            {saveIntegrationMutation.data ? <span className="form-success">External API keys saved.</span> : null}
+            <Button
+              variant="secondary"
+              loading={saveIntegrationMutation.isPending}
+              onClick={() => saveIntegrationMutation.mutate({ external_api_keys_csv: externalApiKeysCsv, pdf_download_path: '', clear_pdf_download_path: true })}
+            >
+              Clear PDF Download Path
+            </Button>
+            <Button
+              variant="secondary"
+              loading={saveIntegrationMutation.isPending}
+              onClick={() => saveIntegrationMutation.mutate({
+                external_api_keys_csv: externalApiKeysCsv,
+                master_catalog_export_path: '',
+                clear_master_catalog_export_path: true,
+              })}
+            >
+              Clear Catalog Export Path
+            </Button>
+            {saveIntegrationMutation.data ? <span className="form-success">Integration settings saved.</span> : null}
             {saveIntegrationMutation.error ? <span className="form-error">{saveIntegrationMutation.error.message || 'Failed to save external API keys.'}</span> : null}
           </div>
           <div className="settings-summary-box">
@@ -236,6 +295,15 @@ export default function Settings() {
               {integrationSettingsQuery.data?.configured
                 ? `${integrationSettingsQuery.data.external_api_key_count || 0} external API key(s) configured.`
                 : 'No external API keys configured yet.'}
+            </div>
+            <div className="row-subtitle">
+              PDF download path: {integrationSettingsQuery.data?.pdf_download_path || 'Using default local storage root'}
+            </div>
+            <div className="row-subtitle">
+              Master catalog export: {integrationSettingsQuery.data?.master_catalog_export_path || 'Not configured'}
+            </div>
+            <div className="row-subtitle">
+              Last catalog write: {integrationSettingsQuery.data?.master_catalog_export_last_written_at || 'Never'} | Rows: {integrationSettingsQuery.data?.master_catalog_export_last_row_count || 0}
             </div>
           </div>
         </div>

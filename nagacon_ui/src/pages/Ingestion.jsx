@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
-import { Card, Button, EmptyState, Input, StatusPill } from '../components/ui'
+import { Card, Button, EmptyState, Input, MultiSelect, StatusPill } from '../components/ui'
+import { FSC_CODE_OPTIONS, NAICS_CODE_OPTIONS, withCustomOptions } from '../data/codeCatalogs'
 
 const DEFAULT_DIBBS_FSC_CODES = ['6520', '8470', '6550', '5805', '5130', '5810', '5998', '5999', '1095', '6110', '6515']
 const DEFAULT_MANUAL_DIBBS_FSC = DEFAULT_DIBBS_FSC_CODES[0]
+const DEFAULT_SAM_NAICS_CODES = ['561720', '561210', '561730', '561740', '561790', '484110', '484121', '484122', '488510', '492110', '492210', '485999', '488999']
 const DEFAULT_PER_CODE_SEARCH_SIZE = 25
+const ACTIVE_SEARCH_JOB_STORAGE_KEY = 'nagacon_active_search_job_id'
 
 function totalResult(result) {
   if (!result) return { inserted: 0, updated: 0, skipped: 0, errors: [] }
@@ -38,62 +41,17 @@ function resultSummary(result) {
   return result._job_summary || null
 }
 
-function SearchCoverage({ diagnostics, codeLabel }) {
-  if (!diagnostics) return null
-
-  const usedCodes = diagnostics.used_codes || []
-  const codeResults = diagnostics.code_results || []
-  const queryResults = diagnostics.queries || []
-
-  return (
-    <div className="ingest-coverage">
-      {usedCodes.length > 0 ? (
-        <div className="ingest-code-breakdown" aria-label={codeLabel}>
-          {usedCodes.map((code) => (
-            <span key={`${codeLabel}-${code}`} className="ingest-code-pill">{code}</span>
-          ))}
-        </div>
-      ) : null}
-      <div className="ingest-result-row">
-        <span>Source records found</span>
-        <strong>{diagnostics.raw_rows ?? 0}</strong>
-      </div>
-      {codeResults.length > 0 ? (
-        <div className="ingest-code-breakdown">
-          {codeResults.map((item) => (
-            <div key={`${codeLabel}-result-${item.code}`} className="ingest-code-pill">
-              <span>{item.code}</span>
-              <strong>{item.raw_rows ?? 0}</strong>
-            </div>
-          ))}
-        </div>
-      ) : null}
-      {queryResults.length > 0 ? (
-        <div className="ingest-query-list">
-          {queryResults.slice(0, 4).map((item, index) => (
-            <div key={`query-${index}`} className="ingest-query-line">
-              <strong>{item.query?.title || item.query?.ncode || item.query?.ccode || `Search ${index + 1}`}</strong>
-              <span>{item.naics_filtered_rows ?? item.raw_rows ?? 0} matched</span>
-            </div>
-          ))}
-          {queryResults.length > 4 ? <div className="row-subtitle">+ {queryResults.length - 4} more searches</div> : null}
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
 function SourceResult({ label, result }) {
   if (!result) return null
-  const codeLabel = label === 'SAM' ? 'SAM Targeting' : 'DIBBS FSC Codes'
-  const foundCount = result.diagnostics?.raw_rows ?? 0
 
   return (
     <div className="ingest-source-card">
       <div>
         <div className="row-title">{label}</div>
         <div className="row-subtitle">
-          {foundCount > 0 ? `${foundCount} source record${foundCount === 1 ? '' : 's'} reviewed` : 'No source records matched this run'}
+          {(Number(result.inserted ?? 0) + Number(result.updated ?? 0) + Number(result.skipped ?? 0)) > 0
+            ? 'Search completed for this source.'
+            : 'No opportunities changed in this run.'}
         </div>
       </div>
       <div className="ingest-result-row">
@@ -108,7 +66,6 @@ function SourceResult({ label, result }) {
         <span>Already current</span>
         <StatusPill status={String(result.skipped ?? 0)} />
       </div>
-      <SearchCoverage diagnostics={result.diagnostics} codeLabel={codeLabel} />
       {(result.errors || []).length > 0 ? (
         <div className="ingest-errors">
           {(result.errors || []).map((error, index) => (
@@ -122,14 +79,26 @@ function SourceResult({ label, result }) {
 
 export default function Ingestion() {
   const queryClient = useQueryClient()
-  const [query, setQuery] = useState(DEFAULT_MANUAL_DIBBS_FSC)
+  const [selectedFscCodes, setSelectedFscCodes] = useState([DEFAULT_MANUAL_DIBBS_FSC])
+  const [selectedNaicsCodes, setSelectedNaicsCodes] = useState(DEFAULT_SAM_NAICS_CODES)
   const [source, setSource] = useState('DIBBS')
   const [searchMode, setSearchMode] = useState('quick')
   const [samState, setSamState] = useState('')
   const [samZip, setSamZip] = useState('')
   const [samAgency, setSamAgency] = useState('')
-  const [activeJobId, setActiveJobId] = useState(null)
+  const [activeJobId, setActiveJobId] = useState(() => (
+    typeof window === 'undefined' ? null : window.localStorage.getItem(ACTIVE_SEARCH_JOB_STORAGE_KEY)
+  ))
   const [activeAction, setActiveAction] = useState(null)
+
+  const fscCodeOptions = useMemo(
+    () => withCustomOptions(FSC_CODE_OPTIONS, selectedFscCodes, 'fsc'),
+    [selectedFscCodes],
+  )
+  const naicsCodeOptions = useMemo(
+    () => withCustomOptions(NAICS_CODE_OPTIONS, selectedNaicsCodes, 'naics'),
+    [selectedNaicsCodes],
+  )
 
   const refreshOpportunityFeeds = () => {
     queryClient.invalidateQueries({ queryKey: ['opportunities'] })
@@ -191,7 +160,25 @@ export default function Ingestion() {
       const res = await api.get(`/api/search-jobs/${activeJobId}`)
       return res.data
     },
+    retry: false,
   })
+
+  useEffect(() => {
+    if (activeJobId) {
+      window.localStorage.setItem(ACTIVE_SEARCH_JOB_STORAGE_KEY, String(activeJobId))
+      return
+    }
+    window.localStorage.removeItem(ACTIVE_SEARCH_JOB_STORAGE_KEY)
+  }, [activeJobId])
+
+  useEffect(() => {
+    if (!searchJobQuery.error) return
+    const status = searchJobQuery.error?.response?.status
+    if (status === 404) {
+      setActiveJobId(null)
+      window.localStorage.removeItem(ACTIVE_SEARCH_JOB_STORAGE_KEY)
+    }
+  }, [searchJobQuery.error])
 
   useEffect(() => {
     if (!['success', 'partial_success'].includes(searchJobQuery.data?.status)) {
@@ -201,10 +188,14 @@ export default function Ingestion() {
     queryClient.invalidateQueries({ queryKey: ['company-ingest-plan'] })
   }, [searchJobQuery.data?.status, searchJobQuery.data?.completed_at])
 
+  const fscQueryValue = selectedFscCodes.join(', ')
+  const naicsQueryValue = selectedNaicsCodes.join(', ')
+
   const runManualSearch = async ({ limit = DEFAULT_PER_CODE_SEARCH_SIZE, deep = false } = {}) => {
     setActiveAction(deep ? 'manual_deep' : 'manual_search')
     await ingestMutation.mutateAsync({
-      q: query.trim(),
+      q: naicsQueryValue,
+      fsc: fscQueryValue,
       per_code_limit: limit,
       limit_mode: deep ? 'all' : 'per_code',
       max_pages: deep ? 999 : 4,
@@ -218,7 +209,7 @@ export default function Ingestion() {
   const runBulkPdfDownload = async () => {
     setActiveAction('manual_pdfs')
     await pdfDownloadMutation.mutateAsync({
-      fscs: query.trim(),
+      fscs: fscQueryValue,
     })
   }
 
@@ -237,8 +228,8 @@ export default function Ingestion() {
 
   const handleSourceChange = (nextSource) => {
     setSource(nextSource)
-    if (nextSource === 'DIBBS' && !query.trim()) {
-      setQuery(DEFAULT_MANUAL_DIBBS_FSC)
+    if (nextSource === 'DIBBS' && selectedFscCodes.length === 0) {
+      setSelectedFscCodes([DEFAULT_MANUAL_DIBBS_FSC])
     }
     if (nextSource !== 'DIBBS' && searchMode === 'pdfs') {
       setSearchMode('quick')
@@ -260,10 +251,10 @@ export default function Ingestion() {
   const summary = resultSummary(result)
   const helperText =
     source === 'DIBBS'
-      ? `Enter one or more DLA FSC codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per FSC.`
+      ? `Choose one or more DLA FSC codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per FSC.`
       : source === 'SAM'
-        ? `Enter SAM NAICS, PSC, or classification codes separated by commas. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per code.`
-        : `Use this for a combined manual run. DIBBS uses FSC codes; SAM uses NAICS/PSC/classification codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per code.`
+        ? `Choose one or more SAM NAICS codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per code.`
+        : `Use this for a combined manual run. DIBBS uses FSC codes and SAM uses NAICS codes. The search checks up to ${DEFAULT_PER_CODE_SEARCH_SIZE} records per code.`
   const showSamFilters = source !== 'DIBBS'
   const profileFscCodes = plan?.dibbs?.fsc_codes || DEFAULT_DIBBS_FSC_CODES
   const profileKeywords = plan?.sam?.keywords || []
@@ -292,8 +283,12 @@ export default function Ingestion() {
       : ingestMutation.isPending || (isSearching && activeAction === (searchMode === 'deep' ? 'manual_deep' : 'manual_search'))
   const manualSubmitDisabled =
     searchMode === 'pdfs'
-      ? source !== 'DIBBS' || profileIngestMutation.isPending || ingestMutation.isPending || isSearching || !query.trim()
-      : profileIngestMutation.isPending || isSearching
+      ? source !== 'DIBBS' || profileIngestMutation.isPending || ingestMutation.isPending || isSearching || selectedFscCodes.length === 0
+      : profileIngestMutation.isPending || isSearching || (
+        (source === 'DIBBS' && selectedFscCodes.length === 0) ||
+        (source === 'SAM' && selectedNaicsCodes.length === 0) ||
+        (source === 'ALL' && selectedFscCodes.length === 0 && selectedNaicsCodes.length === 0)
+      )
   const searchStateLabel = isSearching
     ? 'Search in progress'
     : result
@@ -313,7 +308,7 @@ export default function Ingestion() {
       </div>
 
       <div className="ingestion-grid">
-        <Card title="Use Saved Profile">
+        <Card title="Use Saved Profile" className="ingestion-search-card">
           <div className="ingest-command-card ingest-command-card-primary">
             <div className="ingest-command-header">
               <div>
@@ -367,7 +362,7 @@ export default function Ingestion() {
           </div>
         </Card>
 
-        <Card title="Run a Custom Search">
+        <Card title="Run a Custom Search" className="ingestion-search-card">
           <form className="company-form" onSubmit={handleSubmit}>
             <div className="ingest-search-stack">
               <div className="ingest-command-header">
@@ -400,13 +395,34 @@ export default function Ingestion() {
                   <div className="row-subtitle">{selectedManualMode.description}</div>
                 </div>
               </div>
-              <Input
-                label={source === 'DIBBS' ? 'DLA FSC Codes' : 'Search Codes'}
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder={source === 'DIBBS' ? '6520' : '561720, 561210'}
-                helperText={helperText}
-              />
+              {source !== 'SAM' ? (
+                <MultiSelect
+                  label="DLA FSC Codes"
+                  value={selectedFscCodes}
+                  options={fscCodeOptions}
+                  onChange={setSelectedFscCodes}
+                  placeholder="Search FSC codes"
+                  helperText={source === 'DIBBS' ? helperText : 'Optional for combined runs. Use FSC codes to target DIBBS opportunities.'}
+                  allowCustom
+                  customTypeLabel="FSC code"
+                  normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 4)}
+                  disabled={isSearching}
+                />
+              ) : null}
+              {source !== 'DIBBS' ? (
+                <MultiSelect
+                  label="SAM NAICS Codes"
+                  value={selectedNaicsCodes}
+                  options={naicsCodeOptions}
+                  onChange={setSelectedNaicsCodes}
+                  placeholder="Search NAICS codes"
+                  helperText={source === 'SAM' ? helperText : 'Optional for combined runs. Use NAICS codes to target SAM opportunities.'}
+                  allowCustom
+                  customTypeLabel="NAICS code"
+                  normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 6)}
+                  disabled={isSearching}
+                />
+              ) : null}
               <div className="ingest-controls-row">
                 <div className="filter-select">
                   <label className="input-label">Source</label>
@@ -466,7 +482,7 @@ export default function Ingestion() {
         </Card>
       </div>
 
-      <Card title="Search Results">
+      <Card title="Search Results" className="ingestion-results-card">
         <div className="ingest-results-header">
           <div>
             <div className="row-title">{searchStateLabel}</div>

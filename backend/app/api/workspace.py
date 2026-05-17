@@ -1,14 +1,19 @@
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_current_user, get_db
+from app.models.agent_run import AgentRun
 from app.models.bid_submission import BidSubmission
 from app.models.opportunity import Opportunity
 from app.models.opportunity import OpportunityAnalysis
 from app.models.opportunity_file import OpportunityFile
-from app.models.vendor import VendorLead
+from app.models.pipeline_item import PipelineItem
+from app.models.search_job import SearchJob
+from app.models.vendor import VendorLead, VendorQuote
 from app.models.workspace import WorkspaceArtifact, WorkspaceTask
 from app.repositories.agents import AgentRunRepository
 from app.repositories.company import CompanyRepository
@@ -17,14 +22,17 @@ from app.repositories.pipeline import PipelineRepository
 from app.schemas.agent import AgentRunCreate, AgentRunUpdate
 from app.schemas.workspace import ArtifactOut, ArtifactUpdate, GenerateIn, TaskCreate, TaskOut, TaskUpdate
 from app.services.dibbs.detail_enrichment_playwright import enrich_dibbs_opportunity
-from app.services.agents.workspace_agents import PHASE_AGENT_MAP, run_workspace_agent, workspace_agent_type
+from app.services.agents.workspace_agents import PHASE_AGENT_MAP, get_workspace_agent_catalog, resolve_workspace_agent_key, run_workspace_agent, workspace_agent_type
 from app.services.bid_submission_service import get_submission
+from app.services.opportunity_brief import build_contract_brief, build_procurement_profile, build_readiness_assessment
 from app.services.recommendation_engine import build_workspace_recommendation
 from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipeline
-from app.services.sam_capability_match import build_sam_capability_match
+from app.services.sam_capability_match import build_capability_match
 from app.services.research.usaspending_research_service import search_usaspending_for_opportunity, seed_usaspending_vendors_into_leads
 from app.services.intelligence.nsn_intelligence_service import get_nsn_intelligence, run_nsn_intelligence
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs, seed_vendor_leads_from_providers
+from app.services.nsn_catalog.publog_reference_service import search_publog_reference
+from app.services.solicitation_memory import build_solicitation_memory
 from app.services.vendor_service import promote_vendor_lead_to_quote_request, sync_quote_status_from_outreach_artifact, sync_vendor_leads_from_parsed
 from app.services.vendor_email_automation import generate_quote_request_email
 from app.services.vendor_email_automation import send_email_message
@@ -142,6 +150,255 @@ def _artifact_payload(artifact: WorkspaceArtifact) -> dict:
     }
 
 
+def _latest_artifact(artifacts: list[WorkspaceArtifact], artifact_type: str) -> WorkspaceArtifact | None:
+    return next((artifact for artifact in artifacts if artifact.artifact_type == artifact_type), None)
+
+
+def _build_agent_findings(
+    *,
+    artifacts: list[WorkspaceArtifact],
+    recommendation: dict[str, Any],
+    solicitation_memory: dict[str, Any],
+    compliance_json: dict[str, Any],
+    capability_match: dict[str, Any],
+    past_performance_map: dict[str, Any],
+) -> dict[str, Any]:
+    opportunity_analysis = dict((getattr(_latest_artifact(artifacts, "OPPORTUNITY_ANALYSIS"), "content_json", None) or {}))
+    compliance_brief = dict((getattr(_latest_artifact(artifacts, "COMPLIANCE_BRIEF"), "content_json", None) or {}))
+    vendor_research = dict((getattr(_latest_artifact(artifacts, "VENDOR_RESEARCH"), "content_json", None) or {}))
+    capability_artifact = dict((getattr(_latest_artifact(artifacts, "CAPABILITY_MATCH"), "content_json", None) or {}))
+    outreach_plan = dict((getattr(_latest_artifact(artifacts, "OUTREACH_PLAN"), "content_json", None) or {}))
+    execution_plan = dict((getattr(_latest_artifact(artifacts, "EXECUTION_PLAN"), "content_json", None) or {}))
+
+    return {
+        "solicitation_analyst": {
+            "summary": opportunity_analysis.get("executive_assessment") or recommendation.get("summary"),
+            "history_signals": opportunity_analysis.get("history_signals") or solicitation_memory.get("history_signals") or [],
+            "outcome_patterns": opportunity_analysis.get("outcome_patterns") or solicitation_memory.get("outcome_patterns") or [],
+            "response_patterns": opportunity_analysis.get("response_patterns") or solicitation_memory.get("response_patterns") or [],
+            "strengths": opportunity_analysis.get("strengths") or recommendation.get("strengths") or [],
+            "blockers": opportunity_analysis.get("blockers") or recommendation.get("blockers") or [],
+            "next_actions": opportunity_analysis.get("recommended_next_actions") or recommendation.get("next_actions") or [],
+        },
+        "compliance_reviewer": {
+            "summary": compliance_brief.get("source_basis") or compliance_json.get("summary") or "Document review is ready.",
+            "requirement_matrix": compliance_brief.get("requirement_matrix") or [],
+            "review_flags": compliance_brief.get("review_flags") or compliance_json.get("review_flags") or [],
+            "missing_information": compliance_brief.get("missing_information") or compliance_json.get("missing_information") or [],
+            "vendor_request_items": compliance_brief.get("vendor_request_items") or compliance_json.get("vendor_request_items") or [],
+        },
+        "market_researcher": {
+            "summary": vendor_research.get("research_profile", {}).get("summary") or "Market research is available.",
+            "market_findings": vendor_research.get("market_findings") or [],
+            "recommended_targets": vendor_research.get("recommended_targets") or [],
+            "award_history_summary": vendor_research.get("award_history_summary") or {},
+            "supplier_evidence": vendor_research.get("supplier_evidence") or {},
+            "workspace_vendor_history": vendor_research.get("workspace_vendor_history") or {},
+            "past_performance_map": past_performance_map or {},
+        },
+        "capability_matcher": {
+            "summary": capability_artifact.get("summary") or capability_match.get("summary") or "Capability fit has not been reviewed yet.",
+            "signals": capability_artifact.get("signals") or capability_match.get("signals") or [],
+            "gaps": capability_artifact.get("gaps") or capability_match.get("gaps") or [],
+            "matched_fields": capability_artifact.get("matched_fields") or capability_match.get("matched_fields") or {},
+        },
+        "outreach_coordinator": {
+            "summary": outreach_plan.get("subject") or "No outreach plan has been generated yet.",
+            "target_vendor_name": outreach_plan.get("target_vendor_name"),
+            "target_vendor_cage": outreach_plan.get("target_vendor_cage"),
+            "vendor_request_items": outreach_plan.get("vendor_request_items") or [],
+            "follow_up_plan": outreach_plan.get("follow_up_plan") or [],
+        },
+        "proposal_coordinator": {
+            "summary": execution_plan.get("submission_outcome", {}).get("status") or "No execution plan has been generated yet.",
+            "recommended_sequence": execution_plan.get("recommended_sequence") or [],
+            "open_task_count": execution_plan.get("open_task_count"),
+            "open_tasks": execution_plan.get("open_tasks") or [],
+        },
+    }
+
+
+def _workspace_snapshot_marker(db: Session, opp_id: int, organization_id: int | None = None) -> dict[str, Any]:
+    def _max_for(model, field_name: str, *, scoped_field: str = "opportunity_id"):
+        query = db.query(func.max(getattr(model, field_name)))
+        if hasattr(model, scoped_field):
+            query = query.filter(getattr(model, scoped_field) == opp_id)
+        if organization_id is not None and hasattr(model, "organization_id"):
+            query = query.filter(getattr(model, "organization_id") == organization_id)
+        return query.scalar()
+
+    def _count_for(model, *, scoped_field: str = "opportunity_id", extra_filter=None):
+        query = db.query(func.count()).select_from(model)
+        if hasattr(model, scoped_field):
+            query = query.filter(getattr(model, scoped_field) == opp_id)
+        if organization_id is not None and hasattr(model, "organization_id"):
+            query = query.filter(getattr(model, "organization_id") == organization_id)
+        if extra_filter is not None:
+            query = query.filter(extra_filter)
+        return int(query.scalar() or 0)
+
+    snapshot_artifact_type = "WORKSPACE_SUMMARY_SNAPSHOT"
+    active_job_query = db.query(SearchJob.id, SearchJob.kind, SearchJob.status, SearchJob.payload).filter(
+        SearchJob.status.in_(["queued", "running"]),
+        SearchJob.kind.in_(["workspace_intake", "provider_backfill", "awardee_enrichment"]),
+    )
+    if organization_id is not None:
+        active_job_query = active_job_query.filter(SearchJob.organization_id == organization_id)
+    active_job_signature = sorted(
+        f"{row.id}:{row.kind}:{row.status}"
+        for row in active_job_query.all()
+        if int((dict(row.payload or {})).get("opportunity_id") or (dict(row.payload or {})).get("opp_id") or 0) == opp_id
+    )
+
+    marker = {
+        "opportunity_updated_at": getattr(getattr(db.get(Opportunity, opp_id), "updated_at", None), "isoformat", lambda: None)(),
+        "analysis_updated_at": getattr(_max_for(OpportunityAnalysis, "updated_at"), "isoformat", lambda: None)(),
+        "file_created_at": getattr(_max_for(OpportunityFile, "created_at"), "isoformat", lambda: None)(),
+        "artifact_created_at": getattr(
+            db.query(func.max(WorkspaceArtifact.created_at))
+            .filter(WorkspaceArtifact.opportunity_id == opp_id, WorkspaceArtifact.artifact_type != snapshot_artifact_type)
+            .scalar(),
+            "isoformat",
+            lambda: None,
+        )(),
+        "task_created_at": getattr(_max_for(WorkspaceTask, "created_at"), "isoformat", lambda: None)(),
+        "quote_updated_at": getattr(_max_for(VendorQuote, "updated_at"), "isoformat", lambda: None)(),
+        "vendor_updated_at": getattr(_max_for(VendorLead, "updated_at"), "isoformat", lambda: None)(),
+        "agent_run_created_at": getattr(
+            db.query(func.max(AgentRun.created_at)).filter(AgentRun.opportunity_id == opp_id).scalar(),
+            "isoformat",
+            lambda: None,
+        )(),
+        "submission_updated_at": getattr(
+            db.query(func.max(BidSubmission.updated_at)).filter(BidSubmission.opportunity_id == opp_id).scalar(),
+            "isoformat",
+            lambda: None,
+        )(),
+        "pipeline_updated_at": getattr(
+            db.query(func.max(PipelineItem.updated_at))
+            .filter(PipelineItem.opportunity_id == opp_id)
+            .scalar(),
+            "isoformat",
+            lambda: None,
+        )(),
+        "artifact_count": _count_for(WorkspaceArtifact, extra_filter=WorkspaceArtifact.artifact_type != snapshot_artifact_type),
+        "task_count": _count_for(WorkspaceTask),
+        "quote_count": _count_for(VendorQuote),
+        "vendor_count": _count_for(VendorLead),
+        "agent_run_count": _count_for(AgentRun, scoped_field="opportunity_id"),
+        "file_count": _count_for(OpportunityFile),
+        "active_job_signature": active_job_signature,
+    }
+    return marker
+
+
+def _latest_workspace_snapshot(db: Session, opp_id: int, organization_id: int | None = None) -> WorkspaceArtifact | None:
+    query = db.query(WorkspaceArtifact).filter(
+        WorkspaceArtifact.opportunity_id == opp_id,
+        WorkspaceArtifact.artifact_type == "WORKSPACE_SUMMARY_SNAPSHOT",
+    )
+    if organization_id is not None:
+        query = query.filter(WorkspaceArtifact.organization_id == organization_id)
+    return query.order_by(WorkspaceArtifact.created_at.desc()).first()
+
+
+def _workspace_snapshot_is_fresh(snapshot: WorkspaceArtifact | None, marker: dict[str, Any]) -> bool:
+    if snapshot is None:
+        return False
+    snapshot_marker = dict((snapshot.content_json or {}).get("snapshot_marker") or {})
+    return snapshot_marker == marker
+
+
+def _workspace_freshness(
+    *,
+    opp: Opportunity,
+    artifacts: list[WorkspaceArtifact],
+    files: list[OpportunityFile],
+    tasks: list[WorkspaceTask],
+    compliance_json: dict[str, Any],
+    document_data: dict[str, Any],
+    db: Session,
+    organization_id: int | None,
+) -> dict[str, Any]:
+    artifact_types = {str(getattr(artifact, "artifact_type", "") or "").upper() for artifact in artifacts}
+    has_vendor_artifact = "VENDOR_LIST" in artifact_types
+    has_checklist = "CHECKLIST" in artifact_types
+    has_compliance_matrix = "COMPLIANCE_MATRIX" in artifact_types
+    has_execution_plan = "EXECUTION_PLAN" in artifact_types
+    source = str(getattr(opp, "source", "") or "").upper()
+    parsed_json = getattr(opp, "parsed_json", None) or {}
+    has_parsed_data = bool(
+        parsed_json
+        or document_data.get("fields")
+        or document_data.get("summary")
+        or any(getattr(file, "extracted_text", None) for file in files)
+    )
+    needs_document_refresh = bool(files) and _artifact_needs_document_refresh(compliance_json, files)
+    needs_workspace_prep = not has_vendor_artifact or not has_parsed_data
+    needs_checklist_generation = source == "SAM" and not has_checklist
+    needs_compliance_matrix_generation = source == "SAM" and bool(compliance_json) and not has_compliance_matrix
+    needs_task_seed = source == "SAM" and not tasks
+
+    active_job_query = db.query(SearchJob).filter(
+        SearchJob.status.in_(["queued", "running"]),
+        SearchJob.kind.in_(["workspace_intake", "provider_backfill", "awardee_enrichment"]),
+    )
+    if organization_id is not None:
+        active_job_query = active_job_query.filter(SearchJob.organization_id == organization_id)
+    active_jobs = []
+    for row in active_job_query.all():
+        payload = dict(row.payload or {})
+        if int(payload.get("opportunity_id") or payload.get("opp_id") or 0) != int(getattr(opp, "id", 0) or 0):
+            continue
+        active_jobs.append(
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "status": row.status,
+                "worker_lane": payload.get("worker_lane"),
+            }
+        )
+
+    reasons: list[str] = []
+    if needs_workspace_prep:
+        reasons.append("Workspace preparation is incomplete.")
+    if needs_document_refresh:
+        reasons.append("Document-backed compliance artifacts look out of date.")
+    if needs_checklist_generation:
+        reasons.append("Checklist artifact has not been generated yet.")
+    if needs_compliance_matrix_generation:
+        reasons.append("Compliance matrix artifact has not been generated yet.")
+    if needs_task_seed:
+        reasons.append("Proposal task seeding has not been completed yet.")
+
+    return {
+        "has_parsed_data": has_parsed_data,
+        "needs_workspace_prep": needs_workspace_prep,
+        "needs_document_refresh": needs_document_refresh,
+        "needs_checklist_generation": needs_checklist_generation,
+        "needs_compliance_matrix_generation": needs_compliance_matrix_generation,
+        "needs_task_seed": needs_task_seed,
+        "has_execution_plan": has_execution_plan,
+        "active_jobs": active_jobs,
+        "summary": "Workspace is current." if not reasons else " ".join(reasons),
+        "reasons": reasons,
+    }
+
+
+def _serialize_agent_run(run, *, include_output: bool = True) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "agent_type": getattr(run.agent_type, "value", run.agent_type),
+        "agent_key": (run.input_payload or {}).get("agent_key") if isinstance(getattr(run, "input_payload", None), dict) else None,
+        "status": run.status,
+        "model_name": run.model_name,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "error_message": run.error_message,
+        "output_payload": run.output_payload if include_output else None,
+    }
+
+
 def _create_agent_run_safe(db: Session, opp_id: int, agent_key: str, extra_input: dict | None = None):
     repo = AgentRunRepository(db)
     try:
@@ -192,33 +449,10 @@ def _run_workspace_agent_for_user(agent_key: str, opp: Opportunity, db: Session,
 def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     org_id = getattr(current_org, "id", None)
     opp = _get_opp_scoped(db, opp_id, organization_id=org_id)
-
-    intake_pipeline = None
-    if str((getattr(opp, "raw_payload", None) or {}).get("_intake_pipeline_ran") or "").lower() != "true":
-        try:
-            existing_artifacts = _query_count(db.query(WorkspaceArtifact).filter(WorkspaceArtifact.opportunity_id == opp_id))
-            existing_leads = _query_count(db.query(VendorLead).filter(VendorLead.opportunity_id == opp_id))
-            if existing_artifacts == 0 and existing_leads == 0:
-                intake_pipeline = run_opportunity_intake_pipeline(
-                    db,
-                    opp_id,
-                    organization_id=org_id,
-                    download_documents=False,
-                    run_usaspending=False,
-                )
-                _safe_session_call(db, "refresh", opp)
-        except Exception as exc:
-            _safe_session_call(db, "rollback")
-            intake_pipeline = {"status": "failed", "error": str(exc)}
-        finally:
-            try:
-                raw_payload = dict(getattr(opp, "raw_payload", None) or {})
-                raw_payload["_intake_pipeline_ran"] = True
-                opp.raw_payload = raw_payload
-                _safe_session_call(db, "add", opp)
-                _safe_session_call(db, "commit")
-            except Exception:
-                _safe_session_call(db, "rollback")
+    snapshot_marker = _workspace_snapshot_marker(db, opp_id, organization_id=org_id)
+    snapshot = _latest_workspace_snapshot(db, opp_id, organization_id=org_id)
+    if _workspace_snapshot_is_fresh(snapshot, snapshot_marker):
+        return dict(snapshot.content_json or {})
 
     try:
         analysis = db.query(OpportunityAnalysis).filter(OpportunityAnalysis.opportunity_id == opp_id).first()
@@ -231,6 +465,11 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     except Exception:
         _safe_session_call(db, "rollback")
         vendor_matches = []
+
+    vendor_leads_query = db.query(VendorLead).filter(VendorLead.opportunity_id == opp_id)
+    if org_id is not None:
+        vendor_leads_query = vendor_leads_query.filter(VendorLead.organization_id == org_id)
+    vendor_leads = vendor_leads_query.order_by(VendorLead.updated_at.desc(), VendorLead.id.desc()).all()
 
     vendor_ids = [getattr(v, "vendor_id", None) for v in vendor_matches if getattr(v, "vendor_id", None) is not None]
     vendor_lookup = {}
@@ -290,7 +529,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
         "workspace_url": getattr(opp, "workspace_url", None),
         "solicitation_status": derive_solicitation_status(getattr(opp, "due_at", None)),
         "opportunity_lifecycle": derive_opportunity_lifecycle(getattr(opp, "due_at", None)),
-        "intake_pipeline": intake_pipeline,
+        "intake_pipeline": None,
     }
     is_closed = opportunity_payload["solicitation_status"] == "CLOSED"
 
@@ -316,59 +555,26 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     artifacts_query = db.query(WorkspaceArtifact).filter(WorkspaceArtifact.opportunity_id == opp_id)
     if org_id is not None:
         artifacts_query = artifacts_query.filter(WorkspaceArtifact.organization_id == org_id)
-    artifacts = artifacts_query.order_by(WorkspaceArtifact.created_at.desc()).all()
+    artifacts = artifacts_query.filter(WorkspaceArtifact.artifact_type != "WORKSPACE_SUMMARY_SNAPSHOT").order_by(WorkspaceArtifact.created_at.desc()).all()
     compliance_artifact = next((artifact for artifact in artifacts if artifact.artifact_type == "COMPLIANCE_BRIEF"), None)
     compliance_json = dict(getattr(compliance_artifact, "content_json", None) or {})
-    needs_document_refresh = _artifact_needs_document_refresh(compliance_json, files)
-    if files:
-        try:
-            from app.services.document_pipeline import _build_compliance_artifact_content
-
-            fresh_compliance = _build_compliance_artifact_content(db, opp)
-            current_actions = list(compliance_json.get("required_actions") or compliance_json.get("submission_requirements") or [])
-            fresh_actions = list(fresh_compliance.get("required_actions") or fresh_compliance.get("submission_requirements") or [])
-            current_review = list(compliance_json.get("review_flags") or [])
-            fresh_review = list(fresh_compliance.get("review_flags") or [])
-            current_missing = list(compliance_json.get("missing_information") or [])
-            fresh_missing = list(fresh_compliance.get("missing_information") or [])
-            current_source = str((compliance_json.get("compliance_fields") or {}).get("source_file") or "")
-            fresh_source = str((fresh_compliance.get("compliance_fields") or {}).get("source_file") or "")
-            if (
-                current_actions != fresh_actions
-                or current_review != fresh_review
-                or current_missing != fresh_missing
-                or current_source != fresh_source
-            ):
-                needs_document_refresh = True
-        except Exception:
-            _safe_session_call(db, "rollback")
-    if needs_document_refresh:
-        try:
-            from app.services.document_pipeline import refresh_workspace_document_outputs
-
-            refresh_workspace_document_outputs(db, opp)
-            artifacts = artifacts_query.order_by(WorkspaceArtifact.created_at.desc()).all()
-            compliance_artifact = next((artifact for artifact in artifacts if artifact.artifact_type == "COMPLIANCE_BRIEF"), None)
-            compliance_json = dict(getattr(compliance_artifact, "content_json", None) or {})
-        except Exception:
-            _safe_session_call(db, "rollback")
-    if str(getattr(opp, "source", "") or "").upper() == "SAM":
-        try:
-            checklist_artifact = next((artifact for artifact in artifacts if artifact.artifact_type == "CHECKLIST"), None)
-            if checklist_artifact is None:
-                generate_checklist(db, opp)
-            if compliance_json:
-                generate_compliance_matrix(db, opp)
-            seed_proposal_tasks(db, opp)
-            artifacts = artifacts_query.order_by(WorkspaceArtifact.created_at.desc()).all()
-        except Exception:
-            _safe_session_call(db, "rollback")
     tasks_query = db.query(WorkspaceTask).filter(WorkspaceTask.opportunity_id == opp_id)
     if org_id is not None:
         tasks_query = tasks_query.filter(WorkspaceTask.organization_id == org_id)
     tasks = tasks_query.order_by(WorkspaceTask.created_at.desc()).all()
+    quotes_query = db.query(VendorQuote).filter(VendorQuote.opportunity_id == opp_id)
+    if org_id is not None:
+        quotes_query = quotes_query.filter(VendorQuote.organization_id == org_id)
+    quotes = quotes_query.order_by(VendorQuote.created_at.desc()).all()
+    agent_runs_count = int(snapshot_marker.get("agent_run_count") or 0)
     try:
-        agent_runs = AgentRunRepository(db).list_by_opportunity_id(opp_id)
+        agent_runs = (
+            db.query(AgentRun)
+            .filter(AgentRun.opportunity_id == opp_id)
+            .order_by(AgentRun.created_at.desc())
+            .limit(5)
+            .all()
+        )
     except Exception:
         _safe_session_call(db, "rollback")
         agent_runs = []
@@ -378,15 +584,6 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed, dict) else {}
     if not isinstance(sam_intelligence, dict):
         sam_intelligence = {}
-    if not parsed:
-        try:
-            parsed = ensure_parsed(db, opp)
-        except Exception:
-            _safe_session_call(db, "rollback")
-            parsed = getattr(opp, "parsed_json", None) or {}
-        sam_intelligence = parsed.get("sam_intelligence") if isinstance(parsed, dict) else {}
-        if not isinstance(sam_intelligence, dict):
-            sam_intelligence = {}
     parsed_summary = {
         "nsn": document_data.get("fields", {}).get("nsn") or parsed.get("nsn"),
         "nomenclature": document_data.get("fields", {}).get("nomenclature") or document_data.get("summary", {}).get("title") or parsed.get("nomenclature") or parsed.get("item_description"),
@@ -402,20 +599,94 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
     }
     normalized_facts = build_normalized_facts(opp, parsed, document_data, compliance_json)
     research_profile = build_research_profile(opp, parsed)
+    contract_brief = build_contract_brief(
+        opp,
+        normalized_facts,
+        parsed_summary=parsed_summary,
+        document_count=len(files),
+        vendor_count=len(vendor_matches),
+        quote_count=len(quotes),
+    )
+    procurement_profile = build_procurement_profile(
+        opp,
+        normalized_facts,
+        parsed_summary,
+        document_data=document_data,
+        compliance_json=compliance_json,
+    )
+    readiness = build_readiness_assessment(
+        opp,
+        document_count=len(files),
+        vendor_count=len(vendor_matches),
+        quote_count=len(quotes),
+        submission_package_count=sum(1 for artifact in artifacts if artifact.artifact_type == "SUBMISSION_PACKAGE"),
+        open_task_count=sum(1 for task in tasks if str(task.status or "").upper() in {"OPEN", "IN_PROGRESS"}),
+        has_nsn=bool(contract_brief.get("nsn")),
+        has_set_aside=bool(contract_brief.get("set_aside_type")),
+        has_submission=bool(submission),
+    )
+    publog_reference = {"manufacturer_candidates": [], "best_rows": []}
+    if contract_brief.get("nsn"):
+        try:
+            publog_reference["manufacturer_candidates"] = (
+                search_publog_reference(
+                    db,
+                    dataset="references",
+                    mode="manufacturer_candidates",
+                    nsn=contract_brief.get("nsn"),
+                    limit=12,
+                ).get("rows")
+                or []
+            )
+            publog_reference["best_rows"] = (
+                search_publog_reference(
+                    db,
+                    dataset="references",
+                    mode="best_rows",
+                    nsn=contract_brief.get("nsn"),
+                    limit=12,
+                ).get("rows")
+                or []
+            )
+        except Exception:
+            _safe_session_call(db, "rollback")
     company_profile = CompanyRepository(db).get_first_profile()
-    capability_match = build_sam_capability_match(opp, company_profile) if str(getattr(opp, "source", "")).upper() == "SAM" else {}
+    capability_match = build_capability_match(opp, company_profile)
     past_performance_map = build_sam_past_performance_map(db, opp) if str(getattr(opp, "source", "")).upper() == "SAM" else {}
+    try:
+        solicitation_memory = build_solicitation_memory(db, opp)
+    except Exception:
+        _safe_session_call(db, "rollback")
+        solicitation_memory = {}
     try:
         recommendation = build_workspace_recommendation(
             db,
             opp,
             parsed=parsed,
             files=files,
+            leads=vendor_leads,
+            quotes=quotes,
             submission=submission,
+            publog_rows=publog_reference.get("manufacturer_candidates") or [],
+            capability_match=capability_match,
+            past_performance_map=past_performance_map,
+            procurement_profile=procurement_profile,
+            pipeline_item=pipeline_item,
+            solicitation_memory=solicitation_memory,
         )
     except Exception:
         _safe_session_call(db, "rollback")
         recommendation = {}
+    workspace_freshness = _workspace_freshness(
+        opp=opp,
+        artifacts=artifacts,
+        files=files,
+        tasks=tasks,
+        compliance_json=compliance_json,
+        document_data=document_data,
+        db=db,
+        organization_id=org_id,
+    )
     opportunity_payload["solicitation_number"] = document_data.get("fields", {}).get("solicitation_number") or opportunity_payload["solicitation_number"]
     opportunity_payload["due_at"] = document_data.get("fields", {}).get("return_by") or opportunity_payload["due_at"]
     opportunity_payload["summary"] = (
@@ -472,17 +743,29 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
         run_agent_key = None
         if isinstance(getattr(run, "input_payload", None), dict):
             run_agent_key = run.input_payload.get("agent_key")
+        try:
+            agent_label = (get_workspace_agent_catalog().get(resolve_workspace_agent_key(run_agent_key or getattr(run.agent_type, "value", run.agent_type))) or {}).get("label")
+        except Exception:
+            agent_label = None
         recent_activity.append(
             {
                 "type": "agent",
-                "title": f"Agent run: {run_agent_key or getattr(run.agent_type, 'value', run.agent_type)}",
+                "title": f"Agent run: {agent_label or run_agent_key or getattr(run.agent_type, 'value', run.agent_type)}",
                 "timestamp": run.created_at.isoformat() if run.created_at else None,
                 "detail": run.status,
             }
         )
     recent_activity.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
+    agent_findings = _build_agent_findings(
+        artifacts=artifacts,
+        recommendation=recommendation,
+        solicitation_memory=solicitation_memory,
+        compliance_json=compliance_json,
+        capability_match=capability_match,
+        past_performance_map=past_performance_map,
+    )
 
-    return {
+    response_payload = {
         "opportunity": opportunity_payload,
         "analysis": {
             "priority_score": recommendation.get("recommendation_score") or (getattr(analysis, "priority_score", 0) if analysis else 0),
@@ -493,10 +776,13 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             "decision_status": getattr(opp, "decision_status", None),
             "recommendation": recommendation,
             "capability_match": capability_match,
+            "solicitation_memory": solicitation_memory,
         },
         "recommendation": recommendation,
         "capability_match": capability_match,
+        "solicitation_memory": solicitation_memory,
         "past_performance_map": past_performance_map,
+        "agent_findings": agent_findings,
         "vendor_matches": vendor_matches,
         "artifacts": [_artifact_payload(artifact) for artifact in artifacts],
         "tasks": [
@@ -511,20 +797,8 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             }
             for task in tasks
         ],
-        "agent_runs": [
-            {
-                "id": run.id,
-                "agent_type": getattr(run.agent_type, "value", run.agent_type),
-                "agent_key": (run.input_payload or {}).get("agent_key") if isinstance(getattr(run, "input_payload", None), dict) else None,
-                "status": run.status,
-                "model_name": run.model_name,
-                "created_at": run.created_at.isoformat() if run.created_at else None,
-                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-                "error_message": run.error_message,
-                "output_payload": run.output_payload,
-            }
-            for run in agent_runs
-        ],
+        "agent_runs_count": agent_runs_count,
+        "agent_runs": [],
         "files": [
             {
                 "id": file.id,
@@ -535,9 +809,29 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             }
             for file in files
         ],
-        "quotes": [],
+        "quotes": [
+            {
+                "id": quote.id,
+                "company_name": quote.company_name,
+                "cage": quote.cage,
+                "part_number": quote.part_number,
+                "status": quote.status,
+                "unit_price": float(quote.unit_price) if quote.unit_price is not None else None,
+                "lead_time_days": quote.lead_time_days,
+                "requested_at": quote.requested_at.isoformat() if quote.requested_at else None,
+                "last_follow_up_at": quote.last_follow_up_at.isoformat() if quote.last_follow_up_at else None,
+                "next_follow_up_at": quote.next_follow_up_at.isoformat() if quote.next_follow_up_at else None,
+                "follow_up_count": quote.follow_up_count,
+            }
+            for quote in quotes
+        ],
         "parsed_summary": parsed_summary,
         "normalized_facts": normalized_facts,
+        "contract_brief": contract_brief,
+        "procurement_profile": procurement_profile,
+        "readiness": readiness,
+        "workspace_freshness": workspace_freshness,
+        "publog_reference": publog_reference,
         "research_profile": research_profile,
         "submission": {
             "id": submission.id,
@@ -572,13 +866,47 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
         } if pipeline_item else None,
         "actions": actions,
         "agent_phases": PHASE_AGENT_MAP,
+        "agent_catalog": get_workspace_agent_catalog(),
         "ui_hints": {
             "source_badge": opp.source,
             "empty_vendors_message": "No vendor matches yet. Use USAspending research or vendor discovery next.",
             "empty_artifacts_message": "No artifacts yet. Parse the opportunity or generate a checklist.",
             "workspace_mode": "research_only" if is_closed else "active",
             "closed_message": "This solicitation is closed. Keep using this workspace for research, vendor intelligence, and historical reference.",
+            "freshness_summary": workspace_freshness.get("summary"),
         },
+    }
+    try:
+        create_artifact(
+            db,
+            opp.id,
+            "WORKSPACE_SUMMARY_SNAPSHOT",
+            f"Workspace Summary Snapshot - {opp.solicitation_number or opp.id}",
+            content_json={
+                **response_payload,
+                "snapshot_marker": snapshot_marker,
+                "cached_at": datetime.utcnow().isoformat(),
+            },
+            replace_existing=True,
+        )
+    except Exception:
+        _safe_session_call(db, "rollback")
+    return response_payload
+
+
+@router.get("/agent-runs")
+def workspace_agent_runs(opp_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+    org_id = getattr(current_org, "id", None)
+    _get_opp_scoped(db, opp_id, organization_id=org_id)
+    try:
+        runs = AgentRunRepository(db).list_by_opportunity_id(opp_id)
+    except Exception:
+        _safe_session_call(db, "rollback")
+        runs = []
+    return {
+        "opportunity_id": opp_id,
+        "count": len(runs),
+        "items": [_serialize_agent_run(run, include_output=True) for run in runs],
     }
 
 
@@ -594,10 +922,14 @@ def run_workspace_agent_route(
     opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
     if not agent_key:
         raise HTTPException(status_code=400, detail="agent_key is required")
-
-    repo, run = _create_agent_run_safe(db, opp.id, agent_key)
     try:
-        result = _run_workspace_agent_for_user(agent_key, opp, db, getattr(current_user, "id", None))
+        canonical_agent_key = resolve_workspace_agent_key(agent_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    repo, run = _create_agent_run_safe(db, opp.id, canonical_agent_key)
+    try:
+        result = _run_workspace_agent_for_user(canonical_agent_key, opp, db, getattr(current_user, "id", None))
         _update_agent_run_safe(
             db,
             repo,
@@ -609,7 +941,7 @@ def run_workspace_agent_route(
         return {
             "status": "success",
             "run_id": getattr(run, "id", None),
-            "agent_key": agent_key,
+            "agent_key": canonical_agent_key,
             "artifact": result.get("artifact"),
             "output": result.get("output"),
             "model_name": result.get("model_name") or "workspace_phased_agent",

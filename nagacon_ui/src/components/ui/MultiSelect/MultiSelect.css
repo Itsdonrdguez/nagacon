@@ -1,0 +1,143 @@
+.multi-select-wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  z-index: 1;
+}
+
+.multi-select-trigger {
+  width: 100%;
+  min-height: 48px;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.multi-select-trigger:disabled {
+  background: #f9fafb;
+  color: #6b7280;
+  cursor: not-allowed;
+}
+
+.multi-select-trigger.open {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.multi-select-placeholder {
+  color: #6b7280;
+}
+
+.multi-select-value {
+  color: #111827;
+  font-weight: 500;
+}
+
+.multi-select-chevron {
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.multi-select-panel {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.14);
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.multi-select-search {
+  width: 100%;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font: inherit;
+}
+
+.multi-select-search:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.multi-select-options {
+  max-height: 280px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.multi-select-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.55rem 0.5rem;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.multi-select-option:hover,
+.multi-select-option.selected {
+  background: #f8fafc;
+}
+
+.multi-select-option input {
+  width: 16px;
+  height: 16px;
+  margin-top: 0.15rem;
+  flex: 0 0 auto;
+}
+
+.multi-select-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.multi-select-option-label {
+  font-size: 0.93rem;
+  color: #111827;
+  line-height: 1.35;
+}
+
+.multi-select-option-subtitle {
+  font-size: 0.78rem;
+  color: #64748b;
+  line-height: 1.35;
+}
+
+.multi-select-empty {
+  padding: 0.6rem 0.25rem;
+  color: #64748b;
+  font-size: 0.88rem;
+}
+
+.multi-select-custom {
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: #1d4ed8;
+}

@@ -42,6 +42,13 @@ def _normalize_nsn(value: str | None) -> str | None:
     return value.upper()
 
 
+def _normalize_item_label(value: str | None) -> str | None:
+    value = _clean(value, 300)
+    if not value:
+        return None
+    return re.sub(r"\s+", " ", value).strip().upper()
+
+
 def _derive_fsc(nsn: str | None, fsc: str | None) -> str | None:
     explicit = re.sub(r"\D", "", str(fsc or ""))
     if len(explicit) >= 4:
@@ -176,6 +183,55 @@ def _sum_amount(rows: list[dict[str, Any]]) -> float | None:
 def _latest_date(rows: list[dict[str, Any]]) -> str | None:
     values = [str(row.get("award_date") or "").strip() for row in rows if str(row.get("award_date") or "").strip()]
     return max(values) if values else None
+
+
+def _merge_provider_item_rows(item_rows: list[ProviderItem]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in item_rows:
+        item_key = (
+            _normalize_nsn(item.nsn) or "",
+            re.sub(r"\D", "", str(item.fsc or ""))[:4],
+            _normalize_item_label(item.nomenclature) or "",
+        )
+        existing = grouped.get(item_key)
+        row = {
+            "provider_item_id": item.id,
+            "nsn": item.nsn,
+            "fsc": item.fsc,
+            "nomenclature": item.nomenclature,
+            "relationship_type": item.relationship_type,
+            "relationship_types": _unique([item.relationship_type]),
+            "source": item.source,
+            "sources": _unique([item.source]),
+            "source_url": item.source_url,
+            "confidence": item.confidence,
+            "notes": item.notes,
+        }
+        if not existing:
+            grouped[item_key] = row
+            continue
+
+        if float(item.confidence or 0) > float(existing.get("confidence") or 0):
+            existing["confidence"] = item.confidence
+            existing["provider_item_id"] = item.id
+        if not existing.get("nsn") and item.nsn:
+            existing["nsn"] = item.nsn
+        if not existing.get("fsc") and item.fsc:
+            existing["fsc"] = item.fsc
+        if not existing.get("nomenclature") and item.nomenclature:
+            existing["nomenclature"] = item.nomenclature
+        if not existing.get("source_url") and item.source_url:
+            existing["source_url"] = item.source_url
+        if not existing.get("notes") and item.notes:
+            existing["notes"] = item.notes
+        existing["relationship_types"] = _unique([*(existing.get("relationship_types") or []), item.relationship_type])
+        existing["sources"] = _unique([*(existing.get("sources") or []), item.source])
+        if not existing.get("source") and item.source:
+            existing["source"] = item.source
+        if not existing.get("relationship_type") and item.relationship_type:
+            existing["relationship_type"] = item.relationship_type
+
+    return list(grouped.values())
 
 
 class ProviderRepository:
@@ -581,11 +637,12 @@ class ProviderRepository:
             key=lambda row: (float(getattr(row, "confidence", None) or 0), getattr(row, "id", 0)),
             reverse=True,
         )
+        item_summaries = _merge_provider_item_rows(item_rows)
+        primary_summary = item_summaries[0] if item_summaries else None
         primary = item or (item_rows[0] if item_rows else None)
-        item_summaries = [self._item_summary(row) for row in item_rows]
         return {
             "provider_id": provider.id,
-            "provider_item_id": primary.id if primary else None,
+            "provider_item_id": (primary_summary or {}).get("provider_item_id") if primary_summary else (primary.id if primary else None),
             "company_name": provider.company_name,
             "display_name": _display_company_name(provider),
             "canonical_name": provider.canonical_name,
@@ -600,19 +657,27 @@ class ProviderRepository:
             "phone": provider.phone,
             "provider_notes": provider.notes,
             "status": provider.status,
-            "nsn": primary.nsn if primary else None,
-            "fsc": primary.fsc if primary else None,
-            "nomenclature": primary.nomenclature if primary else None,
-            "relationship_type": primary.relationship_type if primary else None,
-            "source": primary.source if primary else None,
-            "source_url": primary.source_url if primary else None,
-            "confidence": primary.confidence if primary else None,
-            "item_notes": primary.notes if primary else None,
-            "item_count": len(item_rows),
-            "relationship_types": _unique([row.relationship_type for row in item_rows]),
-            "sources": _unique([row.source for row in item_rows]),
-            "nsns": _unique([row.nsn for row in item_rows]),
-            "fscs": _unique([row.fsc for row in item_rows]),
+            "nsn": (primary_summary or {}).get("nsn") if primary_summary else (primary.nsn if primary else None),
+            "fsc": (primary_summary or {}).get("fsc") if primary_summary else (primary.fsc if primary else None),
+            "nomenclature": (primary_summary or {}).get("nomenclature") if primary_summary else (primary.nomenclature if primary else None),
+            "relationship_type": (primary_summary or {}).get("relationship_type") if primary_summary else (primary.relationship_type if primary else None),
+            "source": (primary_summary or {}).get("source") if primary_summary else (primary.source if primary else None),
+            "source_url": (primary_summary or {}).get("source_url") if primary_summary else (primary.source_url if primary else None),
+            "confidence": (primary_summary or {}).get("confidence") if primary_summary else (primary.confidence if primary else None),
+            "item_notes": (primary_summary or {}).get("notes") if primary_summary else (primary.notes if primary else None),
+            "item_count": len(item_summaries),
+            "relationship_types": _unique([
+                rel
+                for row in item_summaries
+                for rel in (row.get("relationship_types") or ([row.get("relationship_type")] if row.get("relationship_type") else []))
+            ]),
+            "sources": _unique([
+                source
+                for row in item_summaries
+                for source in (row.get("sources") or ([row.get("source")] if row.get("source") else []))
+            ]),
+            "nsns": _unique([row.get("nsn") for row in item_summaries]),
+            "fscs": _unique([row.get("fsc") for row in item_summaries]),
             "item_summaries": item_summaries,
             "updated_at": provider.updated_at,
         }

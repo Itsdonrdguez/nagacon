@@ -7,9 +7,10 @@ from typing import Any
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.models.workspace import WorkspaceArtifact
-from app.services.storage import delete_reference
+from app.services.storage import delete_reference, delete_reference_tree, storage_root
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
 from sqlalchemy.orm import Session, object_session
+from pathlib import Path
 
 
 @dataclass
@@ -152,6 +153,7 @@ def prune_eligible_files_for_system(
     pruned_count = 0
     skipped_count = 0
     items: list[dict[str, Any]] = []
+    cleanup_dirs: set[str] = set()
 
     for file_record in files:
         opportunity = getattr(file_record, "opportunity", None)
@@ -162,6 +164,9 @@ def prune_eligible_files_for_system(
 
         original_ref = file_record.file_path
         deleted = delete_reference(original_ref)
+        cleanup_dir = _storage_cleanup_dir_for_reference(original_ref)
+        if cleanup_dir:
+            cleanup_dirs.add(cleanup_dir)
         metadata = dict(getattr(file_record, "parsed_metadata", None) or {})
         metadata["_retention"] = {
             **dict(metadata.get("_retention") or {}),
@@ -188,11 +193,84 @@ def prune_eligible_files_for_system(
 
     if pruned_count:
         db.commit()
+        _remove_storage_dirs(cleanup_dirs)
 
     return {
         "pruned_count": pruned_count,
         "skipped_count": skipped_count,
         "items": items,
+    }
+
+
+def prune_closed_opportunity_files_and_storage(
+    db: Session,
+    opportunity_id: int,
+    *,
+    require_closed: bool = True,
+    source: str = "closed_workspace_cleanup",
+) -> dict[str, Any]:
+    opportunity = db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
+    if not opportunity:
+        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "opportunity_not_found"}
+
+    lifecycle = derive_opportunity_lifecycle(getattr(opportunity, "due_at", None))
+    if require_closed and lifecycle == "ACTIVE":
+        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "opportunity_active"}
+
+    files = (
+        db.query(OpportunityFile)
+        .filter(OpportunityFile.opportunity_id == opportunity_id)
+        .all()
+    )
+    if not files:
+        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "no_files"}
+
+    if any(not _closed_workspace_cleanup_ready(file_record, opportunity) for file_record in files):
+        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "downstream_processing_incomplete"}
+
+    pruned_count = 0
+    cleanup_dirs: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for file_record in files:
+        original_ref = getattr(file_record, "file_path", None)
+        if not original_ref or str(original_ref).startswith("pruned://"):
+            continue
+        deleted = delete_reference(original_ref)
+        cleanup_dir = _storage_cleanup_dir_for_reference(original_ref)
+        if cleanup_dir:
+            cleanup_dirs.add(cleanup_dir)
+        metadata = dict(getattr(file_record, "parsed_metadata", None) or {})
+        metadata["_retention"] = {
+            **dict(metadata.get("_retention") or {}),
+            "status": "pruned",
+            "reason": source,
+            "pruned_at": datetime.utcnow().isoformat(),
+            "original_file_path": original_ref,
+            "deleted_from_storage": bool(deleted),
+            "folder_cleanup_requested": True,
+        }
+        file_record.file_path = f"pruned://opportunity-file/{file_record.id}"
+        file_record.parsed_metadata = metadata
+        db.add(file_record)
+        pruned_count += 1
+        items.append(
+            {
+                "id": file_record.id,
+                "filename": file_record.filename,
+                "deleted_from_storage": bool(deleted),
+            }
+        )
+
+    folder_deleted = False
+    if pruned_count:
+        db.commit()
+        folder_deleted = _remove_storage_dirs(cleanup_dirs)
+
+    return {
+        "pruned_count": pruned_count,
+        "folder_deleted": folder_deleted,
+        "items": items,
+        "lifecycle": lifecycle,
     }
 
 
@@ -226,3 +304,43 @@ def _downstream_processing_complete(
     }
     required = {"COMPLIANCE_BRIEF", "SUBMISSION_PACKAGE"}
     return required.issubset(artifact_types)
+
+
+def _closed_workspace_cleanup_ready(
+    file_record: OpportunityFile,
+    opportunity: Opportunity | None = None,
+) -> bool:
+    file_path = getattr(file_record, "file_path", None)
+    if isinstance(file_path, str) and file_path.startswith("pruned://"):
+        return True
+    if not file_path:
+        return True
+    parsed_metadata = getattr(file_record, "parsed_metadata", None) or {}
+    retention_meta = parsed_metadata.get("_retention") or {}
+    if retention_meta.get("downstream_complete") is not True:
+        return False
+    if opportunity is None:
+        return False
+    return _downstream_processing_complete(file_record, opportunity)
+
+
+def _storage_cleanup_dir_for_reference(reference: str | None) -> str | None:
+    if not reference or not isinstance(reference, str) or reference.startswith(("pruned://", "s3://", "http://", "https://")):
+        return None
+    try:
+        target = Path(reference).resolve()
+        root = storage_root().resolve()
+        target.relative_to(root)
+    except Exception:
+        return None
+    if target.parent.name.lower() == "documents":
+        return str(target.parent.parent)
+    return str(target.parent)
+
+
+def _remove_storage_dirs(cleanup_dirs: set[str]) -> bool:
+    removed_any = False
+    for directory in sorted(cleanup_dirs):
+        if delete_reference_tree(directory):
+            removed_any = True
+    return removed_any

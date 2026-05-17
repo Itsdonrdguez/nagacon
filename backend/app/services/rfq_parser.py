@@ -19,6 +19,26 @@ def _compact_spaces(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
+def _clean_company_name(value: str | None, *, cage: str | None = None, part_number: str | None = None) -> str:
+    text = _compact_spaces(value)
+    if not text:
+        return ""
+    if cage:
+        cage_match = re.search(rf"\b{re.escape(cage)}\b", text, re.IGNORECASE)
+        if cage_match:
+            before_cage = _compact_spaces(text[:cage_match.start()])
+            if len(before_cage) >= 3:
+                text = before_cage
+    if part_number:
+        part_match = re.search(rf"\b{re.escape(part_number)}\b", text, re.IGNORECASE)
+        if part_match:
+            before_part = _compact_spaces(text[:part_match.start()])
+            if len(before_part) >= 3:
+                text = before_part
+    text = re.sub(r"\s+[0-9A-Z]{5}\s+[A-Z0-9./_-]{2,80}\b.*$", "", text).strip()
+    return text[:200].strip()
+
+
 def _normalize_nsn(value: str | None) -> str | None:
     if not value:
         return None
@@ -34,7 +54,7 @@ def _dedupe_sources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         cage = _compact_spaces(row.get("cage"))
         part_number = _compact_spaces(row.get("part_number"))
-        company_name = _compact_spaces(row.get("company_name"))
+        company_name = _clean_company_name(row.get("company_name"), cage=cage or None, part_number=part_number or None)
         key = (cage.upper(), part_number.upper(), company_name.upper())
         if key in seen:
             continue
@@ -250,6 +270,12 @@ def _extract_part_numbers(text: str, approved_sources: list[dict[str, Any]]) -> 
     return out
 
 
+def _matches_nsn(value: str | None, nsn: str | None) -> bool:
+    if not value or not nsn:
+        return False
+    return re.sub(r"\D", "", value) == re.sub(r"\D", "", nsn)
+
+
 def get_best_opportunity_text(db: Session, opp: Opportunity) -> dict[str, Any]:
     file_rows = (
         db.query(OpportunityFile)
@@ -326,7 +352,7 @@ def parse_dibbs_sources(text: str, url: str | None = None) -> dict[str, Any]:
         "approved_source_count": len(approved_sources),
         "manufacturers": manufacturers,
         "cage_codes": cages,
-        "part_numbers": _extract_part_numbers(text, approved_sources),
+        "part_numbers": [part for part in _extract_part_numbers(text, approved_sources) if not _matches_nsn(part, nsn)],
         "solicitations": _extract_solicitations(text),
     }
     return parsed

@@ -9,6 +9,7 @@ import {
   Card,
   Input,
   Button,
+  MultiSelect,
   Table,
   TableHeader,
   TableBody,
@@ -18,7 +19,8 @@ import {
   LoadingState,
   StatusPill,
 } from '../components/ui'
-import { setAsideBadgeVariant, setAsideBadgeLabel } from '../utils/badges'
+import { setAsideBadgeVariant, setAsideBadgeLabel, setAsideOptionLabel } from '../utils/badges'
+import { FSC_CODE_OPTIONS, NAICS_CODE_OPTIONS, withCustomOptions } from '../data/codeCatalogs'
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100]
 
@@ -65,10 +67,24 @@ export default function Opportunities() {
   const [submittedAgency, setSubmittedAgency] = useState('')
   const [stateFilter, setStateFilter] = useState('')
   const [submittedState, setSubmittedState] = useState('')
+  const [fscCodesFilter, setFscCodesFilter] = useState([])
+  const [submittedFscCodes, setSubmittedFscCodes] = useState([])
+  const [naicsCodesFilter, setNaicsCodesFilter] = useState([])
+  const [submittedNaicsCodes, setSubmittedNaicsCodes] = useState([])
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
   const [awardJobId, setAwardJobId] = useState(null)
+  const [selectedOpportunityIds, setSelectedOpportunityIds] = useState([])
+  const [bulkPrepareResult, setBulkPrepareResult] = useState(null)
   const { filters, updateFilter } = useFilters(DEFAULT_FILTERS)
+  const fscCodeOptions = useMemo(
+    () => withCustomOptions(FSC_CODE_OPTIONS, [...fscCodesFilter, ...submittedFscCodes], 'fsc'),
+    [fscCodesFilter, submittedFscCodes],
+  )
+  const naicsCodeOptions = useMemo(
+    () => withCustomOptions(NAICS_CODE_OPTIONS, [...naicsCodesFilter, ...submittedNaicsCodes], 'naics'),
+    [naicsCodesFilter, submittedNaicsCodes],
+  )
   const filterOptionsQuery = useQuery({
     queryKey: ['opportunity-filter-options'],
     queryFn: async () => {
@@ -79,7 +95,7 @@ export default function Opportunities() {
   })
 
   const opportunitiesQuery = useQuery({
-    queryKey: ['opportunities-search', submittedSearch, submittedNsn, submittedAgency, submittedState, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, page, pageSize],
+    queryKey: ['opportunities-search', submittedSearch, submittedNsn, submittedAgency, submittedState, submittedFscCodes.join(','), submittedNaicsCodes.join(','), filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, page, pageSize],
     queryFn: async () => {
       const res = await api.get('/api/opportunities/search', {
         params: {
@@ -89,6 +105,8 @@ export default function Opportunities() {
           nsn: submittedNsn || undefined,
           agency: submittedAgency || undefined,
           state: submittedState || undefined,
+          fsc_codes: submittedFscCodes.length ? submittedFscCodes.join(',') : undefined,
+          naics_codes: submittedNaicsCodes.length ? submittedNaicsCodes.join(',') : undefined,
           source: filters.source === 'all' ? undefined : filters.source,
           set_aside_type: filters.setAside === 'all' ? undefined : filters.setAside,
           due_window: filters.dueWindow === 'all' ? undefined : filters.dueWindow,
@@ -124,6 +142,23 @@ export default function Opportunities() {
     },
   })
 
+  const bulkPrepareMutation = useMutation({
+    mutationFn: async (opportunityIds) => {
+      const res = await api.post('/api/opportunities/bulk/workspace-intake', {
+        opportunity_ids: opportunityIds,
+        download_documents: true,
+        run_usaspending: true,
+      })
+      return res.data
+    },
+    onSuccess: (result) => {
+      setBulkPrepareResult(result)
+      setSelectedOpportunityIds([])
+      queryClient.invalidateQueries({ queryKey: ['opportunities-search'] })
+      queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
+    },
+  })
+
   const awardJobQuery = useQuery({
     queryKey: ['awardee-enrichment-job', awardJobId],
     queryFn: async () => {
@@ -140,9 +175,19 @@ export default function Opportunities() {
   const data = opportunitiesQuery.data?.items || []
   const total = opportunitiesQuery.data?.total || 0
   const totalPages = Math.max(Math.ceil(total / pageSize), 1)
+  const selectableIds = useMemo(
+    () => data.filter((opp) => opp.opportunity_lifecycle !== 'ARCHIVED').map((opp) => opp.id),
+    [data],
+  )
+  const allSelectableSelected = selectableIds.length > 0 && selectableIds.every((id) => selectedOpportunityIds.includes(id))
+  const hasSelection = selectedOpportunityIds.length > 0
   useEffect(() => {
     setPage(1)
-  }, [submittedSearch, submittedNsn, submittedAgency, submittedState, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, pageSize])
+  }, [submittedSearch, submittedNsn, submittedAgency, submittedState, submittedFscCodes, submittedNaicsCodes, filters.source, filters.setAside, filters.dueWindow, sortBy, sortOrder, pageSize])
+
+  useEffect(() => {
+    setSelectedOpportunityIds((current) => current.filter((id) => data.some((opp) => opp.id === id)))
+  }, [data])
 
   const sortedData = useMemo(() => {
     if (sortBy !== 'due_at') {
@@ -166,6 +211,7 @@ export default function Opportunities() {
   const sourceOptions = filterOptionsQuery.data?.sources?.length ? filterOptionsQuery.data.sources : ['SAM', 'DIBBS']
   const setAsideCategories = filterOptionsQuery.data?.set_aside_categories || []
   const exactSetAsideTypes = filterOptionsQuery.data?.set_asides || []
+  const exactSetAsideLabels = filterOptionsQuery.data?.set_aside_exact_labels || []
   const statusOptions = filterOptionsQuery.data?.status_filters?.length
     ? filterOptionsQuery.data.status_filters
     : [
@@ -194,6 +240,8 @@ export default function Opportunities() {
     setSubmittedNsn(nsnFilter.trim())
     setSubmittedAgency(agencyFilter.trim())
     setSubmittedState(stateFilter.trim())
+    setSubmittedFscCodes(fscCodesFilter)
+    setSubmittedNaicsCodes(naicsCodesFilter)
   }
 
   const resetFilters = () => {
@@ -205,6 +253,10 @@ export default function Opportunities() {
     setSubmittedAgency('')
     setStateFilter('')
     setSubmittedState('')
+    setFscCodesFilter([])
+    setSubmittedFscCodes([])
+    setNaicsCodesFilter([])
+    setSubmittedNaicsCodes([])
     setPageSize(25)
     setSortBy('due_at')
     setSortOrder('asc')
@@ -212,6 +264,22 @@ export default function Opportunities() {
     updateFilter('source', DEFAULT_FILTERS.source)
     updateFilter('setAside', DEFAULT_FILTERS.setAside)
     updateFilter('dueWindow', DEFAULT_FILTERS.dueWindow)
+  }
+
+  const toggleOpportunitySelection = (opportunityId) => {
+    setSelectedOpportunityIds((current) => (
+      current.includes(opportunityId)
+        ? current.filter((id) => id !== opportunityId)
+        : [...current, opportunityId]
+    ))
+  }
+
+  const toggleSelectAllOnPage = () => {
+    if (allSelectableSelected) {
+      setSelectedOpportunityIds((current) => current.filter((id) => !selectableIds.includes(id)))
+      return
+    }
+    setSelectedOpportunityIds((current) => Array.from(new Set([...current, ...selectableIds])))
   }
 
   const activeFilterSummary = [
@@ -222,10 +290,36 @@ export default function Opportunities() {
     submittedNsn ? `NSN: ${submittedNsn}` : null,
     submittedAgency ? `Agency: ${submittedAgency}` : null,
     submittedState ? `State: ${submittedState}` : null,
+    submittedFscCodes.length ? `FSC: ${submittedFscCodes.join(', ')}` : null,
+    submittedNaicsCodes.length ? `NAICS: ${submittedNaicsCodes.join(', ')}` : null,
   ].filter(Boolean)
 
   const startRecord = total === 0 ? 0 : (page - 1) * pageSize + 1
   const endRecord = Math.min(page * pageSize, total)
+  const exportOpportunitiesUrl = useMemo(() => {
+    const params = new URLSearchParams()
+    if (submittedSearch) params.set('q', submittedSearch)
+    if (submittedNsn) params.set('nsn', submittedNsn)
+    if (submittedAgency) params.set('agency', submittedAgency)
+    if (submittedState) params.set('state', submittedState)
+    if (submittedFscCodes.length) params.set('fsc_codes', submittedFscCodes.join(','))
+    if (submittedNaicsCodes.length) params.set('naics_codes', submittedNaicsCodes.join(','))
+    if (filters.source !== 'all') params.set('source', filters.source)
+    if (filters.setAside !== 'all') params.set('set_aside_type', filters.setAside)
+    if (filters.dueWindow !== 'all') params.set('due_window', filters.dueWindow)
+    const query = params.toString()
+    return `${api.defaults.baseURL}/api/export/opportunities.csv${query ? `?${query}` : ''}`
+  }, [
+    submittedSearch,
+    submittedNsn,
+    submittedAgency,
+    submittedState,
+    submittedFscCodes,
+    submittedNaicsCodes,
+    filters.source,
+    filters.setAside,
+    filters.dueWindow,
+  ])
 
   if (opportunitiesQuery.isLoading) {
     return (
@@ -257,18 +351,25 @@ export default function Opportunities() {
           <h1 className="page-title">Opportunities</h1>
           <div className="page-subtitle">Active solicitations stay bid-focused. Closed solicitations stay searchable for sourcing, pricing, and NSN intelligence.</div>
         </div>
+        <a className="btn btn-secondary btn-sm" href={exportOpportunitiesUrl} target="_blank" rel="noreferrer">
+          Export Opportunities CSV
+        </a>
       </div>
 
-      <Card title="Search Opportunities">
+      <Card title="Search Opportunities" className="opportunity-search-card">
+        <div className="panel-subtitle">
+          Use keyword search for broad matching, then narrow with exact FSC or NAICS filters when you want a cleaner result set.
+        </div>
         <form className="filters-form" onSubmit={handleSearch}>
-          <div className="filters-grid filters-grid-wide">
-            <div className="search-input">
+          <div className="filters-grid filters-grid-wide opportunity-filters-grid">
+            <div className="search-input filter-span-2">
               <Input
-                label="Keyword"
+                label="Keyword Search"
                 type="text"
                 placeholder="Search title, agency, solicitation, NAICS, or FSC..."
                 value={searchTerm}
                 onChange={(event) => setSearchTerm(event.target.value)}
+                helperText="Broad search across the opportunity record."
               />
             </div>
             <Input
@@ -277,6 +378,7 @@ export default function Opportunities() {
               placeholder="6520-01-123-4567"
               value={nsnFilter}
               onChange={(event) => setNsnFilter(event.target.value)}
+              helperText="Best for DIBBS item lookups."
             />
             <Input
               label="Agency"
@@ -284,6 +386,7 @@ export default function Opportunities() {
               placeholder="VA, Army, GSA..."
               value={agencyFilter}
               onChange={(event) => setAgencyFilter(event.target.value)}
+              helperText="Matches buying agency text."
             />
             <Input
               label="State / POP"
@@ -291,6 +394,29 @@ export default function Opportunities() {
               placeholder="TX, CA, Virginia..."
               value={stateFilter}
               onChange={(event) => setStateFilter(event.target.value)}
+              helperText="Filters place of performance text."
+            />
+            <MultiSelect
+              label="FSC Codes"
+              value={fscCodesFilter}
+              options={fscCodeOptions}
+              onChange={setFscCodesFilter}
+              placeholder="Search FSC codes"
+              helperText="Exact FSC matches. You can select more than one."
+              allowCustom
+              customTypeLabel="FSC code"
+              normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 4)}
+            />
+            <MultiSelect
+              label="NAICS Codes"
+              value={naicsCodesFilter}
+              options={naicsCodeOptions}
+              onChange={setNaicsCodesFilter}
+              placeholder="Search NAICS codes"
+              helperText="Exact NAICS matches. You can select more than one."
+              allowCustom
+              customTypeLabel="NAICS code"
+              normalizeValue={(item) => String(item || '').replace(/\D/g, '').slice(0, 6)}
             />
             <div className="filter-select">
               <label className="input-label">Source</label>
@@ -300,6 +426,7 @@ export default function Opportunities() {
                   <option key={source} value={source}>{source}</option>
                 ))}
               </select>
+              <span className="input-helper-text">Choose DIBBS, SAM, or both.</span>
             </div>
             <div className="filter-select">
               <label className="input-label">Set-Aside</label>
@@ -309,10 +436,11 @@ export default function Opportunities() {
                   <option key={type.value} value={type.value}>{type.label}</option>
                 ))}
                 {exactSetAsideTypes.length ? <option disabled>Exact labels</option> : null}
-                {exactSetAsideTypes.map((type) => (
-                  <option key={`exact-${type}`} value={type}>{type}</option>
+                {(exactSetAsideLabels.length ? exactSetAsideLabels : exactSetAsideTypes.map((type) => ({ value: type, label: setAsideOptionLabel(type) }))).map((type) => (
+                  <option key={`exact-${type.value}`} value={type.value}>{type.label}</option>
                 ))}
               </select>
+              <span className="input-helper-text">Use category filters first, then exact labels if needed.</span>
             </div>
             <div className="filter-select">
               <label className="input-label">Status</label>
@@ -321,8 +449,9 @@ export default function Opportunities() {
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
+              <span className="input-helper-text">Limits by active, closing soon, or closed records.</span>
             </div>
-            <div className="form-action">
+            <div className="form-action opportunity-filter-action">
               <Button type="submit">Search</Button>
             </div>
           </div>
@@ -381,13 +510,61 @@ export default function Opportunities() {
         </div>
       </Card>
 
-      <Card title="Opportunities">
+      <Card title="Opportunities" className="opportunity-results-card">
+        {bulkPrepareResult ? (
+          <div className="settings-summary-box">
+            <div className="row-title">Workspace preparation queued</div>
+            <div className="row-subtitle">
+              Queued {bulkPrepareResult.queued_count || 0}
+              {` | `}
+              Already running {bulkPrepareResult.skipped_duplicate_count || 0}
+              {` | `}
+              Archived skipped {bulkPrepareResult.archived_skip_count || 0}
+            </div>
+            <div className="panel-subtitle">
+              Those jobs now show up in <Link to="/work-queue">Today</Link> while the prep runs.
+            </div>
+          </div>
+        ) : null}
+        <div className="opportunity-bulk-toolbar">
+          <div>
+            <div className="row-title">Workspace prep</div>
+            <div className="row-subtitle">
+              Select opportunities on this page and queue full workspace preparation, including documents, Part Finder, vendor leads, and workspace artifacts.
+            </div>
+          </div>
+          <div className="opportunity-bulk-toolbar-actions">
+            <Badge label={hasSelection ? `${selectedOpportunityIds.length} selected` : 'No selection'} variant={hasSelection ? 'info' : 'default'} />
+            <Button
+              variant="secondary"
+              onClick={() => setSelectedOpportunityIds([])}
+              disabled={!hasSelection}
+            >
+              Clear
+            </Button>
+            <Button
+              onClick={() => bulkPrepareMutation.mutate(selectedOpportunityIds)}
+              disabled={!hasSelection}
+              loading={bulkPrepareMutation.isPending}
+            >
+              Prepare Selected
+            </Button>
+          </div>
+        </div>
         {sortedData.length === 0 ? (
           <EmptyState title="No matching opportunities" subtitle="Try a broader search or adjust your filters." />
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="opportunity-select-column">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all opportunities on this page"
+                    checked={allSelectableSelected}
+                    onChange={toggleSelectAllOnPage}
+                  />
+                </TableHead>
                 <TableHead sortable sortDirection={sortBy === 'solicitation_number' ? sortOrder : null} onSort={() => toggleSort('solicitation_number')}>
                   Title / NSN
                 </TableHead>
@@ -405,6 +582,15 @@ export default function Opportunities() {
             <TableBody>
               {sortedData.map((opp) => (
                 <TableRow key={opp.id}>
+                  <TableCell className="opportunity-select-column">
+                    <input
+                      type="checkbox"
+                      aria-label={`Select opportunity ${opp.solicitation_number || opp.id}`}
+                      checked={selectedOpportunityIds.includes(opp.id)}
+                      disabled={opp.opportunity_lifecycle === 'ARCHIVED'}
+                      onChange={() => toggleOpportunitySelection(opp.id)}
+                    />
+                  </TableCell>
                   <TableCell>
                     <div className="row-title">{opp.display_title || opp.title}</div>
                     <div className="row-subtitle">

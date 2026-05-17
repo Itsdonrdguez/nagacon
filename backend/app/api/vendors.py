@@ -65,7 +65,35 @@ def _serialize_leads_with_provider_context(db: Session, leads: list[VendorLead])
             for item in items:
                 items_by_provider_id.setdefault(item.provider_id, []).append(item)
 
-    rows: list[dict] = []
+    grouped: dict[tuple[str, str], dict] = {}
+
+    def merge_rows(existing: dict, row: dict) -> dict:
+        if int(row.get("confidence") or 0) > int(existing.get("confidence") or 0):
+            existing["confidence"] = row.get("confidence")
+        if not existing.get("company_name") and row.get("company_name"):
+            existing["company_name"] = row.get("company_name")
+        if not existing.get("part_number") and row.get("part_number"):
+            existing["part_number"] = row.get("part_number")
+        if not existing.get("provider_website") and row.get("provider_website"):
+            existing["provider_website"] = row.get("provider_website")
+        if not existing.get("provider_email") and row.get("provider_email"):
+            existing["provider_email"] = row.get("provider_email")
+        if not existing.get("provider_phone") and row.get("provider_phone"):
+            existing["provider_phone"] = row.get("provider_phone")
+        if row.get("is_approved_source"):
+            existing["is_approved_source"] = True
+        source_bits = [item for item in [existing.get("source_type"), row.get("source_type")] if item]
+        existing["source_type"] = "+".join(sorted(dict.fromkeys(source_bits)))
+        label_bits = [item for item in [existing.get("source_label"), row.get("source_label")] if item]
+        existing["source_label"] = " | ".join(dict.fromkeys(label_bits))
+        notes_bits = [item for item in [existing.get("notes"), row.get("notes")] if item]
+        existing["notes"] = " | ".join(dict.fromkeys(notes_bits))[:4000] if notes_bits else existing.get("notes")
+        raw_bits = [item for item in [existing.get("raw_text"), row.get("raw_text")] if item]
+        existing["raw_text"] = " | ".join(dict.fromkeys(raw_bits))[:4000] if raw_bits else existing.get("raw_text")
+        if row.get("updated_at") and existing.get("updated_at") and row["updated_at"] > existing["updated_at"]:
+            existing["updated_at"] = row["updated_at"]
+        return existing
+
     for lead in leads:
         provider = providers_by_cage.get((lead.cage or "").upper())
         provider_item = None
@@ -81,8 +109,29 @@ def _serialize_leads_with_provider_context(db: Session, leads: list[VendorLead])
             "provider_relationship_type": getattr(provider_item, "relationship_type", None),
             "provider_item": getattr(provider_item, "nomenclature", None),
         })
-        rows.append(row)
-    return rows
+        cage_key = str(row.get("cage") or "").strip().upper()
+        part_key = str(row.get("part_number") or "").strip().upper()
+        company_key = str(row.get("company_name") or "").strip().upper()
+        identity_key = cage_key or company_key
+        if not identity_key:
+            continue
+        dedupe_key = (identity_key, part_key)
+        blank_key = (identity_key, "")
+        if part_key and blank_key in grouped:
+            merged = merge_rows(grouped.pop(blank_key), row)
+            grouped[dedupe_key] = merged
+            continue
+        if not part_key:
+            existing_key = next((key for key in grouped if key[0] == identity_key and key[1]), None)
+            if existing_key:
+                grouped[existing_key] = merge_rows(grouped[existing_key], row)
+                continue
+        existing = grouped.get(dedupe_key)
+        if not existing:
+            grouped[dedupe_key] = row
+            continue
+        grouped[dedupe_key] = merge_rows(existing, row)
+    return list(grouped.values())
 
 
 def _serialize_quote(quote) -> dict:
@@ -117,6 +166,47 @@ def _serialize_quote(quote) -> dict:
         "follow_up_label": follow_up_label,
     })
     return row
+
+
+def _dedupe_quotes(quotes: list) -> list:
+    grouped: dict[tuple[str, str], dict] = {}
+    for quote in quotes:
+        row = _serialize_quote(quote)
+        dedupe_key = (
+            str(row.get("cage") or "").strip().upper(),
+            str(row.get("part_number") or "").strip().upper(),
+        )
+        blank_key = (dedupe_key[0], "")
+        if dedupe_key[1] and blank_key in grouped:
+            grouped[dedupe_key] = grouped.pop(blank_key)
+        elif not dedupe_key[1]:
+            existing_key = next((key for key in grouped if key[0] == dedupe_key[0] and key[1]), None)
+            if existing_key:
+                dedupe_key = existing_key
+        existing = grouped.get(dedupe_key)
+        if not existing:
+            grouped[dedupe_key] = row
+            continue
+        if str(row.get("status") or "").upper() == "RECEIVED" and str(existing.get("status") or "").upper() != "RECEIVED":
+            grouped[dedupe_key] = row
+            existing = grouped[dedupe_key]
+        if row.get("unit_price") is not None and existing.get("unit_price") is None:
+            existing["unit_price"] = row.get("unit_price")
+        if row.get("lead_time_days") is not None and existing.get("lead_time_days") is None:
+            existing["lead_time_days"] = row.get("lead_time_days")
+        if not existing.get("company_name") and row.get("company_name"):
+            existing["company_name"] = row.get("company_name")
+        if not existing.get("contact_name") and row.get("contact_name"):
+            existing["contact_name"] = row.get("contact_name")
+        if not existing.get("email") and row.get("email"):
+            existing["email"] = row.get("email")
+        if not existing.get("phone") and row.get("phone"):
+            existing["phone"] = row.get("phone")
+        note_bits = [item for item in [existing.get("notes"), row.get("notes")] if item]
+        existing["notes"] = " | ".join(dict.fromkeys(note_bits))[:4000] if note_bits else existing.get("notes")
+        if row.get("updated_at") and existing.get("updated_at") and row["updated_at"] > existing["updated_at"]:
+            existing["updated_at"] = row["updated_at"]
+    return list(grouped.values())
 
 
 @router.get("/leads", response_model=list[VendorLeadOut])
@@ -186,7 +276,7 @@ def upsert_lead(req: VendorLeadUpsertRequest, db: Session = Depends(get_db), cur
 
 @router.get("/quotes", response_model=list[VendorQuoteOut])
 def get_quotes(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
-    return [_serialize_quote(quote) for quote in list_quotes(db, opportunity_id, organization_id=getattr(current_org, "id", None))]
+    return _dedupe_quotes(list_quotes(db, opportunity_id, organization_id=getattr(current_org, "id", None)))
 
 
 @router.get("/quotes/follow-ups/summary")

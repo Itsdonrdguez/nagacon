@@ -25,14 +25,23 @@ def _split_text_chunks(value: str | None) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+def _build_result(summary: str, signals: list[str], gaps: list[str], matched_fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": summary,
+        "signals": signals or ["This opportunity still needs a manual capability review against your profile."],
+        "gaps": gaps or ["No major capability gaps were obvious from the current opportunity data."],
+        "matched_fields": matched_fields,
+    }
+
+
 def build_sam_capability_match(opp, company_profile) -> dict[str, Any]:
     if not company_profile:
-        return {
-            "summary": "Add a company profile to compare this opportunity against your capabilities.",
-            "signals": [],
-            "gaps": ["No company profile is available yet."],
-            "matched_fields": {},
-        }
+        return _build_result(
+            "Add a company profile to compare this opportunity against your capabilities.",
+            [],
+            ["No company profile is available yet."],
+            {},
+        )
 
     title = _clean_text(getattr(opp, "title", None))
     agency = _clean_text(getattr(opp, "agency", None))
@@ -128,11 +137,11 @@ def build_sam_capability_match(opp, company_profile) -> dict[str, Any]:
     else:
         summary = "Capability match is still inconclusive from the saved profile and current notice text."
 
-    return {
-        "summary": summary,
-        "signals": signals,
-        "gaps": gaps,
-        "matched_fields": {
+    return _build_result(
+        summary,
+        signals,
+        gaps,
+        {
             "naics": naics if naics_match else "",
             "agencies": matched_agencies,
             "keywords": matched_keywords,
@@ -142,4 +151,82 @@ def build_sam_capability_match(opp, company_profile) -> dict[str, Any]:
             "geography": bool(geography_match),
             "past_performance": bool(past_performance_match),
         },
-    }
+    )
+
+
+def build_product_capability_match(opp, company_profile) -> dict[str, Any]:
+    if not company_profile:
+        return _build_result(
+            "Add a company profile to compare this opportunity against your product capabilities.",
+            [],
+            ["No company profile is available yet."],
+            {},
+        )
+
+    title = _clean_text(getattr(opp, "title", None))
+    fsc = _clean_text(getattr(opp, "fsc", None))
+    raw_text = _clean_text(getattr(opp, "raw_text", None))
+    parsed_json = getattr(opp, "parsed_json", None) or {}
+    item_description = _clean_text(parsed_json.get("item_description") or parsed_json.get("nomenclature"))
+    source_text = " ".join(part for part in [title, item_description, raw_text] if part)
+
+    preferred_fscs = _clean_list(getattr(company_profile, "preferred_dibbs_fsc_codes", None))
+    preferred_keywords = _clean_list(getattr(company_profile, "preferred_sam_keywords", None))
+    certifications = _clean_list(getattr(company_profile, "certifications", None))
+    competencies = _split_text_chunks(getattr(company_profile, "core_competencies", None))
+    differentiators = _split_text_chunks(getattr(company_profile, "differentiators", None))
+
+    fsc_match = bool(fsc and fsc in preferred_fscs)
+    matched_keywords = _contains_any(source_text, preferred_keywords)
+    matched_competencies = _contains_any(source_text, competencies)
+    matched_differentiators = _contains_any(source_text, differentiators)
+    matched_certifications = _contains_any(source_text, certifications)
+
+    signals: list[str] = []
+    gaps: list[str] = []
+
+    if fsc_match:
+        signals.append(f"FSC {fsc} is already in your preferred DIBBS targeting.")
+    elif fsc:
+        gaps.append(f"FSC {fsc} is not listed in your saved DIBBS targeting yet.")
+
+    if matched_keywords:
+        signals.append(f"Item language matches your focus keywords: {', '.join(matched_keywords[:4])}.")
+    elif preferred_keywords:
+        gaps.append("None of your saved focus keywords appeared clearly in the current product description.")
+
+    if matched_competencies:
+        signals.append(f"Core competencies line up with the product scope: {', '.join(matched_competencies[:3])}.")
+    elif competencies:
+        gaps.append("Your core competencies are not clearly reflected in the current product description yet.")
+
+    if matched_certifications:
+        signals.append(f"Saved certifications appear relevant here: {', '.join(matched_certifications[:3])}.")
+
+    if matched_differentiators:
+        signals.append(f"Differentiators that may help here: {', '.join(matched_differentiators[:2])}.")
+
+    if fsc_match or matched_keywords or matched_competencies:
+        summary = "Capability match looks promising for this product opportunity."
+    else:
+        summary = "Capability match is still inconclusive from the saved profile and current product details."
+
+    return _build_result(
+        summary,
+        signals,
+        gaps,
+        {
+            "fsc": fsc if fsc_match else "",
+            "keywords": matched_keywords,
+            "certifications": matched_certifications,
+            "competencies": matched_competencies,
+            "differentiators": matched_differentiators,
+        },
+    )
+
+
+def build_capability_match(opp, company_profile) -> dict[str, Any]:
+    source = _clean_text(getattr(opp, "source", None)).upper()
+    if source == "SAM":
+        return build_sam_capability_match(opp, company_profile)
+    return build_product_capability_match(opp, company_profile)

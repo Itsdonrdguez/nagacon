@@ -7,6 +7,17 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 
+SET_ASIDE_ICON_MAP: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"iconedwosb", re.I), "EDWOSB"),
+    (re.compile(r"iconwosb", re.I), "WOSB"),
+    (re.compile(r"iconhubzone", re.I), "HUBZONE"),
+    (re.compile(r"iconsdvosb", re.I), "SDVOSB"),
+    (re.compile(r"iconsb", re.I), "SMALL_BUSINESS"),
+    (re.compile(r"iconcombined", re.I), "COMBINED"),
+    (re.compile(r"iconunrestrictednotsetaside", re.I), "UNRESTRICTED"),
+]
+
+
 def _safe(value: Any) -> str | None:
     if value is None:
         return None
@@ -78,6 +89,52 @@ def _clean_nomenclature(value: str | None) -> str | None:
         return None
     value = re.sub(r"\s*AMSC\s*$", "", value, flags=re.I)
     return _norm(value)
+
+
+def extract_dibbs_set_aside_type_from_strings(values: list[str | None]) -> str | None:
+    markers = [value for value in (_norm(item) for item in values) if value]
+    if not markers:
+        return None
+    haystack = " ".join(markers)
+    for pattern, label in SET_ASIDE_ICON_MAP:
+        if pattern.search(haystack):
+            return label
+    text_map = [
+        (re.compile(r"\b8\(a\)\b", re.I), "8A"),
+        (re.compile(r"\bedwosb\b", re.I), "EDWOSB"),
+        (re.compile(r"\bwosb\b", re.I), "WOSB"),
+        (re.compile(r"\bhubzone\b", re.I), "HUBZONE"),
+        (re.compile(r"\bsdvosb\b", re.I), "SDVOSB"),
+        (re.compile(r"\bsmall business\b", re.I), "SMALL_BUSINESS"),
+        (re.compile(r"\bcombined\b", re.I), "COMBINED"),
+        (re.compile(r"\bunrestricted\b", re.I), "UNRESTRICTED"),
+        (re.compile(r"\bnot set aside\b", re.I), "UNRESTRICTED"),
+    ]
+    for pattern, label in text_map:
+        if pattern.search(haystack):
+            return label
+    return None
+
+
+def extract_dibbs_set_aside_type_from_node(node: Any) -> str | None:
+    if node is None:
+        return None
+    values: list[str | None] = []
+    for image in getattr(node, "find_all", lambda *args, **kwargs: [])("img"):
+        values.extend([
+            image.get("src"),
+            image.get("alt"),
+            image.get("title"),
+        ])
+    values.append(getattr(node, "get_text", lambda *args, **kwargs: "")(" ", strip=True))
+    return extract_dibbs_set_aside_type_from_strings(values)
+
+
+def extract_dibbs_set_aside_type_from_html(html: str) -> str | None:
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    return extract_dibbs_set_aside_type_from_node(soup)
 
 
 def parse_approved_source_rows(page_text: str) -> list[dict[str, str]]:
@@ -173,6 +230,7 @@ def parse_dibbs_detail_structured(html: str, url: str) -> dict[str, Any]:
     approved_sources = parse_approved_source_rows(page_text)
     solicitation_rows = parse_solicitation_rows(page_text, url)
     file_links = collect_file_links(soup, url)
+    set_aside_type = extract_dibbs_set_aside_type_from_node(soup)
 
     existing_urls = {x["url"] for x in file_links}
     for row in solicitation_rows:
@@ -188,6 +246,7 @@ def parse_dibbs_detail_structured(html: str, url: str) -> dict[str, Any]:
         "fsc_code": fsc_code,
         "nomenclature": nomenclature,
         "amsc": amsc,
+        "set_aside_type": set_aside_type,
         "approved_sources": approved_sources,
         "solicitations": solicitation_rows,
         "file_links": file_links[:100],

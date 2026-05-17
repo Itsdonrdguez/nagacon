@@ -18,7 +18,7 @@ from app.models.vendor import VendorLead
 from app.schemas.provider import ProviderCreate, ProviderItemCreate, ProviderPdfExtractResult
 from app.services.dibbs.pdf_bulk_export import LATEST_MANIFEST_REF
 from app.services.document_parser import parse_opportunity_file
-from app.services.provider_settings_service import get_effective_sam_api_key
+from app.services.provider_settings_service import get_effective_sam_api_key, get_sam_api_key_candidates
 from app.services.rfq_parser import parse_dibbs_sources
 from app.services.storage import file_exists, local_temp_path
 
@@ -79,6 +79,10 @@ def _normalize_nsn(value: str | None) -> str | None:
     if len(digits) == 13:
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:9]}-{digits[9:]}"
     return None
+
+
+def _compact_nsn(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")
 
 
 def _nsn_from_filename(path: Path) -> str | None:
@@ -282,7 +286,11 @@ def _lookup_sam_entity(cage: str, api_key: str) -> dict[str, str | None]:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        return {"error": f"{exc.__class__.__name__}: {str(exc)[:300]}"}
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        return {
+            "error": f"{exc.__class__.__name__}: {str(exc)[:300]}",
+            "error_status": str(status_code) if status_code is not None else None,
+        }
 
     name = _first_string(payload, {"legalBusinessName", "entityName", "businessName"})
     website = _first_string(payload, {"entityURL", "entityUrl", "website", "websiteUrl", "websiteURL", "businessURL"})
@@ -290,6 +298,25 @@ def _lookup_sam_entity(cage: str, api_key: str) -> dict[str, str | None]:
         "company_name": _clean(name, 240),
         "website": _normalize_website(website),
     }
+
+
+def _lookup_sam_entity_with_fallback(cage: str, api_keys: list[tuple[str, str]]) -> tuple[dict[str, str | None], str | None]:
+    last_error: dict[str, str | None] | None = None
+    last_source: str | None = None
+    for source, api_key in api_keys:
+        row = _lookup_sam_entity(cage, api_key)
+        if not row.get("error"):
+            row["api_key_source"] = source
+            return row, source
+        last_error = row
+        last_source = source
+        if str(row.get("error_status") or "") not in {"401", "403"}:
+            row["api_key_source"] = source
+            return row, source
+    if last_error is None:
+        return {}, None
+    last_error["api_key_source"] = last_source
+    return last_error, last_source
 
 
 def _approved_source_rows(parsed: dict[str, Any]) -> list[dict[str, Any]]:
@@ -368,6 +395,16 @@ def _part_number_from_notes(notes: str | None) -> str | None:
     return _clean(match.group(1), 80) if match else None
 
 
+def _sanitize_part_number(part_number: str | None, *, nsn: str | None = None) -> str | None:
+    clean = _clean(part_number, 80)
+    if not clean:
+        return None
+    compact = _compact_nsn(clean)
+    if len(compact) == 13 and nsn and compact == _compact_nsn(nsn):
+        return None
+    return clean
+
+
 def _upsert_vendor_lead_from_provider(
     db: Session,
     *,
@@ -383,7 +420,7 @@ def _upsert_vendor_lead_from_provider(
 ) -> tuple[bool, bool]:
     cage = _normalize_cage(cage)
     company_name = _clean(company_name, 200)
-    part_number = _clean(part_number, 80)
+    part_number = _sanitize_part_number(part_number, nsn=nsn)
     if not cage and not company_name:
         return False, False
 
@@ -416,6 +453,22 @@ def _upsert_vendor_lead_from_provider(
     query = query.filter(VendorLead.cage == cage) if cage else query.filter(VendorLead.cage.is_(None))
     query = query.filter(VendorLead.part_number == part_number) if part_number else query.filter(VendorLead.part_number.is_(None))
     existing = query.first()
+
+    if not existing:
+        fallback_query = db.query(VendorLead).filter(VendorLead.opportunity_id == opp.id)
+        if cage:
+            fallback_query = fallback_query.filter(VendorLead.cage == cage)
+        elif company_name:
+            fallback_query = fallback_query.filter(VendorLead.company_name == company_name)
+        else:
+            fallback_query = fallback_query.filter(VendorLead.cage.is_(None))
+        if nsn:
+            fallback_query = fallback_query.filter(or_(VendorLead.nsn == nsn, VendorLead.nsn.is_(None)))
+        existing = (
+            fallback_query
+            .order_by(VendorLead.part_number.is_(None), VendorLead.confidence.desc().nullslast(), VendorLead.id.desc())
+            .first()
+        )
 
     if existing:
         touched = False
@@ -479,7 +532,7 @@ def extract_providers_from_dibbs_pdfs(
     base = Path(root)
 
     repo = ProviderRepository(db, organization_id=organization_id)
-    sam_api_key = get_effective_sam_api_key(db, user_id=user_id) if enrich_with_sam else None
+    sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id) if enrich_with_sam else []
     seen_cage_item: set[tuple[str, str | None, str]] = set()
     if base.exists():
         pdf_paths = sorted(base.rglob("*.pdf"))
@@ -489,7 +542,7 @@ def extract_providers_from_dibbs_pdfs(
             _extract_provider_rows_from_pdf(
                 db,
                 repo=repo,
-                sam_api_key=sam_api_key,
+                sam_api_keys=sam_api_keys,
                 result=result,
                 seen_cage_item=seen_cage_item,
                 reference=str(path),
@@ -519,7 +572,7 @@ def extract_providers_from_dibbs_pdfs(
                 _extract_provider_rows_from_pdf(
                     db,
                     repo=repo,
-                    sam_api_key=sam_api_key,
+                    sam_api_keys=sam_api_keys,
                     result=result,
                     seen_cage_item=seen_cage_item,
                     reference=row["file_path"],
@@ -541,7 +594,7 @@ def _extract_provider_rows_from_pdf(
     db: Session,
     *,
     repo: ProviderRepository,
-    sam_api_key: str | None,
+    sam_api_keys: list[tuple[str, str]],
     result: ProviderPdfExtractResult,
     seen_cage_item: set[tuple[str, str | None, str]],
     reference: str,
@@ -581,10 +634,11 @@ def _extract_provider_rows_from_pdf(
 
             company_name = _normalize_company_name(row.get("company_name"), cage=cage)
             sam_website = None
-            if sam_api_key:
-                sam_row = _lookup_sam_entity(cage, sam_api_key)
+            if sam_api_keys:
+                sam_row, sam_source = _lookup_sam_entity_with_fallback(cage, sam_api_keys)
                 if sam_row.get("error"):
-                    result.errors.append(f"{display_name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
+                    source_label = f" ({sam_source} key)" if sam_source else ""
+                    result.errors.append(f"{display_name} / CAGE {cage}: SAM lookup failed{source_label} - {sam_row['error']}")
                     sam_row = {}
                 sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
                 sam_website = sam_row.get("website")
@@ -603,7 +657,7 @@ def _extract_provider_rows_from_pdf(
             payload = ProviderCreate(
                 company_name=company_name,
                 cage=cage,
-                website=sam_website if sam_api_key else None,
+                website=sam_website if sam_api_keys else None,
                 notes="; ".join(notes),
                 item=ProviderItemCreate(
                     nsn=nsn,
@@ -662,6 +716,7 @@ def seed_vendor_leads_from_providers(
     from sqlalchemy import or_
 
     sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
+    sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id)
     rows = query.filter(or_(*filters)).order_by(ProviderItem.confidence.desc().nullslast(), Provider.company_name.asc()).all()
     created = 0
     updated = 0
@@ -669,8 +724,8 @@ def seed_vendor_leads_from_providers(
     seen: set[tuple[str | None, str | None]] = set()
     for provider, item in rows:
         cage = _normalize_cage(provider.cage)
-        if cage and sam_api_key:
-            sam_row = _lookup_sam_entity(cage, sam_api_key)
+        if cage and sam_api_key and sam_api_keys:
+            sam_row, _ = _lookup_sam_entity_with_fallback(cage, sam_api_keys)
             sam_name = _clean(sam_row.get("company_name"), 240)
             sam_website = _normalize_website(sam_row.get("website"))
             if sam_name and provider.company_name != sam_name:
@@ -679,7 +734,7 @@ def seed_vendor_leads_from_providers(
             if sam_website and not provider.website:
                 provider.website = sam_website
                 db.add(provider)
-        part_number = _part_number_from_notes(item.notes)
+        part_number = _sanitize_part_number(_part_number_from_notes(item.notes), nsn=nsn or item.nsn)
         key = (cage, part_number)
         if key in seen:
             continue
@@ -744,7 +799,7 @@ def extract_providers_from_opportunity_pdfs(
         return result
 
     repo = ProviderRepository(db, organization_id=organization_id)
-    sam_api_key = get_effective_sam_api_key(db, user_id=user_id) if enrich_with_sam else None
+    sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id) if enrich_with_sam else []
     seen_cage_item: set[tuple[str, str | None, str]] = set()
 
     for file_record in files:
@@ -782,10 +837,11 @@ def extract_providers_from_opportunity_pdfs(
 
                 company_name = _normalize_company_name(row.get("company_name"), cage=cage)
                 sam_website = None
-                if sam_api_key:
-                    sam_row = _lookup_sam_entity(cage, sam_api_key)
+                if sam_api_keys:
+                    sam_row, sam_source = _lookup_sam_entity_with_fallback(cage, sam_api_keys)
                     if sam_row.get("error"):
-                        result.errors.append(f"{filename or path.name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
+                        source_label = f" ({sam_source} key)" if sam_source else ""
+                        result.errors.append(f"{filename or path.name} / CAGE {cage}: SAM lookup failed{source_label} - {sam_row['error']}")
                         sam_row = {}
                     sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
                     sam_website = sam_row.get("website")
@@ -803,7 +859,7 @@ def extract_providers_from_opportunity_pdfs(
                 payload = ProviderCreate(
                     company_name=company_name,
                     cage=cage,
-                    website=sam_website if sam_api_key else None,
+                    website=sam_website if sam_api_keys else None,
                     notes="; ".join(notes),
                     item=ProviderItemCreate(
                         nsn=nsn,

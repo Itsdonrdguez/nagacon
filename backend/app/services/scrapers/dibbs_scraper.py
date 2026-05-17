@@ -159,7 +159,7 @@ def fetch_dibbs_opportunities(params: Optional[Dict] = None, max_pages: int = 1)
                         url=row.get("package_url") or row.get("pdf_url") or row.get("detail_url") or "",
                         posted_at=row.get("issue_date"),
                         due_at=row.get("return_by_date"),
-                        set_aside_type=None,
+                        set_aside_type=_clean_spaces(row.get("set_aside_type")),
                         naics_code=None,
                         fsc_code=_normalize_fsc(fsc_value or nsn),
                         place_of_performance=None,

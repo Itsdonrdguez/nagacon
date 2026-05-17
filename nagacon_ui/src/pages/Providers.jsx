@@ -450,22 +450,21 @@ export default function Providers() {
                 ))}
               </div>
             </div>
-            <Table>
+            <Table className="providers-table">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>NSN / Item</TableHead>
-                    <TableHead>Type</TableHead>
-                    <TableHead>Source</TableHead>
-                    <TableHead>Website</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Profile</TableHead>
-                  </TableRow>
+                  <TableHead className="providers-col-provider">Provider</TableHead>
+                  <TableHead className="providers-col-item">NSN / Item</TableHead>
+                  <TableHead className="providers-col-type">Type</TableHead>
+                  <TableHead className="providers-col-website">Website</TableHead>
+                  <TableHead className="providers-col-status">Status</TableHead>
+                  <TableHead className="providers-col-profile">Profile</TableHead>
+                </TableRow>
                 </TableHeader>
                 <TableBody>
                   {rows.map((row) => (
                     <TableRow key={row.provider_id}>
-                    <TableCell>
+                    <TableCell className="providers-cell-provider">
                       <div className="row-title">{providerLabel(row)}</div>
                       <div className="row-subtitle">
                         {row.cage ? `CAGE ${row.cage}` : 'CAGE not set'}
@@ -473,14 +472,14 @@ export default function Providers() {
                         {row.item_count ? ` | ${row.item_count} item link${row.item_count === 1 ? '' : 's'}` : ''}
                       </div>
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="providers-cell-item">
                       {(row.item_summaries || []).slice(0, 3).map((item) => (
-                        <div key={item.provider_item_id || `${item.nsn}-${item.relationship_type}`} className="provider-item-line">
+                        <div key={item.provider_item_id || `${item.nsn}-${item.nomenclature || item.relationship_type}`} className="provider-item-line">
                           <div className="row-title">{item.nomenclature || item.nsn || 'Item not specified'}</div>
                           <div className="row-subtitle">
                             {item.nsn || 'NSN not set'}
                             {item.fsc ? ` | FSC ${item.fsc}` : ''}
-                            {item.source ? ` | ${item.source}` : ''}
+                            {((item.sources?.length ? item.sources : [item.source]).filter(Boolean).join(', ')) ? ` | ${(item.sources?.length ? item.sources : [item.source]).filter(Boolean).join(', ')}` : ''}
                           </div>
                         </div>
                       ))}
@@ -494,22 +493,21 @@ export default function Providers() {
                         <div className="row-subtitle">+{row.item_summaries.length - 3} more item links</div>
                       ) : null}
                     </TableCell>
-                    <TableCell>
-                      <div className="badge-stack">
+                    <TableCell className="providers-cell-type">
+                      <div className="badge-stack providers-type-stack">
                         {(row.relationship_types?.length ? row.relationship_types : [row.relationship_type || 'Unknown']).slice(0, 4).map((type) => (
                           <Badge key={type} label={type || 'Unknown'} variant="default" />
                         ))}
                         {(row.relationship_types || []).length > 4 ? <Badge label={`+${row.relationship_types.length - 4}`} variant="info" /> : null}
                       </div>
                     </TableCell>
-                    <TableCell>{(row.sources?.length ? row.sources : [row.source]).filter(Boolean).join(', ') || '-'}</TableCell>
-                    <TableCell>
+                    <TableCell className="providers-cell-website">
                       {row.website ? (
                         <a href={row.website} target="_blank" rel="noreferrer">Open</a>
                       ) : '-'}
                     </TableCell>
-                    <TableCell><StatusPill status={row.status || 'active'} /></TableCell>
-                    <TableCell>
+                    <TableCell className="providers-cell-status"><StatusPill status={row.status || 'active'} /></TableCell>
+                    <TableCell className="providers-cell-profile">
                       <Button size="sm" variant="secondary" onClick={() => setSelectedProviderId(row.provider_id)}>
                         View
                       </Button>

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.catalog_service import get_nsn_catalog_summary
 from app.services.nsn_catalog.publog_decomp import import_publog_nsn
+from app.services.nsn_catalog.publog_reference_service import (
+    export_publog_reference_csv,
+    export_publog_reference_json,
+    search_publog_reference,
+)
 from app.services.nsn_catalog.publog_sync import get_publog_package_status, sync_publog_package
 from app.services.nsn_catalog.provider_seeding import seed_providers_from_nsn_catalog
 from app.services.nsn_catalog.refresh import refresh_nsn_intelligence
@@ -56,6 +62,92 @@ def sync_publog_job(
     payload["kind"] = "publog_sync"
     payload["target_limit"] = max(min(int(payload.get("target_limit") or 250), 1000), 1)
     return start_search_job("publog_sync", payload)
+
+
+@router.get("/publog/reference/search")
+def search_publog_reference_route(
+    dataset: str = "references",
+    mode: str = "all",
+    q: str | None = None,
+    nsn: str | None = None,
+    part_number: str | None = None,
+    cage: str | None = None,
+    fsc: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    return search_publog_reference(
+        db,
+        dataset=dataset,
+        mode=mode,
+        q=q,
+        nsn=nsn,
+        part_number=part_number,
+        cage=cage,
+        fsc=fsc,
+        limit=limit,
+    )
+
+
+@router.get("/publog/reference/export.csv")
+def export_publog_reference_csv_route(
+    dataset: str = "references",
+    mode: str = "all",
+    q: str | None = None,
+    nsn: str | None = None,
+    part_number: str | None = None,
+    cage: str | None = None,
+    fsc: str | None = None,
+    limit: int = 1000,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    return Response(
+        content=export_publog_reference_csv(
+            db,
+            dataset=dataset,
+            mode=mode,
+            q=q,
+            nsn=nsn,
+            part_number=part_number,
+            cage=cage,
+            fsc=fsc,
+            limit=limit,
+        ),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="publog_{dataset}_{mode}.csv"'},
+    )
+
+
+@router.get("/publog/reference/export.json")
+def export_publog_reference_json_route(
+    dataset: str = "references",
+    mode: str = "all",
+    q: str | None = None,
+    nsn: str | None = None,
+    part_number: str | None = None,
+    cage: str | None = None,
+    fsc: str | None = None,
+    limit: int = 1000,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    return Response(
+        content=export_publog_reference_json(
+            db,
+            dataset=dataset,
+            mode=mode,
+            q=q,
+            nsn=nsn,
+            part_number=part_number,
+            cage=cage,
+            fsc=fsc,
+            limit=limit,
+        ),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="publog_{dataset}_{mode}.json"'},
+    )
 
 
 @router.get("/{nsn}")

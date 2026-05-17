@@ -1,10 +1,53 @@
 
-# Fixed document_parser.py
-# Fix: corrected unterminated string literal that was breaking startup
-
 import logging
+from pathlib import Path
+import json
+import re
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_html(value: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"\\s+", " ", text)
+    return text.strip()
+
+
+def _read_text_like_file(file_path: str) -> dict | None:
+    suffix = Path(file_path).suffix.lower()
+    if suffix not in {".txt", ".text", ".md", ".html", ".htm", ".json", ".xml", ".csv"}:
+        return None
+    try:
+        raw = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        logger.warning(f"Text file parsing failed: {exc}")
+        return None
+
+    if suffix == ".json":
+        try:
+            payload = json.loads(raw)
+            pretty = json.dumps(payload, indent=2, ensure_ascii=False)
+            return {
+                "parser": "json",
+                "text": pretty,
+            }
+        except Exception:
+            pass
+
+    if suffix in {".html", ".htm"}:
+        return {
+            "parser": "html_text",
+            "text": _strip_html(raw),
+        }
+
+    return {
+        "parser": "text",
+        "text": raw,
+    }
+
 
 def parse_opportunity_file(file_path: str) -> dict:
     '''
@@ -13,6 +56,10 @@ def parse_opportunity_file(file_path: str) -> dict:
     '''
 
     extracted_text = ""
+
+    text_result = _read_text_like_file(file_path)
+    if text_result is not None:
+        return text_result
 
     try:
         # Try PyMuPDF first

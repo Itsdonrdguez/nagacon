@@ -8,6 +8,7 @@ import requests
 
 from app.core.config import settings
 from app.schemas.opportunity import RawOpportunity
+from app.utils.set_asides import normalize_set_aside
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,19 @@ def _extract_agency(opp: dict[str, Any]) -> str | None:
     return _safe(opp.get("fullParentPathName") or opp.get("department") or opp.get("agency"))
 
 
+def _extract_set_aside(opp: dict[str, Any]) -> str | None:
+    for key in (
+        "typeOfSetAsideDescription",
+        "typeOfSetAside",
+        "setAsideType",
+        "setAside",
+    ):
+        value = _safe(opp.get(key))
+        if value:
+            return normalize_set_aside(value)
+    return None
+
+
 def _normalize_opp(opp: dict[str, Any]) -> RawOpportunity:
     source_id = _safe(opp.get("noticeId") or opp.get("id") or opp.get("opportunityId"))
     solicitation_number = _safe(
@@ -72,6 +86,7 @@ def _normalize_opp(opp: dict[str, Any]) -> RawOpportunity:
         agency=_extract_agency(opp),
         posted_at=opp.get("postedDate") or opp.get("postedOn") or opp.get("publishDate"),
         due_at=opp.get("responseDeadLine") or opp.get("responseDate") or opp.get("archiveDate"),
+        set_aside_type=_extract_set_aside(opp),
         naics_code=_extract_naics(opp),
         fsc_code=_safe(opp.get("classificationCode") or opp.get("pscCode")),
         description=_extract_description(opp),

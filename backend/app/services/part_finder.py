@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session
 from app.models.award_history import AwardHistory
 from app.models.opportunity import Opportunity
 from app.models.provider import Provider, ProviderItem
+from app.services.intelligence.wbparts_service import get_wbparts_reference
 from app.services.nsn_catalog.catalog_service import get_nsn_catalog_summary
-from app.services.nsn_catalog.normalizer import normalize_nsn
+from app.services.nsn_catalog.normalizer import compact_nsn, normalize_nsn
 
 
 def find_part_for_opportunity(
@@ -17,6 +18,7 @@ def find_part_for_opportunity(
     opportunity_id: int,
     *,
     organization_id: int | None = None,
+    force_wbparts_refresh: bool = False,
 ) -> dict[str, Any]:
     query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
     if organization_id is not None:
@@ -34,7 +36,13 @@ def find_part_for_opportunity(
             "confidence": {"identity": "low", "supplier": "low", "award_history": "low"},
             "next_actions": ["Extract or enter the NSN before running part intelligence."],
         }
-    return build_part_finder_result(db, target, opportunity=opp, organization_id=organization_id)
+    return build_part_finder_result(
+        db,
+        target,
+        opportunity=opp,
+        organization_id=organization_id,
+        force_wbparts_refresh=force_wbparts_refresh,
+    )
 
 
 def find_part_for_nsn(
@@ -76,6 +84,7 @@ def build_part_finder_result(
     *,
     opportunity: Opportunity | None = None,
     organization_id: int | None = None,
+    force_wbparts_refresh: bool = False,
 ) -> dict[str, Any]:
     catalog = get_nsn_catalog_summary(db, target["nsn"])
     identity = catalog.get("identity") or {}
@@ -85,19 +94,35 @@ def build_part_finder_result(
     recommendations = catalog.get("vendor_recommendations") or []
     award_history = catalog.get("award_history") or {}
     nsn_awards = catalog.get("nsn_award_evidence") or {}
+    wbparts = get_wbparts_reference(
+        db,
+        target["nsn"],
+        opportunity_id=getattr(opportunity, "id", None),
+        force_refresh=force_wbparts_refresh,
+    )
+    wbparts_cross_references = wbparts.get("cross_references") or []
+    wbparts_alternates = wbparts.get("part_alternates") or []
+    wbparts_related_products = wbparts.get("related_products") or []
 
-    part_numbers = _unique([row.get("part_number") for row in references])
-    cages = _unique([row.get("cage") for row in references] + [row.get("cage") for row in cage_profiles])
+    part_numbers = _unique_part_numbers(
+        [row.get("part_number") for row in references]
+        + [row.get("part_number") for row in wbparts_cross_references]
+        + wbparts_alternates,
+        nsn=target["nsn"],
+    )
+    cages = _unique([row.get("cage") for row in references] + [row.get("cage") for row in cage_profiles] + [row.get("cage") for row in wbparts_cross_references])
     manufacturers = _unique(
         [row.get("company_name") for row in references]
         + [row.get("company_name") for row in cage_profiles]
         + [(row.get("official_profile") or {}).get("company") for row in cage_profiles]
+        + [row.get("manufacturer") for row in wbparts_cross_references]
     )
     providers = _provider_candidates(
         db,
         target["nsn"],
         catalog_providers,
         recommendations,
+        wbparts_cross_references,
         organization_id=organization_id,
     )
     awardees = _awardee_candidates(db, target["nsn"], award_history, nsn_awards, opportunity_id=getattr(opportunity, "id", None))
@@ -106,12 +131,14 @@ def build_part_finder_result(
         target.get("nomenclature")
         or identity.get("item_name")
         or _first([row.get("nomenclature") for row in catalog_providers])
+        or wbparts.get("item_name")
     )
     confidence = _confidence(
-        has_identity=bool(identity.get("item_name") or target.get("nomenclature")),
+        has_identity=bool(identity.get("item_name") or target.get("nomenclature") or wbparts.get("item_name")),
         references_count=len(references),
         provider_count=len(providers),
         award_count=len(awardees),
+        wbparts_cross_reference_count=len(wbparts_cross_references),
     )
 
     return {
@@ -124,9 +151,22 @@ def build_part_finder_result(
             "cages": cages,
             "manufacturers": manufacturers,
             "reference_count": len(references),
+            "related_nsns": wbparts_related_products[:10],
         },
         "providers": providers,
         "awardees": awardees,
+        "wbparts": {
+            "status": wbparts.get("status"),
+            "source_url": wbparts.get("source_url"),
+            "fetched_at": wbparts.get("fetched_at"),
+            "cache_hit": bool(wbparts.get("cache_hit")),
+            "item_name": wbparts.get("item_name"),
+            "part_alternates": wbparts_alternates[:20],
+            "cross_references": wbparts_cross_references[:20],
+            "related_products": wbparts_related_products[:20],
+            "demand_history": (wbparts.get("demand_history") or [])[:20],
+            "summary": wbparts.get("summary") or {},
+        },
         "evidence": {
             "catalog_status": catalog.get("status"),
             "identity": identity,
@@ -136,9 +176,16 @@ def build_part_finder_result(
             "award_history_count": award_history.get("count", 0),
             "nsn_award_evidence_count": nsn_awards.get("count", 0),
             "source_freshness": catalog.get("source_freshness"),
+            "wbparts": {
+                "status": wbparts.get("status"),
+                "cross_reference_count": len(wbparts_cross_references),
+                "alternate_count": len(wbparts_alternates),
+                "related_product_count": len(wbparts_related_products),
+                "source_url": wbparts.get("source_url"),
+            },
         },
         "confidence": confidence,
-        "next_actions": _next_actions(target, references, providers, awardees, catalog),
+        "next_actions": _next_actions(target, references, providers, awardees, catalog, wbparts),
     }
 
 
@@ -220,6 +267,7 @@ def _provider_candidates(
     nsn: str,
     catalog_providers: list[dict[str, Any]],
     recommendations: list[dict[str, Any]],
+    wbparts_cross_references: list[dict[str, Any]],
     *,
     organization_id: int | None,
 ) -> list[dict[str, Any]]:
@@ -262,6 +310,16 @@ def _provider_candidates(
         roles = row.get("roles") or []
         for role in roles or ["Recommended Supplier"]:
             add_candidate(row.get("company_name"), row.get("cage"), role, "NSN Recommendation", row.get("score") or row.get("confidence"), row.get("provider_id"))
+
+    for row in wbparts_cross_references:
+        add_candidate(
+            row.get("manufacturer"),
+            row.get("cage"),
+            row.get("relationship_type") or "Cross Reference",
+            "WBParts",
+            row.get("confidence"),
+            None,
+        )
 
     return sorted(candidates.values(), key=lambda item: (-(len(item["roles"])), item["name"]))[:25]
 
@@ -335,9 +393,9 @@ def _opportunity_payload(opp: Opportunity | None) -> dict[str, Any] | None:
     }
 
 
-def _confidence(*, has_identity: bool, references_count: int, provider_count: int, award_count: int) -> dict[str, Any]:
+def _confidence(*, has_identity: bool, references_count: int, provider_count: int, award_count: int, wbparts_cross_reference_count: int = 0) -> dict[str, Any]:
     identity_score = 30 + (45 if has_identity else 0) + min(references_count * 4, 25)
-    supplier_score = min(provider_count * 12 + references_count * 2, 100)
+    supplier_score = min(provider_count * 12 + references_count * 2 + min(wbparts_cross_reference_count * 3, 12), 100)
     award_score = min(award_count * 15, 100)
     return {
         "identity_score": min(identity_score, 100),
@@ -355,6 +413,7 @@ def _next_actions(
     providers: list[dict[str, Any]],
     awardees: list[dict[str, Any]],
     catalog: dict[str, Any],
+    wbparts: dict[str, Any] | None = None,
 ) -> list[str]:
     actions: list[str] = []
     if not target.get("quantity"):
@@ -365,6 +424,10 @@ def _next_actions(
         actions.append("Seed provider candidates from catalog references or approved-source PDFs.")
     if not awardees:
         actions.append("Run USAspending/SAM award history search to find prior awardees.")
+    if wbparts and wbparts.get("status") == "ok" and (wbparts.get("cross_references") or []):
+        actions.append("Review WBParts cross references as supplemental manufacturer and alternate-part evidence.")
+    if wbparts and wbparts.get("status") == "not_found":
+        actions.append("WBParts did not return an NSN page. Lean on PUB LOG, parsed solicitation evidence, and provider history instead.")
     if catalog.get("confidence", {}).get("identity") == "low":
         actions.append("Review item identity manually before outreach.")
     if not actions:
@@ -379,6 +442,28 @@ def _unique(values: list[Any]) -> list[str]:
         text = _clean(value)
         key = text.lower()
         if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _unique_part_numbers(values: list[Any], *, nsn: str | None = None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    blocked = {
+        compact_nsn(nsn),
+        str(nsn or "").strip().upper(),
+    }
+    for value in values:
+        text = _clean(value)
+        if not text:
+            continue
+        compact = compact_nsn(text)
+        if compact and compact in blocked:
+            continue
+        key = re.sub(r"[^0-9A-Z]+", "", text.upper())
+        if not key or key in seen:
             continue
         seen.add(key)
         out.append(text)

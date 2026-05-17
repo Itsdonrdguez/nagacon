@@ -235,12 +235,14 @@ def create_artifact(
         "EMAIL_DRAFT": "OUTREACH",
         "VENDOR_LIST": "RESEARCH",
         "RESEARCH_BRIEF": "RESEARCH",
+        "WBPARTS_REFERENCE": "RESEARCH",
         "SUBMISSION_PACKAGE": "SUBMISSION",
     }.get(artifact_type.upper(), "GENERAL"))
     content_json["_meta"].setdefault("artifact_status", "ACTIVE")
     content_json.setdefault("_history", [])
     content_json.setdefault("_outreach_log", [])
     content_json["_meta"].setdefault("created_at", datetime.utcnow().isoformat())
+    skip_history = artifact_type.upper() in {"WORKSPACE_SUMMARY_SNAPSHOT", "WBPARTS_REFERENCE"}
 
     if replace_existing:
         existing = (
@@ -253,17 +255,21 @@ def create_artifact(
             .first()
         )
         if existing:
-            current_content = dict(existing.content_json or {})
-            history = list(content_json.get("_history") or current_content.get("_history") or [])
-            history.append(
-                {
-                    "title": existing.title,
-                    "content_json": {k: v for k, v in current_content.items() if k != "_history"},
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "action": "auto_refresh" if artifact_type in {"COMPLIANCE_BRIEF", "EMAIL_DRAFT"} else "updated",
-                }
-            )
-            content_json["_history"] = history[-20:]
+            if not skip_history:
+                current_content = dict(existing.content_json or {})
+                history = list(content_json.get("_history") or current_content.get("_history") or [])
+                history.append(
+                    {
+                        "title": existing.title,
+                        "content_json": {k: v for k, v in current_content.items() if k != "_history"},
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "action": "auto_refresh" if artifact_type in {"COMPLIANCE_BRIEF", "EMAIL_DRAFT"} else "updated",
+                    }
+                )
+                content_json["_history"] = history[-20:]
+            else:
+                content_json["_history"] = []
+                content_json["_outreach_log"] = []
             existing.title = title
             existing.content_json = content_json
             existing.file_path = file_path
@@ -448,10 +454,20 @@ def build_normalized_facts(
     parsed = parsed or {}
     document_data = document_data or {}
     compliance_json = compliance_json or {}
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
     document_fields = dict(document_data.get("fields") or {})
     compliance_fields = dict(compliance_json.get("compliance_fields") or {})
     document_summary = dict(document_data.get("summary") or {})
     solicitation_row = _matching_solicitation_row(parsed, getattr(opp, "solicitation_number", None))
+    point_of_contact = list(raw_payload.get("pointOfContact") or [])
+    primary_contact = point_of_contact[0] if point_of_contact else {}
+    office_address = dict(raw_payload.get("officeAddress") or {})
+    office_bits = [
+        _first_present(office_address.get("city")),
+        _first_present(office_address.get("state")),
+        _first_present(office_address.get("zipcode")),
+    ]
+    submission_office_hint = " ".join(str(bit).strip() for bit in office_bits if str(bit or "").strip()) or None
 
     def choose(*candidates):
         for value, source in candidates:
@@ -514,6 +530,7 @@ def build_normalized_facts(
         "set_aside": choose(
             (document_fields.get("set_aside_hint"), "solicitation_pdf"),
             (compliance_fields.get("set_aside_hint"), "compliance_brief"),
+            (raw_payload.get("typeOfSetAsideDescription") or raw_payload.get("typeOfSetAside"), "sam_notice"),
             (getattr(opp, "set_aside", None), "opportunity_record"),
         ),
         "naics": choose((getattr(opp, "naics", None), "opportunity_record")),
@@ -529,6 +546,9 @@ def build_normalized_facts(
         "submission_method": choose(
             (document_fields.get("submission_method"), "solicitation_pdf"),
             (compliance_fields.get("submission_method"), "compliance_brief"),
+            ("Submit according to the SAM notice instructions and attachments", "sam_notice")
+            if str(getattr(opp, "source", "") or "").upper() == "SAM"
+            else (None, None),
         ),
         "fob_terms": choose(
             (document_fields.get("fob_terms"), "solicitation_pdf"),
@@ -546,18 +566,22 @@ def build_normalized_facts(
             "name": choose(
                 (document_fields.get("solicitation_contact_name"), "solicitation_pdf"),
                 (compliance_fields.get("solicitation_contact_name"), "compliance_brief"),
+                (primary_contact.get("fullName"), "sam_notice"),
             ),
             "email": choose(
                 (document_fields.get("solicitation_contact_email"), "solicitation_pdf"),
                 (compliance_fields.get("solicitation_contact_email"), "compliance_brief"),
+                (primary_contact.get("email"), "sam_notice"),
             ),
             "phone": choose(
                 (document_fields.get("solicitation_contact_phone"), "solicitation_pdf"),
                 (compliance_fields.get("solicitation_contact_phone"), "compliance_brief"),
+                (primary_contact.get("phone"), "sam_notice"),
             ),
             "submission_office": choose(
                 (document_fields.get("submission_office_hint"), "solicitation_pdf"),
                 (compliance_fields.get("submission_office_hint"), "compliance_brief"),
+                (submission_office_hint, "sam_notice"),
             ),
         },
     }
@@ -1217,8 +1241,10 @@ def generate_submission_package(db: Session, opp: Opportunity) -> WorkspaceArtif
     from app.services.document_pipeline import _build_compliance_artifact_content
     from app.services.pricing_intelligence import summarize_price_history
     from app.services.recommendation_engine import build_workspace_recommendation
+    from app.services.solicitation_memory import build_solicitation_memory
 
     compliance_json = _build_compliance_artifact_content(db, opp)
+    solicitation_memory = build_solicitation_memory(db, opp)
     recommendation_json = build_workspace_recommendation(
         db,
         opp,
@@ -1226,6 +1252,7 @@ def generate_submission_package(db: Session, opp: Opportunity) -> WorkspaceArtif
         files=files,
         quotes=quotes,
         submission=submission,
+        solicitation_memory=solicitation_memory,
     )
     analysis_json = dict(getattr(analysis_artifact, "content_json", None) or {})
     email_json = dict(getattr(email_artifact, "content_json", None) or {})

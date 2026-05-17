@@ -10,6 +10,7 @@ const items = [
   ['/vendors', 'Vendor Intelligence'],
   ['/providers', 'Providers'],
   ['/nsn-intelligence', 'NSN Intelligence'],
+  ['/publog-reference', 'PUB LOG Reference'],
   ['/data-health', 'Data Health'],
   ['/source-freshness', 'Source Freshness'],
   ['/settings', 'Settings'],
@@ -20,6 +21,7 @@ export default function Sidebar({
   onNavigate = null,
   onLogout = null,
   logoutLoading = false,
+  showLogout = true,
 }) {
   return (
     <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
@@ -40,19 +42,21 @@ export default function Sidebar({
           </NavLink>
         ))}
       </nav>
-      <div className="sidebar-footer">
-        <button
-          type="button"
-          className="nav-link nav-link-action"
-          onClick={() => {
-            onNavigate?.()
-            onLogout?.()
-          }}
-          disabled={logoutLoading}
-        >
-          {logoutLoading ? 'Logging out...' : 'Log Out'}
-        </button>
-      </div>
+      {showLogout ? (
+        <div className="sidebar-footer">
+          <button
+            type="button"
+            className="nav-link nav-link-action"
+            onClick={() => {
+              onNavigate?.()
+              onLogout?.()
+            }}
+            disabled={logoutLoading}
+          >
+            {logoutLoading ? 'Logging out...' : 'Log Out'}
+          </button>
+        </div>
+      ) : null}
     </aside>
   )
 }

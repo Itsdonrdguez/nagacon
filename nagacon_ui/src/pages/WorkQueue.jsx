@@ -19,8 +19,10 @@ const TYPE_LABELS = {
   RFQ_NOT_SENT: 'Supplier Outreach',
   READY_TO_SUBMIT: 'Package Prep',
   MISSING_SUBMISSION_PACKAGE: 'Submission Prep',
+  CLOSED_WORKSPACE_PREP: 'Closed Prep',
   AWARDEE_ENRICHMENT_READY: 'Closed Intelligence',
   NSN_INTELLIGENCE_REFRESH: 'NSN Intelligence',
+  WORKSPACE_PREP_RUNNING: 'Workspace Prep',
   SAM_CHECKLIST_MISSING: 'Proposal Setup',
   SAM_COMPLIANCE_MATRIX_MISSING: 'Compliance Review',
   SAM_CO_EMAIL_MISSING: 'CO Outreach',
@@ -31,32 +33,35 @@ const TYPE_LABELS = {
   DIBBS_RFQ_PACKAGE_MISSING: 'RFQ Package',
 }
 
-const FILTERS = [
-  ['all', 'All'],
+const DESK_FILTERS = [
+  ['all', 'All Work'],
+  ['needs_review', 'Needs Review'],
+  ['ready_to_work', 'Ready to Work'],
+  ['waiting_on_vendor', 'Waiting on Vendor'],
   ['due_soon', 'Due Soon'],
-  ['needs_suppliers', 'Needs Suppliers'],
-  ['rfq_not_sent', 'RFQ Not Sent'],
-  ['follow_up_due', 'Follow-up Due'],
-  ['ready_to_submit', 'Ready to Submit'],
-  ['submission_prep', 'Submission Prep'],
-  ['closed_intelligence', 'Closed Intelligence'],
-  ['failed', 'Failed'],
+  ['overdue', 'Overdue'],
+  ['done', 'Done'],
 ]
 
-const formatDate = (value) => {
-  if (!value) return ''
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) return ''
-  return parsed.toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  })
+const DESK_SECTIONS = ['needs_review', 'ready_to_work', 'waiting_on_vendor', 'due_soon', 'overdue', 'done']
+
+const DESK_LABELS = {
+  needs_review: 'Needs Review',
+  ready_to_work: 'Ready to Work',
+  waiting_on_vendor: 'Waiting on Vendor',
+  due_soon: 'Due Soon',
+  overdue: 'Overdue',
+  done: 'Done',
 }
 
-const compactMeta = (parts) => parts.filter(Boolean).join(' | ')
-
-const queueStatusLabel = (value) => String(value || '').toUpperCase() || 'QUEUED'
+const DESK_SUBTITLES = {
+  needs_review: 'New work that needs a first look before we commit time.',
+  ready_to_work: 'Prepared items we can move forward right now.',
+  waiting_on_vendor: 'Work that depends on supplier or quote movement.',
+  due_soon: 'Time-sensitive items that need attention before the deadline closes in.',
+  overdue: 'Missed or failed work that needs recovery.',
+  done: 'Recently completed items kept here for quick confirmation.',
+}
 
 const ACTION_RANK = {
   QUOTE_FOLLOW_UP_DUE: 0,
@@ -65,6 +70,7 @@ const ACTION_RANK = {
   MISSING_VENDOR_LEADS: 3,
   MISSING_PART_FINDER: 4,
   NSN_INTELLIGENCE_REFRESH: 5,
+  WORKSPACE_PREP_RUNNING: 6,
   DIBBS_RFQ_PACKAGE_MISSING: 6,
   RFQ_CLOSING_SOON: 7,
   MISSING_SUBMISSION_PACKAGE: 8,
@@ -105,6 +111,10 @@ const PRIMARY_ACTIONS = {
     heading: 'Prepare package',
     detail: 'The operational pieces are in motion, but the package is not assembled yet.',
   },
+  CLOSED_WORKSPACE_PREP: {
+    heading: 'Queue closed workspace prep',
+    detail: 'This recently closed solicitation still needs the full extraction and intelligence pass.',
+  },
   AWARDEE_ENRICHMENT_READY: {
     heading: 'Review closed intelligence',
     detail: 'This closed solicitation can sharpen future vendor and awardee research.',
@@ -112,6 +122,10 @@ const PRIMARY_ACTIONS = {
   NSN_INTELLIGENCE_REFRESH: {
     heading: 'Open NSN intelligence',
     detail: 'This NSN still needs a saved intelligence record before sourcing is complete.',
+  },
+  WORKSPACE_PREP_RUNNING: {
+    heading: 'Workspace prep is running',
+    detail: 'The background prep is building document coverage, part intelligence, vendor leads, and workspace artifacts.',
   },
   SAM_CHECKLIST_MISSING: {
     heading: 'Start win strategy review',
@@ -147,6 +161,27 @@ const PRIMARY_ACTIONS = {
   },
 }
 
+const compactMeta = (parts) => parts.filter(Boolean).join(' | ')
+
+const queueStatusLabel = (value) => String(value || '').toUpperCase() || 'QUEUED'
+
+const formatDate = (value) => {
+  if (!value) return ''
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return ''
+  return parsed.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })
+}
+
+const parseDate = (value) => {
+  if (!value) return null
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
 function buildVendorResearchUrl(item) {
   const params = new URLSearchParams()
   params.set('source', 'today')
@@ -180,35 +215,6 @@ function buildNsnIntelligenceUrl(item, mode = 'lookup') {
   return `/nsn-intelligence?${params.toString()}`
 }
 
-function missionBucket(item) {
-  const explicit = String(item?.mission_bucket || '').trim()
-  if (explicit) return explicit
-  const type = String(item?.type || '').toUpperCase()
-  if (type === 'RFQ_CLOSING_SOON') return 'due_soon'
-  if (['MISSING_VENDOR_LEADS', 'MISSING_PART_FINDER', 'NSN_INTELLIGENCE_REFRESH'].includes(type)) return 'needs_suppliers'
-  if (type === 'RFQ_NOT_SENT') return 'rfq_not_sent'
-  if (['QUOTE_FOLLOW_UP_DUE', 'QUOTE_REQUESTED_NO_RESPONSE'].includes(type)) return 'follow_up_due'
-  if (type === 'READY_TO_SUBMIT') return 'ready_to_submit'
-  if (['MISSING_SUBMISSION_PACKAGE', 'SAM_CHECKLIST_MISSING', 'SAM_COMPLIANCE_MATRIX_MISSING', 'SAM_CO_EMAIL_MISSING', 'SAM_TARGET_SUBMIT_DATE_MISSING', 'SAM_TASKS_NOT_SEEDED', 'SAM_OPEN_TASKS_MISSING', 'SAM_SUBMISSION_PACKAGE_MISSING', 'DIBBS_RFQ_PACKAGE_MISSING'].includes(type)) return 'submission_prep'
-  if (type === 'AWARDEE_ENRICHMENT_READY') return 'closed_intelligence'
-  return 'manual_review'
-}
-
-function missionBucketLabel(bucket) {
-  const labels = {
-    due_soon: 'Due Soon',
-    needs_suppliers: 'Needs Suppliers',
-    rfq_not_sent: 'RFQ Not Sent',
-    follow_up_due: 'Follow-up Due',
-    ready_to_submit: 'Ready to Submit',
-    submission_prep: 'Submission Prep',
-    closed_intelligence: 'Closed Intelligence',
-    failed: 'Failed',
-    manual_review: 'Manual Review',
-  }
-  return labels[bucket] || 'Manual Review'
-}
-
 function recommendedActionLink(item) {
   if (!item) return { to: item?.action_url || '/work-queue', label: 'Open Workspace' }
   if (item.type === 'MISSING_VENDOR_LEADS') {
@@ -219,6 +225,9 @@ function recommendedActionLink(item) {
   }
   if (item.type === 'NSN_INTELLIGENCE_REFRESH') {
     return { to: buildNsnIntelligenceUrl(item, 'build'), label: 'Open NSN Intelligence' }
+  }
+  if (item.type === 'WORKSPACE_PREP_RUNNING') {
+    return { to: buildWorkspaceUrl(item), label: 'Open Workspace' }
   }
   if (item.type === 'RFQ_NOT_SENT') {
     return { to: buildWorkspaceUrl(item, 'sources-quotes'), label: 'Open RFQ Draft' }
@@ -241,8 +250,14 @@ function recommendedActionLink(item) {
   if (item.type === 'DIBBS_RFQ_PACKAGE_MISSING') {
     return { to: buildWorkspaceUrl(item, 'rfq-package'), label: 'Open RFQ Package' }
   }
+  if (item.type === 'CLOSED_WORKSPACE_PREP') {
+    return { to: buildWorkspaceUrl(item), label: 'Open Closed Workspace' }
+  }
   if (item.type === 'AWARDEE_ENRICHMENT_READY') {
     return { to: item.action_url, label: 'Review Closed Intelligence' }
+  }
+  if (item.type === 'MISSING_VENDOR_LEADS') {
+    return { to: buildVendorResearchUrl(item), label: 'Research Vendors' }
   }
   return { to: item.action_url, label: item.action_label || 'Open Workspace' }
 }
@@ -281,11 +296,38 @@ function groupActionItems(items) {
     })
 }
 
+function classifyDeskStatus(item, kind = 'group') {
+  const queueState = item.queue_state || {}
+  const status = String(queueState.status || item.status || '').toLowerCase()
+  const type = String(item.type || '').toUpperCase()
+  const dueAt = parseDate(item.due_at || item.opportunity?.due_at)
+  const now = new Date()
+
+  if (kind === 'completed' || status === 'success' || status === 'completed') return 'done'
+  if (kind === 'failed' || status === 'failed') return 'overdue'
+  if (type === 'RFQ_CLOSING_SOON' && dueAt && dueAt < now) return 'overdue'
+  if (type === 'WORKSPACE_PREP_RUNNING' || type === 'READY_TO_SUBMIT' || type === 'MISSING_SUBMISSION_PACKAGE' || type === 'MISSING_PART_FINDER' || type === 'NSN_INTELLIGENCE_REFRESH' || type === 'DIBBS_RFQ_PACKAGE_MISSING' || type === 'AWARDEE_ENRICHMENT_READY' || type === 'CLOSED_WORKSPACE_PREP' || type.startsWith('SAM_')) {
+    return 'ready_to_work'
+  }
+  if (type === 'QUOTE_FOLLOW_UP_DUE' || type === 'QUOTE_REQUESTED_NO_RESPONSE' || type === 'RFQ_NOT_SENT' || type === 'MISSING_VENDOR_LEADS') {
+    return 'waiting_on_vendor'
+  }
+  if (type === 'RFQ_CLOSING_SOON') return 'due_soon'
+  return 'needs_review'
+}
+
+function getOpportunityIdFromCard(card) {
+  return Number(card?.group?.opportunity?.id || card?.item?.opportunity?.id || 0) || null
+}
+
 export default function WorkQueue() {
   const [filter, setFilter] = useState('all')
   const [backgroundJobId, setBackgroundJobId] = useState(null)
   const [queueTodayResult, setQueueTodayResult] = useState(null)
+  const [hideCompleted, setHideCompleted] = useState(true)
+  const [selectedOpportunityIds, setSelectedOpportunityIds] = useState([])
   const queryClient = useQueryClient()
+
   const workQueueQuery = useQuery({
     queryKey: ['work-queue-today'],
     queryFn: async () => {
@@ -300,9 +342,8 @@ export default function WorkQueue() {
   const inProgressItems = data.in_progress_items || []
   const recentCompletedItems = data.recent_completed_items || []
   const recentFailedItems = data.recent_failed_items || []
-  const summary = data.summary || {}
-  const inProgressSummary = data.in_progress_summary || {}
   const collectionSummary = data.collection_summary || {}
+
   const backgroundJobQuery = useQuery({
     queryKey: ['work-queue-background-job', backgroundJobId],
     enabled: Boolean(backgroundJobId),
@@ -315,33 +356,11 @@ export default function WorkQueue() {
       return res.data
     },
   })
+
   const refreshQueue = () => {
     queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
   }
-  const runPartFinderMutation = useMutation({
-    mutationFn: async (opportunityId) => {
-      const res = await api.post(`/api/parts/opportunity/${opportunityId}/refresh`)
-      return res.data
-    },
-    onSuccess: refreshQueue,
-  })
-  const syncVendorLeadsMutation = useMutation({
-    mutationFn: async (opportunityId) => {
-      const res = await api.post('/api/vendors/leads/sync', { opportunity_id: Number(opportunityId) })
-      return res.data
-    },
-    onSuccess: refreshQueue,
-  })
-  const logFollowUpMutation = useMutation({
-    mutationFn: async ({ opportunityId, quoteId, companyName }) => {
-      const res = await api.post(`/api/vendors/quotes/${quoteId}/follow-up`, {
-        opportunity_id: Number(opportunityId),
-        notes: `Follow-up logged from Daily Work Queue${companyName ? ` for ${companyName}` : ''}.`,
-      })
-      return res.data
-    },
-    onSuccess: refreshQueue,
-  })
+
   const queueBackgroundMutation = useMutation({
     mutationFn: async (item) => {
       const opportunityId = item.opportunity?.id
@@ -366,8 +385,10 @@ export default function WorkQueue() {
     },
     onSuccess: (job) => {
       setBackgroundJobId(job.id)
+      refreshQueue()
     },
   })
+
   const queueTodayMutation = useMutation({
     mutationFn: async () => {
       const res = await api.post('/api/work-queue/queue-today', null, {
@@ -379,21 +400,96 @@ export default function WorkQueue() {
       setQueueTodayResult(result)
       refreshQueue()
       const firstJobId = result?.queued_jobs?.[0]?.job_id
-      if (firstJobId) {
-        setBackgroundJobId(firstJobId)
-      }
+      if (firstJobId) setBackgroundJobId(firstJobId)
     },
   })
+
+  const bulkPrepareMutation = useMutation({
+    mutationFn: async (opportunityIds) => {
+      const res = await api.post('/api/opportunities/bulk/workspace-intake', {
+        opportunity_ids: opportunityIds,
+        download_documents: true,
+        run_usaspending: true,
+      })
+      return res.data
+    },
+    onSuccess: (result) => {
+      setQueueTodayResult({
+        queued_count: result.queued_count || 0,
+        skipped_duplicate_count: result.skipped_duplicate_count || 0,
+        queueable_items: result.requested_count || 0,
+        queued_jobs: result.queued_jobs || [],
+      })
+      setSelectedOpportunityIds([])
+      refreshQueue()
+      const firstJobId = result?.queued_jobs?.[0]?.job_id
+      if (firstJobId) setBackgroundJobId(firstJobId)
+    },
+  })
+
+  const markReviewedMutation = useMutation({
+    mutationFn: async (opportunityIds) => {
+      const results = []
+      for (const opportunityId of opportunityIds) {
+        let pipeline = null
+        try {
+          const existing = await api.get(`/api/pipeline/by-opportunity/${opportunityId}`)
+          pipeline = existing.data
+        } catch (error) {
+          pipeline = null
+        }
+        if (!pipeline?.id) {
+          const created = await api.post(`/api/pipeline/by-opportunity/${opportunityId}`)
+          pipeline = created.data
+        }
+        const updated = await api.patch(`/api/pipeline/${pipeline.id}`, {
+          decision_status: 'IN_PROGRESS',
+        })
+        results.push(updated.data)
+      }
+      return results
+    },
+    onSuccess: () => {
+      setSelectedOpportunityIds([])
+      refreshQueue()
+    },
+  })
+
+  const refreshIntelligenceMutation = useMutation({
+    mutationFn: async (cards) => {
+      const results = []
+      for (const card of cards) {
+        const opportunityId = getOpportunityIdFromCard(card)
+        if (!opportunityId) continue
+        const primaryItem = card.group?.primary || card.item
+        if (primaryItem?.type === 'AWARDEE_ENRICHMENT_READY' || primaryItem?.type === 'CLOSED_WORKSPACE_PREP') {
+          const res = await api.post(`/api/opportunities/${opportunityId}/awardee-enrichment-job`, null, {
+            params: { force: true },
+          })
+          results.push(res.data)
+          continue
+        }
+        const res = await api.post(`/api/parts/opportunity/${opportunityId}/refresh`)
+        results.push(res.data)
+      }
+      return results
+    },
+    onSuccess: () => {
+      setSelectedOpportunityIds([])
+      refreshQueue()
+    },
+  })
+
   const groupedVisibleItems = useMemo(() => groupActionItems(items), [items])
+
   const missionCards = useMemo(() => {
     const cards = []
 
     for (const item of inProgressItems) {
       cards.push({
         kind: 'job',
-        filterKey: missionBucket(item),
+        deskStatus: classifyDeskStatus(item, 'job'),
         statusLabel: String(item.display_status || queueStatusLabel(item.queue_state?.status)).toUpperCase(),
-        bucketLabel: missionBucketLabel(missionBucket(item)),
         item,
       })
     }
@@ -401,58 +497,114 @@ export default function WorkQueue() {
     for (const item of recentFailedItems) {
       cards.push({
         kind: 'failed',
-        filterKey: 'failed',
+        deskStatus: 'overdue',
         statusLabel: 'FAILED',
-        bucketLabel: 'Failed',
         item,
       })
     }
 
     for (const group of groupedVisibleItems) {
       const primary = group.primary
-      const filterKey = missionBucket(primary)
       cards.push({
-        kind: filterKey === 'closed_intelligence' ? 'closed' : 'group',
-        filterKey,
+        kind: 'group',
+        deskStatus: classifyDeskStatus(primary, 'group'),
         statusLabel: String(primary.display_status || 'OPEN').toUpperCase(),
-        bucketLabel: missionBucketLabel(filterKey),
         item: primary,
         group,
       })
     }
 
+    for (const item of recentCompletedItems) {
+      cards.push({
+        kind: 'completed',
+        deskStatus: 'done',
+        statusLabel: 'DONE',
+        item,
+      })
+    }
+
     return cards
-  }, [groupedVisibleItems, inProgressItems, recentFailedItems])
+  }, [groupedVisibleItems, inProgressItems, recentCompletedItems, recentFailedItems])
 
   const filterCounts = useMemo(() => {
-    const counts = { all: missionCards.length }
+    const counts = { all: 0 }
     for (const card of missionCards) {
-      counts[card.filterKey] = (counts[card.filterKey] || 0) + 1
+      counts.all += hideCompleted && card.deskStatus === 'done' ? 0 : 1
+      counts[card.deskStatus] = (counts[card.deskStatus] || 0) + 1
     }
     return counts
-  }, [missionCards])
+  }, [missionCards, hideCompleted])
 
   const visibleCards = useMemo(() => {
-    if (filter === 'all') return missionCards
-    return missionCards.filter((card) => card.filterKey === filter)
-  }, [missionCards, filter])
+    const base = missionCards.filter((card) => !(hideCompleted && card.deskStatus === 'done'))
+    if (filter === 'all') return base
+    return base.filter((card) => card.deskStatus === filter)
+  }, [filter, hideCompleted, missionCards])
+
+  const cardsBySection = useMemo(() => {
+    const grouped = Object.fromEntries(DESK_SECTIONS.map((key) => [key, []]))
+    for (const card of visibleCards) {
+      grouped[card.deskStatus]?.push(card)
+    }
+    return grouped
+  }, [visibleCards])
 
   const spotlightStats = useMemo(() => ([
-    { key: 'all', label: 'Open Actions', value: filterCounts.all || 0, subtitle: 'Items needing work today' },
-    { key: 'due_soon', label: 'Due Soon', value: filterCounts.due_soon || 0, subtitle: 'Due within 7 days' },
-    { key: 'needs_suppliers', label: 'Needs Suppliers', value: filterCounts.needs_suppliers || 0, subtitle: 'No usable supplier yet' },
-    { key: 'rfq_not_sent', label: 'RFQs Not Sent', value: filterCounts.rfq_not_sent || 0, subtitle: 'Suppliers found, outreach pending' },
-    { key: 'follow_up_due', label: 'Follow-ups Due', value: filterCounts.follow_up_due || 0, subtitle: 'Quotes not received yet' },
-    { key: 'ready_to_submit', label: 'Ready to Submit', value: filterCounts.ready_to_submit || 0, subtitle: 'Quote received and package pending' },
+    { key: 'needs_review', label: 'Needs Review', value: filterCounts.needs_review || 0, subtitle: 'New work to triage' },
+    { key: 'ready_to_work', label: 'Ready to Work', value: filterCounts.ready_to_work || 0, subtitle: 'Actionable now' },
+    { key: 'waiting_on_vendor', label: 'Waiting on Vendor', value: filterCounts.waiting_on_vendor || 0, subtitle: 'Quote and outreach movement' },
+    { key: 'due_soon', label: 'Due Soon', value: filterCounts.due_soon || 0, subtitle: 'Deadline pressure building' },
+    { key: 'overdue', label: 'Overdue', value: filterCounts.overdue || 0, subtitle: 'Needs recovery' },
+    { key: 'done', label: 'Done', value: filterCounts.done || 0, subtitle: 'Recently completed' },
   ]), [filterCounts])
+
+  const selectedCards = useMemo(
+    () => visibleCards.filter((card) => selectedOpportunityIds.includes(getOpportunityIdFromCard(card))),
+    [selectedOpportunityIds, visibleCards],
+  )
+
+  const selectedSummary = useMemo(() => {
+    const labels = new Set(selectedCards.map((card) => DESK_LABELS[card.deskStatus] || 'Work'))
+    return Array.from(labels).join(' | ')
+  }, [selectedCards])
+
   useEffect(() => {
     if (backgroundJobQuery.data?.status === 'success') {
       refreshQueue()
     }
   }, [backgroundJobQuery.data?.status])
+
   const primaryActionMeta = (item) => PRIMARY_ACTIONS[item?.type] || {
     heading: item?.action_label || 'Open workspace',
     detail: item?.subtitle || 'Open the workspace and continue the next step.',
+  }
+
+  const toggleSelection = (card) => {
+    const opportunityId = getOpportunityIdFromCard(card)
+    if (!opportunityId) return
+    setSelectedOpportunityIds((current) => (
+      current.includes(opportunityId)
+        ? current.filter((value) => value !== opportunityId)
+        : [...current, opportunityId]
+    ))
+  }
+
+  const handleBulkPrepare = () => {
+    if (selectedOpportunityIds.length === 0) return
+    if (!window.confirm(`Prepare ${selectedOpportunityIds.length} selected workspace${selectedOpportunityIds.length === 1 ? '' : 's'} and send them into Today queue?`)) return
+    bulkPrepareMutation.mutate(selectedOpportunityIds)
+  }
+
+  const handleMarkReviewed = () => {
+    if (selectedOpportunityIds.length === 0) return
+    if (!window.confirm(`Mark ${selectedOpportunityIds.length} selected item${selectedOpportunityIds.length === 1 ? '' : 's'} as reviewed?`)) return
+    markReviewedMutation.mutate(selectedOpportunityIds)
+  }
+
+  const handleRefreshIntelligence = () => {
+    if (selectedCards.length === 0) return
+    if (!window.confirm(`Refresh intelligence for ${selectedCards.length} selected item${selectedCards.length === 1 ? '' : 's'}?`)) return
+    refreshIntelligenceMutation.mutate(selectedCards)
   }
 
   if (workQueueQuery.isLoading) {
@@ -481,9 +633,11 @@ export default function WorkQueue() {
     <div className="page">
       <div className="page-header">
         <div>
-          <div className="page-kicker">Mission Control</div>
+          <div className="page-kicker">Command Center</div>
           <h1 className="page-title">Today</h1>
-          <div className="page-subtitle">Start with the next best action for each opportunity instead of sorting through a raw queue by hand.</div>
+          <div className="page-subtitle">
+            Use this as your follow-up desk: review new work, move ready items forward, and keep vendor motion from getting buried.
+          </div>
         </div>
         <div className="company-form-actions">
           <Button onClick={() => queueTodayMutation.mutate()} loading={queueTodayMutation.isPending}>
@@ -492,18 +646,18 @@ export default function WorkQueue() {
           <Button variant="secondary" onClick={() => workQueueQuery.refetch()}>
             Refresh Status
           </Button>
-          <a className="btn btn-secondary btn-sm" href={`${api.defaults.baseURL}/api/export/work_queue.csv`}>
+          <a className="btn btn-secondary btn-sm" href={`${api.defaults.baseURL}/api/export/work_queue.csv`} target="_blank" rel="noreferrer">
             Export CSV
           </a>
         </div>
       </div>
 
-      <div className="stats-grid">
+      <div className="stats-grid work-queue-stats-grid">
         {spotlightStats.map((stat) => (
           <button
-            key={stat.label}
+            key={stat.key}
             type="button"
-            className="card stat-card work-queue-stat"
+            className={`card stat-card work-queue-stat ${filter === stat.key ? 'work-queue-stat-active' : ''}`}
             onClick={() => setFilter(stat.key)}
           >
             <div className="stat-label">{stat.label}</div>
@@ -513,125 +667,195 @@ export default function WorkQueue() {
         ))}
       </div>
 
-      <Card title="Action Filters">
-        <div className="quote-follow-up-summary">
-          {FILTERS.map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              className={`quote-filter-chip ${filter === value ? 'quote-filter-active' : ''}`}
-              onClick={() => setFilter(value)}
-            >
-              {label} {filterCounts[value] || 0}
-            </button>
-          ))}
+      <Card title="Desk Controls">
+        <div className="work-queue-toolbar">
+          <div className="quote-follow-up-summary">
+            {DESK_FILTERS.map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={`quote-filter-chip ${filter === value ? 'quote-filter-active' : ''}`}
+                onClick={() => setFilter(value)}
+              >
+                {label} {value === 'all' ? filterCounts.all || 0 : filterCounts[value] || 0}
+              </button>
+            ))}
+          </div>
+          <label className="inline-checkbox">
+            <input type="checkbox" checked={hideCompleted} onChange={(event) => setHideCompleted(event.target.checked)} />
+            Hide completed
+          </label>
         </div>
       </Card>
 
-      <Card title="Recommended Next Steps">
-        {queueTodayResult ? (
-          <div className="settings-summary-box">
-            <div className="row-title">Today's collection work queued</div>
-            <div className="row-subtitle">
-              Queued {queueTodayResult.queued_count || 0} job{(queueTodayResult.queued_count || 0) === 1 ? '' : 's'}
-              {` | `}
-              Skipped {queueTodayResult.skipped_duplicate_count || 0} duplicate{(queueTodayResult.skipped_duplicate_count || 0) === 1 ? '' : 's'}
-              {` | `}
-              From {queueTodayResult.queueable_items || 0} queueable item{(queueTodayResult.queueable_items || 0) === 1 ? '' : 's'}
+      {selectedOpportunityIds.length > 0 ? (
+        <Card title="Selected Work">
+          <div className="work-queue-selected-bar">
+            <div>
+              <div className="row-title">
+                {selectedOpportunityIds.length} selected
+              </div>
+              <div className="panel-subtitle">{selectedSummary || 'Selected work items are ready for action.'}</div>
+            </div>
+            <div className="work-queue-selected-actions">
+              <Button size="sm" onClick={handleBulkPrepare} loading={bulkPrepareMutation.isPending}>
+                Prepare Workspace
+              </Button>
+              <Button size="sm" variant="secondary" onClick={handleMarkReviewed} loading={markReviewedMutation.isPending}>
+                Mark Reviewed
+              </Button>
+              <Button size="sm" variant="secondary" onClick={handleRefreshIntelligence} loading={refreshIntelligenceMutation.isPending}>
+                Refresh Intelligence
+              </Button>
+              <Button size="sm" variant="secondary" onClick={() => setSelectedOpportunityIds([])}>
+                Clear Selection
+              </Button>
             </div>
           </div>
-        ) : null}
-        {(collectionSummary.tracked_total || backgroundJobQuery.data || queueTodayResult) ? (
-          <div className="settings-summary-box">
-            <div className="row-title">Collection Activity</div>
-            <div className="row-subtitle">
-              Queued {collectionSummary.queued || 0}
-              {` | `}
-              Running {collectionSummary.running || 0}
-              {` | `}
-              Completed {collectionSummary.completed || 0}
-              {` | `}
-              Failed {collectionSummary.failed || 0}
-              {` | `}
-              Skipped {queueTodayResult?.skipped_duplicate_count || 0}
-            </div>
-            {backgroundJobQuery.data ? (
-              <div className="panel-subtitle">
-                Latest queued job: {String(backgroundJobQuery.data.status || '').toUpperCase() || 'QUEUED'}
-                {backgroundJobQuery.data.progress?.current_label ? ` | ${backgroundJobQuery.data.progress.current_label}` : ''}
-                {backgroundJobQuery.data.progress?.percent !== undefined ? ` | ${backgroundJobQuery.data.progress.percent}%` : ''}
+        </Card>
+      ) : null}
+
+      {(queueTodayResult || collectionSummary.tracked_total || backgroundJobQuery.data) ? (
+        <Card title="Collection Activity">
+          <div className="work-queue-activity-grid">
+            {queueTodayResult ? (
+              <div className="settings-summary-box">
+                <div className="row-title">Latest queue run</div>
+                <div className="row-subtitle">
+                  Queued {queueTodayResult.queued_count || 0}
+                  {' | '}
+                  Skipped {queueTodayResult.skipped_duplicate_count || 0}
+                  {' | '}
+                  Considered {queueTodayResult.queueable_items || 0}
+                </div>
               </div>
             ) : null}
+            <div className="settings-summary-box">
+              <div className="row-title">Background jobs</div>
+              <div className="row-subtitle">
+                Queued {collectionSummary.queued || 0}
+                {' | '}
+                Running {collectionSummary.running || 0}
+                {' | '}
+                Completed {collectionSummary.completed || 0}
+                {' | '}
+                Failed {collectionSummary.failed || 0}
+              </div>
+              {backgroundJobQuery.data ? (
+                <div className="panel-subtitle">
+                  Latest job: {String(backgroundJobQuery.data.status || '').toUpperCase()}
+                  {backgroundJobQuery.data.progress?.current_label ? ` | ${backgroundJobQuery.data.progress.current_label}` : ''}
+                </div>
+              ) : null}
+            </div>
           </div>
-        ) : null}
+        </Card>
+      ) : null}
+
+      <Card title="My Work">
         {visibleCards.length === 0 ? (
           <EmptyState
-            title="No work items match this filter"
+            title="No work items match this view"
             subtitle="Try another filter or refresh the queue."
           />
         ) : (
-          <div className="work-queue-list">
-            {visibleCards.map((card, index) => {
-              const item = card.item
-              const queueState = item.queue_state || {}
-              const actionMeta = primaryActionMeta(item)
-              const recommendedAction = recommendedActionLink(item)
-              const isRunning = String(card.statusLabel || '').toUpperCase() === 'RUNNING'
-              const progress = queueState.progress?.percent
-              const group = card.group
-              const contextTitle = group?.opportunity?.title || item.opportunity?.title || item.title
-              const contextMeta = compactMeta([
-                item.opportunity?.source,
-                item.meta?.nsn,
-                item.opportunity?.solicitation_number,
-                item.opportunity?.agency,
-                item.meta?.company_name,
-              ])
-              const explanation = [
-                item.subtitle,
-                isRunning && queueState.progress?.current_label ? queueState.progress.current_label : '',
-                card.kind === 'failed' ? (queueState.error || 'Collection job failed and needs attention.') : '',
-              ].filter(Boolean).join(' | ')
-              const secondaryText = group?.additionalItems?.length
-                ? `Also needs attention: ${group.additionalItems.map((entry) => TYPE_LABELS[entry.type] || entry.type).join(', ')}.`
-                : ''
+          <div className="work-queue-sections">
+            {DESK_SECTIONS.filter((section) => !(hideCompleted && section === 'done') && (filter === 'all' || filter === section)).map((section) => {
+              const sectionCards = cardsBySection[section] || []
+              if (sectionCards.length === 0) return null
               return (
-                <div key={`${card.kind}-${item.id}-${index}`} className={`work-queue-item work-queue-${String(item.priority || '').toLowerCase()} work-queue-item-spotlight`}>
-                  <div className="work-queue-item-main">
-                    <div className="work-queue-item-header">
-                      <Badge label={card.statusLabel} variant={card.kind === 'failed' ? 'error' : (isRunning ? 'warning' : (PRIORITY_VARIANT[item.priority] || 'default'))} />
-                      <Badge label={card.bucketLabel} variant="info" />
-                      <Badge label={TYPE_LABELS[item.type] || item.type} variant="default" />
-                      {item.due_at ? <span className="row-subtitle">Due {formatDate(item.due_at)}</span> : null}
-                      {isRunning && progress !== undefined ? <span className="row-subtitle">{progress}%</span> : null}
+                <section key={section} className="work-queue-section">
+                  <div className="work-queue-section-header">
+                    <div>
+                      <div className="row-title">{DESK_LABELS[section]}</div>
+                      <div className="panel-subtitle">{DESK_SUBTITLES[section]}</div>
                     </div>
-                    <div className="row-title">{contextTitle}</div>
-                    <div className="panel-subtitle">{explanation || actionMeta.detail}</div>
-                    <div className="row-subtitle">{contextMeta}</div>
-                    <div className="work-queue-next-step">
-                      <div className="row-title">{actionMeta.heading}</div>
-                      <div className="panel-subtitle">{actionMeta.detail}</div>
-                    </div>
-                    {secondaryText ? <div className="panel-subtitle">{secondaryText}</div> : null}
+                    <Badge label={`${sectionCards.length}`} variant="default" />
                   </div>
-                  <div className="work-queue-actions">
-                    <Link className="btn btn-sm" to={recommendedAction.to}>
-                      {recommendedAction.label}
-                    </Link>
-                    {card.kind === 'failed' && queueBackgroundMutation.isPending === false && ['AWARDEE_ENRICHMENT_READY', 'NSN_INTELLIGENCE_REFRESH'].includes(item.type) ? (
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={() => queueBackgroundMutation.mutate(item)}
-                      >
-                        Retry Job
-                      </Button>
-                    ) : null}
-                    <Link className="row-subtitle" to={item.action_url}>
-                      Open workspace
-                    </Link>
+                  <div className="work-queue-list">
+                    {sectionCards.map((card, index) => {
+                      const item = card.item
+                      const queueState = item.queue_state || {}
+                      const actionMeta = primaryActionMeta(item)
+                      const recommendedAction = recommendedActionLink(item)
+                      const isRunning = String(card.statusLabel || '').toUpperCase() === 'RUNNING'
+                      const progress = queueState.progress?.percent
+                      const group = card.group
+                      const opportunityId = getOpportunityIdFromCard(card)
+                      const isSelected = opportunityId ? selectedOpportunityIds.includes(opportunityId) : false
+                      const contextTitle = group?.opportunity?.title || item.opportunity?.title || item.title
+                      const contextMeta = compactMeta([
+                        item.opportunity?.source,
+                        item.meta?.nsn,
+                        item.opportunity?.solicitation_number,
+                        item.opportunity?.agency,
+                        item.meta?.company_name,
+                      ])
+                      const explanation = [
+                        item.subtitle,
+                        item.readiness?.summary || '',
+                        isRunning && queueState.progress?.current_label ? queueState.progress.current_label : '',
+                        card.kind === 'failed' ? (queueState.error || 'Collection job failed and needs attention.') : '',
+                      ].filter(Boolean).join(' | ')
+                      const secondaryText = group?.additionalItems?.length
+                        ? `Also needs attention: ${group.additionalItems.map((entry) => TYPE_LABELS[entry.type] || entry.type).join(', ')}.`
+                        : ''
+                      return (
+                        <div
+                          key={`${card.kind}-${item.id}-${index}`}
+                          className={`work-queue-item work-queue-${String(item.priority || '').toLowerCase()} work-queue-item-spotlight ${isSelected ? 'work-queue-item-selected' : ''}`}
+                        >
+                          <div className="work-queue-item-select">
+                            {opportunityId ? (
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => toggleSelection(card)}
+                                aria-label={`Select ${contextTitle}`}
+                              />
+                            ) : null}
+                          </div>
+                          <div className="work-queue-item-main">
+                            <div className="work-queue-item-header">
+                              <Badge label={card.statusLabel} variant={card.kind === 'failed' ? 'error' : (isRunning ? 'warning' : (PRIORITY_VARIANT[item.priority] || 'default'))} />
+                              <Badge label={DESK_LABELS[card.deskStatus]} variant="info" />
+                              <Badge label={TYPE_LABELS[item.type] || item.type} variant="default" />
+                              {item.due_at ? <span className="row-subtitle">Due {formatDate(item.due_at)}</span> : null}
+                              {isRunning && progress !== undefined ? <span className="row-subtitle">{progress}%</span> : null}
+                            </div>
+                            <div className="row-title">{contextTitle}</div>
+                            <div className="panel-subtitle">{explanation || actionMeta.detail}</div>
+                            <div className="row-subtitle">{contextMeta}</div>
+                            <div className="work-queue-next-step">
+                              <div className="row-title">{actionMeta.heading}</div>
+                              <div className="panel-subtitle">
+                                {[actionMeta.detail, item.readiness?.next_actions?.[0]].filter(Boolean).join(' | ')}
+                              </div>
+                            </div>
+                            {secondaryText ? <div className="panel-subtitle">{secondaryText}</div> : null}
+                          </div>
+                          <div className="work-queue-actions">
+                            <Link className="btn btn-sm" to={recommendedAction.to}>
+                              {recommendedAction.label}
+                            </Link>
+                            {card.kind === 'failed' && ['AWARDEE_ENRICHMENT_READY', 'NSN_INTELLIGENCE_REFRESH'].includes(item.type) ? (
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={() => queueBackgroundMutation.mutate(item)}
+                              >
+                                Retry Failed Job
+                              </Button>
+                            ) : null}
+                            <Link className="row-subtitle" to={item.action_url}>
+                              Open workspace
+                            </Link>
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
-                </div>
+                </section>
               )
             })}
           </div>

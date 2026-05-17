@@ -4,7 +4,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_db
-from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
+from app.services.ingest_enrichment import run_part_finder_enrichment_for_opportunity
 from app.services.part_finder import find_part_for_nsn, find_part_for_opportunity, find_parts_batch
 
 router = APIRouter(prefix="/api/parts", tags=["part-finder"])
@@ -28,16 +28,17 @@ def refresh_part_for_opportunity(
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
 ):
-    result = enrich_dibbs_opportunities_after_ingest(
-        db,
-        [opportunity_id],
-        organization_id=getattr(current_org, "id", None),
-        max_items=1,
-        queue_nsn_build=False,
-    )
-    if result.get("errors") and not result.get("items"):
-        raise HTTPException(status_code=400, detail=result["errors"][0].get("error") or "Part Finder refresh failed")
-    return result
+    try:
+        item = run_part_finder_enrichment_for_opportunity(
+            db,
+            opportunity_id,
+            organization_id=getattr(current_org, "id", None),
+            force_wbparts_refresh=True,
+        )
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "completed", "processed": 1, "items": [item], "errors": []}
 
 
 @router.get("/nsn/{nsn}")

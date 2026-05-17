@@ -41,6 +41,14 @@ def _compact_nsn(nsn: str | None) -> str:
     return re.sub(r"\D+", "", nsn or "")
 
 
+def _matches_known_nsn(value: str | None, nsn: str | None) -> bool:
+    text = _clean(value, 120)
+    if not text or not nsn:
+        return False
+    compact = _compact_nsn(text)
+    return bool(compact and compact == _compact_nsn(nsn))
+
+
 def _dedupe(values: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -212,7 +220,7 @@ def build_nsn_research_target(db: Session, opp: Opportunity) -> dict[str, Any]:
         approved_names.extend(hints["manufacturer_names"])
         approved_cages.extend(hints["manufacturer_cages"])
 
-    part_numbers = [part for part in _dedupe(part_numbers) if _looks_like_part_number(part)]
+    part_numbers = [part for part in _dedupe(part_numbers) if _looks_like_part_number(part) and not _matches_known_nsn(part, nsn)]
 
     keywords = _dedupe(
         [nsn, _compact_nsn(nsn), fsc]

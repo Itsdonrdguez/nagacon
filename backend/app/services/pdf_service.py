@@ -4,6 +4,7 @@ import json
 import mimetypes
 import re
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -16,6 +17,7 @@ from playwright.sync_api import sync_playwright
 from app.core.config import settings
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
+from app.services.app_settings_service import get_setting
 from app.services.document_pipeline import process_opportunity_documents
 from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
 from app.services.storage import delete_reference, ensure_dir, file_exists, storage_root, store_bytes, store_text
@@ -38,6 +40,15 @@ def _safe_filename(s: str) -> str:
 
 def _normalize_source_url(url: str | None) -> str:
     return (url or "").strip()
+
+
+def _effective_pdf_download_base_dir(db: Session, opp: Opportunity, explicit_base_dir: str | None = None) -> str | None:
+    if explicit_base_dir and str(explicit_base_dir).strip():
+        return str(explicit_base_dir).strip()
+    org_id = getattr(opp, "organization_id", None)
+    configured = get_setting(db, "pdf_download_path", default="", organization_id=org_id) or ""
+    clean = str(configured).strip()
+    return clean or None
 
 
 def _matching_file_records(
@@ -333,6 +344,61 @@ def _save_downloaded_file(
     return 1, filename
 
 
+def _save_text_file_record(
+    db: Session,
+    opp: Opportunity,
+    out_dir: Path,
+    filename: str,
+    source_url: str | None,
+    text: str,
+    file_type: str,
+    parsed_metadata: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    filename = _safe_filename(filename)
+    matching_records = _matching_file_records(db, opp.id, filename, source_url)
+    existing = None
+    if matching_records:
+        existing = sorted(matching_records, key=_record_sort_key, reverse=True)[0]
+        existing = _collapse_duplicate_file_records(db, existing, matching_records)
+    if existing is not None and file_exists(existing.file_path):
+        existing.file_type = file_type
+        existing.source_url = source_url or existing.source_url
+        existing.filename = filename
+        existing.extracted_text = text or existing.extracted_text
+        if parsed_metadata:
+            existing.parsed_metadata = {**(getattr(existing, "parsed_metadata", None) or {}), **parsed_metadata}
+        db.add(existing)
+        db.commit()
+        return 0, filename
+
+    fp = out_dir / filename
+    stored_ref = store_text(fp, text, encoding="utf-8")
+    if existing is not None:
+        existing.file_type = file_type
+        existing.source_url = source_url
+        existing.file_path = stored_ref
+        existing.extracted_text = text
+        if parsed_metadata:
+            existing.parsed_metadata = {**(getattr(existing, "parsed_metadata", None) or {}), **parsed_metadata}
+        db.add(existing)
+    else:
+        db.add(
+            OpportunityFile(
+                organization_id=getattr(opp, "organization_id", None),
+                opportunity_id=opp.id,
+                file_type=file_type,
+                filename=filename,
+                source_url=source_url,
+                file_path=stored_ref,
+                extracted_text=text,
+                parsed_metadata=parsed_metadata or None,
+                created_at=datetime.utcnow(),
+            )
+        )
+    db.commit()
+    return 1, filename
+
+
 def _write_debug_log(out_dir: Path, opp: Opportunity, payload: dict) -> str:
     ensure_dir(out_dir)
     sol_clean = _safe_filename(opp.solicitation_number or f"opportunity_{opp.id}")
@@ -619,25 +685,134 @@ def _collect_sam_file_candidates(opp: Opportunity) -> list[dict[str, str]]:
     return _dedupe_candidates(candidates)
 
 
+def _is_url_like(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def _clean_notice_text(value: Any) -> str:
+    text = str(value or "")
+    text = unescape(text)
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = text.replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+def _extract_notice_body(payload: dict[str, Any]) -> str:
+    def _usable_notice_text(value: str) -> str:
+        cleaned = _clean_notice_text(value)
+        if re.fullmatch(r"[a-f0-9]{32}", cleaned, flags=re.IGNORECASE):
+            return ""
+        return cleaned
+
+    preferred_keys = (
+        "descriptionText",
+        "description",
+        "noticeText",
+        "body",
+        "content",
+        "html",
+        "message",
+    )
+    for key in preferred_keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip() and not _is_url_like(value):
+            cleaned = _usable_notice_text(value)
+            if cleaned:
+                return cleaned
+
+    for key, value in payload.items():
+        if isinstance(value, str) and any(tok in key.lower() for tok in ("description", "notice", "body", "content")) and not _is_url_like(value):
+            cleaned = _usable_notice_text(value)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _build_sam_notice_text(opp: Opportunity, detail_payload: dict[str, Any]) -> str:
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
+    lines: list[str] = []
+
+    def add(label: str, value: Any) -> None:
+        text = _clean_notice_text(value)
+        if text:
+            lines.append(f"{label}: {text}")
+
+    add("Title", getattr(opp, "title", None) or raw_payload.get("title"))
+    add("Solicitation Number", getattr(opp, "solicitation_number", None) or raw_payload.get("solicitationNumber"))
+    add("Agency", raw_payload.get("fullParentPathName"))
+    add("Set-Aside", raw_payload.get("typeOfSetAsideDescription") or raw_payload.get("typeOfSetAside"))
+    add("Response Deadline", raw_payload.get("responseDeadLine"))
+    add("NAICS", raw_payload.get("naicsCode"))
+    add("FSC", raw_payload.get("classificationCode"))
+
+    place = raw_payload.get("placeOfPerformance") if isinstance(raw_payload.get("placeOfPerformance"), dict) else {}
+    place_bits = [
+        (((place.get("city") or {}) if isinstance(place.get("city"), dict) else {}).get("name")),
+        (((place.get("state") or {}) if isinstance(place.get("state"), dict) else {}).get("name")),
+        place.get("zip"),
+        (((place.get("country") or {}) if isinstance(place.get("country"), dict) else {}).get("name")),
+    ]
+    add("Place of Performance", ", ".join(str(bit).strip() for bit in place_bits if bit))
+
+    contacts = raw_payload.get("pointOfContact")
+    if isinstance(contacts, list) and contacts:
+        contact_lines: list[str] = []
+        for contact in contacts:
+            if not isinstance(contact, dict):
+                continue
+            parts = [contact.get("fullName"), contact.get("email"), contact.get("phone")]
+            joined = " | ".join(str(part).strip() for part in parts if part)
+            if joined:
+                contact_lines.append(joined)
+        if contact_lines:
+            lines.append("Contacts:\n" + "\n".join(contact_lines))
+
+    notice_text = _extract_notice_body(detail_payload) or _extract_notice_body(raw_payload)
+    if notice_text:
+        lines.append("Notice Description:\n" + notice_text)
+
+    resource_links = []
+    for key in ("resourceLinks", "attachments", "attachmentLinks", "fileLinks", "links"):
+        for item in _extract_urlish_candidates(raw_payload.get(key), default_label=key):
+            resource_links.append(f"- {item.get('label') or item.get('url')}: {item.get('url')}")
+        for item in _extract_urlish_candidates(detail_payload.get(key), default_label=key):
+            resource_links.append(f"- {item.get('label') or item.get('url')}: {item.get('url')}")
+    if raw_payload.get("additionalInfoLink"):
+        resource_links.append(f"- Additional Info: {raw_payload.get('additionalInfoLink')}")
+    if raw_payload.get("uiLink"):
+        resource_links.append(f"- SAM Workspace: {raw_payload.get('uiLink')}")
+    if resource_links:
+        lines.append("Reference Links:\n" + "\n".join(dict.fromkeys(resource_links)))
+
+    return "\n\n".join(line for line in lines if line).strip()
+
+
 def _collect_sam_file_candidates_from_page(opp: Opportunity) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-            page.goto(opp.url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
-            rows = page.eval_on_selector_all(
-                "app-attachments a[href], #attachments a[href], #links-attachments a[href], #files a[href]",
-                "els => els.map(el => ({ href: el.href, text: (el.innerText || '').trim() }))",
-            )
-            for row in rows:
-                href = row.get("href")
-                text = row.get("text")
-                if href:
-                    candidates.append({"url": str(href), "label": str(text or href)})
-        finally:
-            browser.close()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.goto(opp.url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(4000)
+                rows = page.eval_on_selector_all(
+                    "app-attachments a[href], #attachments a[href], #links-attachments a[href], #files a[href]",
+                    "els => els.map(el => ({ href: el.href, text: (el.innerText || '').trim() }))",
+                )
+                for row in rows:
+                    href = row.get("href")
+                    text = row.get("text")
+                    if href:
+                        candidates.append({"url": str(href), "label": str(text or href)})
+            finally:
+                browser.close()
+    except Exception:
+        return []
     return _dedupe_candidates(candidates)
 
 
@@ -685,7 +860,7 @@ def download_pdfs_for_opportunity(
     sol = opp.solicitation_number or f"opportunity_{opp.id}"
     sol_compact = _compact_solicitation(opp.solicitation_number) or ""
     folder = _safe_dirname(sol)
-    out_dir = ensure_dir(storage_root(base_dir) / folder / "documents")
+    out_dir = ensure_dir(storage_root(_effective_pdf_download_base_dir(db, opp, base_dir)) / folder / "documents")
 
     created = 0
     skipped = 0
@@ -698,11 +873,11 @@ def download_pdfs_for_opportunity(
     downloaded_files: list[dict[str, str]] = []
     detail_url = None
     snapshot = None
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
 
     if (opp.source or "").upper() == "SAM":
-        sam_candidates = _dedupe_candidates(
-            _collect_sam_file_candidates(opp) + _collect_sam_file_candidates_from_page(opp)
-        )
+        detail_payload = _fetch_sam_notice_detail(opp)
+        sam_candidates = _collect_sam_file_candidates(opp)
         if not sam_candidates:
             official_pdf_error = "no_sam_attachments_found"
             errors.append("SAM opportunity did not expose any attachment/resource links.")
@@ -746,6 +921,36 @@ def download_pdfs_for_opportunity(
                     "file_type": "SAM_ATTACHMENT",
                 }
             )
+
+        notice_text = _build_sam_notice_text(opp, detail_payload)
+        if notice_text:
+            notice_filename = f"{_safe_filename(sol)}_sam_notice.txt"
+            created_now, saved_name = _save_text_file_record(
+                db,
+                opp,
+                out_dir,
+                notice_filename,
+                raw_payload.get("uiLink") or opp.url,
+                notice_text,
+                "SAM_NOTICE",
+                parsed_metadata={
+                    "source_basis": "sam_notice_detail",
+                    "document_type": "SOLICITATION",
+                    "notice_id": raw_payload.get("noticeId"),
+                },
+            )
+            created += created_now
+            if created_now == 0:
+                skipped += 1
+            downloaded_files.append(
+                {
+                    "filename": saved_name,
+                    "source_url": raw_payload.get("uiLink") or opp.url,
+                    "file_type": "SAM_NOTICE",
+                }
+            )
+        elif not downloaded_files:
+            errors.append("SAM notice text could not be built from notice detail or raw payload.")
     else:
         detail_url = _preferred_dibbs_detail_pdf_url(opp) if prefer_dibbs_solicitation_detail else None
 

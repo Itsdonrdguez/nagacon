@@ -116,6 +116,8 @@ def _classify_document(file_record: OpportunityFile, text: str) -> str:
         return "VENDOR_QUOTE"
     if file_type == "PDF_FALLBACK_SNAPSHOT":
         return "SOLICITATION_SNAPSHOT"
+    if file_type == "SAM_NOTICE":
+        return "SOLICITATION"
     if "REQUEST FOR QUOTATIONS" in upper or "SOLICITATION" in upper or "STANDARD FORM 18" in upper:
         return "SOLICITATION"
     return "ATTACHMENT"
@@ -234,7 +236,49 @@ def _summarize_sam_amendment_changes(text: str) -> list[str]:
     return changes
 
 
+def _sam_primary_contact(raw_payload: dict[str, Any]) -> dict[str, str | None]:
+    contacts = raw_payload.get("pointOfContact")
+    if not isinstance(contacts, list):
+        return {"name": None, "email": None, "phone": None, "summary": None}
+    ranked = sorted(
+        [item for item in contacts if isinstance(item, dict)],
+        key=lambda item: (0 if str(item.get("type") or "").lower() == "primary" else 1, str(item.get("fullName") or "")),
+    )
+    if not ranked:
+        return {"name": None, "email": None, "phone": None, "summary": None}
+    contact = ranked[0]
+    name = _safe_text(contact.get("fullName")) or None
+    email = _safe_text(contact.get("email")) or None
+    phone = _safe_text(contact.get("phone")) or None
+    summary = " | ".join(part for part in [name, phone, email] if part) or None
+    return {"name": name, "email": email, "phone": phone, "summary": summary}
+
+
+def _sam_place_of_performance(raw_payload: dict[str, Any]) -> str | None:
+    place = raw_payload.get("placeOfPerformance")
+    if not isinstance(place, dict):
+        return None
+    city = ((place.get("city") or {}) if isinstance(place.get("city"), dict) else {}).get("name")
+    state = ((place.get("state") or {}) if isinstance(place.get("state"), dict) else {}).get("name")
+    zip_code = place.get("zip")
+    country = ((place.get("country") or {}) if isinstance(place.get("country"), dict) else {}).get("name")
+    parts = [str(part).strip() for part in [city, state, zip_code, country] if str(part or "").strip()]
+    return ", ".join(parts) if parts else None
+
+
+def _sam_source_coverage(files: list[OpportunityFile]) -> str:
+    types = {str(getattr(file, "file_type", "") or "").upper() for file in files}
+    if types == {"SAM_NOTICE"}:
+        return "Notice only"
+    if "STATEMENT_OF_WORK" in types or "AMENDMENT" in types:
+        return "Notice plus supporting attachments"
+    if "SAM_ATTACHMENT" in types:
+        return "Notice plus attachments"
+    return "Document set loaded"
+
+
 def _build_sam_document_set_rollup(opp: Opportunity, files: list[OpportunityFile]) -> dict[str, Any]:
+    raw_payload = dict(getattr(opp, "raw_payload", None) or {})
     inventory: list[dict[str, Any]] = []
     evaluation_factors: list[str] = []
     required_attachments: list[str] = []
@@ -307,14 +351,15 @@ def _build_sam_document_set_rollup(opp: Opportunity, files: list[OpportunityFile
         "agency": getattr(opp, "agency", None),
         "naics_code": getattr(opp, "naics_code", getattr(opp, "naics", None)),
         "set_aside_type": getattr(opp, "set_aside_type", getattr(opp, "set_aside", None)),
-        "place_of_performance": getattr(opp, "place_of_performance", None),
+        "place_of_performance": getattr(opp, "place_of_performance", None) or _sam_place_of_performance(raw_payload),
         "return_by": getattr(opp, "due_at", None).isoformat() if getattr(opp, "due_at", None) else None,
-        "submission_office_hint": None,
-        "solicitation_contact_name": None,
-        "solicitation_contact_email": None,
-        "solicitation_contact_phone": None,
+        "submission_office_hint": _sam_primary_contact(raw_payload).get("summary"),
+        "solicitation_contact_name": _sam_primary_contact(raw_payload).get("name"),
+        "solicitation_contact_email": _sam_primary_contact(raw_payload).get("email"),
+        "solicitation_contact_phone": _sam_primary_contact(raw_payload).get("phone"),
         "period_of_performance": None,
         "page_limits": [],
+        "source_coverage": _sam_source_coverage(files),
     }
 
     merge_keys = [
@@ -353,9 +398,9 @@ def _build_sam_document_set_rollup(opp: Opportunity, files: list[OpportunityFile
     scope_map = {
         "scope_summary": [
             f"Service acquisition for {getattr(opp, 'title', None) or 'the stated requirement'}.",
-            f"Place of performance: {merged_fields.get('place_of_performance') or 'Not clearly stated yet'}.",
-            f"Period of performance: {merged_fields.get('period_of_performance') or 'Not clearly stated yet'}.",
-            "Performance-based work statement detected." if any(item.get("document_type") == "STATEMENT_OF_WORK" for item in inventory) else "No dedicated PWS/SOW file has been identified yet.",
+            f"Place of performance: {merged_fields.get('place_of_performance') or 'Not confirmed from the loaded notice/package yet'}.",
+            f"Period of performance: {merged_fields.get('period_of_performance') or 'Not confirmed from the loaded notice/package yet'}.",
+            "Performance-based work statement detected." if any(item.get("document_type") == "STATEMENT_OF_WORK" for item in inventory) else ("Only the SAM notice is loaded so far; no dedicated PWS/SOW file has been identified yet." if merged_fields.get("source_coverage") == "Notice only" else "No dedicated PWS/SOW file has been identified yet."),
         ],
         "performance_signals": [
             item for item in [
@@ -363,6 +408,7 @@ def _build_sam_document_set_rollup(opp: Opportunity, files: list[OpportunityFile
                 "Past performance evidence is likely part of the evaluation." if "PAST PERFORMANCE" in evaluation_factors else "",
                 "Staffing or key personnel inputs may be required." if any(factor in evaluation_factors for factor in ["KEY PERSONNEL", "STAFFING PLAN"]) else "",
                 "Quality or management approach signals are present." if any(factor in evaluation_factors for factor in ["QUALITY CONTROL", "MANAGEMENT APPROACH"]) else "",
+                "Only the SAM notice is loaded so far, so performance details may still be missing." if merged_fields.get("source_coverage") == "Notice only" else "",
             ] if item
         ],
     }
@@ -663,6 +709,13 @@ def _build_compliance_artifact_content(db: Session, opp: Opportunity) -> dict[st
                 continue
             if value not in (None, "", []) and not compliance_fields.get(key):
                 compliance_fields[key] = value
+    if compliance_fields:
+        extracted_facts = _extract_facts(compliance_fields)
+    if compliance_fields and primary_text:
+        requirements = _extract_required_actions(compliance_fields, primary_text) or requirements
+        missing_information = _extract_missing_information(compliance_fields, primary_text)
+        review_flags = _extract_review_flags(compliance_fields, primary_text)
+        vendor_request_items = _extract_vendor_request_items(compliance_fields, primary_text) or vendor_request_items
     evaluation_factors = sam_document_set.get("evaluation_factors") or []
     required_attachments = sam_document_set.get("required_attachments") or []
     return {

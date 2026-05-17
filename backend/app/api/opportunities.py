@@ -5,12 +5,19 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.pipeline_item import PipelineItem
+from app.models.search_job import SearchJob
 from app.repositories.opportunities import OpportunityRepository
 from app.schemas.opportunity import IngestResult, OpportunityCreate, OpportunityRead, OpportunityUpdate, RawOpportunity
 from app.services.search_jobs import start_search_job
 from app.services.opportunities.ingest import ingest_raw_opportunities
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
+
+
+def _parse_code_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
 def _opportunity_repo(db: Session, organization_id: int | None):
@@ -52,6 +59,8 @@ def list_opportunities(
     nsn: str | None = None,
     agency: str | None = None,
     state: str | None = None,
+    naics_codes: str | None = None,
+    fsc_codes: str | None = None,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
 ):
@@ -66,6 +75,8 @@ def list_opportunities(
         nsn=nsn,
         agency=agency,
         state=state,
+        naics_codes=_parse_code_list(naics_codes),
+        fsc_codes=_parse_code_list(fsc_codes),
     )
     return _serialize_opportunities_with_pipeline(db, items, org_id)
 
@@ -81,6 +92,8 @@ def search_opportunities(
     nsn: str | None = None,
     agency: str | None = None,
     state: str | None = None,
+    naics_codes: str | None = None,
+    fsc_codes: str | None = None,
     sort_by: str | None = None,
     sort_order: str = "asc",
     db: Session = Depends(get_db),
@@ -97,6 +110,8 @@ def search_opportunities(
         nsn=nsn,
         agency=agency,
         state=state,
+        naics_codes=_parse_code_list(naics_codes),
+        fsc_codes=_parse_code_list(fsc_codes),
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -111,6 +126,99 @@ def search_opportunities(
 @router.get("/filters")
 def opportunity_filter_options(db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     return _opportunity_repo(db, getattr(current_org, "id", None)).filter_options()
+
+
+@router.post("/bulk/workspace-intake")
+def bulk_prepare_workspace(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    org_id = getattr(current_org, "id", None)
+    user_id = getattr(current_user, "id", None)
+    raw_ids = payload.get("opportunity_ids") or []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="opportunity_ids is required")
+
+    seen: set[int] = set()
+    opportunity_ids: list[int] = []
+    for raw_id in raw_ids[:100]:
+        try:
+            clean_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if clean_id in seen:
+            continue
+        seen.add(clean_id)
+        opportunity_ids.append(clean_id)
+
+    if not opportunity_ids:
+        raise HTTPException(status_code=400, detail="No valid opportunity ids were provided")
+
+    repo = _opportunity_repo(db, org_id)
+    opps = [repo.get(opportunity_id) for opportunity_id in opportunity_ids]
+    missing = [opportunity_ids[index] for index, opp in enumerate(opps) if not opp]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Opportunity not found: {missing[0]}")
+
+    active_jobs = (
+        db.query(SearchJob)
+        .filter(
+            SearchJob.kind == "workspace_intake",
+            SearchJob.status.in_(("queued", "running")),
+            SearchJob.organization_id == org_id if org_id is not None else SearchJob.organization_id.is_(None),
+        )
+        .all()
+    )
+    active_ids = {
+        int((job.payload or {}).get("opportunity_id"))
+        for job in active_jobs
+        if isinstance(job.payload, dict) and (job.payload or {}).get("opportunity_id") is not None
+    }
+
+    download_documents = bool(payload.get("download_documents", True))
+    run_usaspending = bool(payload.get("run_usaspending", True))
+
+    queued_jobs: list[dict[str, object]] = []
+    skipped_duplicates: list[int] = []
+    archived_skips: list[int] = []
+    for opp in opps:
+        if getattr(opp, "opportunity_lifecycle", None) == "ARCHIVED":
+            archived_skips.append(int(opp.id))
+            continue
+        if int(opp.id) in active_ids:
+            skipped_duplicates.append(int(opp.id))
+            continue
+        job = start_search_job(
+            "workspace_intake",
+            {
+                "opportunity_id": int(opp.id),
+                "organization_id": org_id,
+                "user_id": user_id,
+                "download_documents": download_documents,
+                "run_usaspending": run_usaspending,
+            },
+        )
+        queued_jobs.append(
+            {
+                "opportunity_id": int(opp.id),
+                "job_id": job.get("id"),
+                "status": job.get("status"),
+                "title": getattr(opp, "display_title", None) or getattr(opp, "title", None),
+            }
+        )
+
+    return {
+        "status": "ok",
+        "requested_count": len(opportunity_ids),
+        "queued_count": len(queued_jobs),
+        "queued_jobs": queued_jobs,
+        "skipped_duplicate_count": len(skipped_duplicates),
+        "skipped_duplicate_opportunity_ids": skipped_duplicates,
+        "archived_skip_count": len(archived_skips),
+        "archived_skip_opportunity_ids": archived_skips,
+    }
 
 
 @router.post("/{opportunity_id}/awardee-enrichment-job")

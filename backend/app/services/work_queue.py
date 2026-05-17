@@ -14,6 +14,7 @@ from app.models.pipeline_item import PipelineItem
 from app.models.search_job import SearchJob
 from app.models.vendor import VendorLead, VendorQuote
 from app.models.workspace import WorkspaceArtifact, WorkspaceTask
+from app.services.opportunity_brief import build_contract_brief, build_readiness_assessment
 from app.services.search_jobs import record_search_job, start_search_job
 from app.utils.opportunity_lifecycle import is_archived_opportunity
 
@@ -21,8 +22,8 @@ from app.utils.opportunity_lifecycle import is_archived_opportunity
 HIGH = "HIGH"
 MEDIUM = "MEDIUM"
 LOW = "LOW"
-QUEUEABLE_TYPES = {"AWARDEE_ENRICHMENT_READY", "NSN_INTELLIGENCE_REFRESH"}
-QUEUEABLE_JOB_KINDS = {"awardee_enrichment", "nsn_build"}
+QUEUEABLE_TYPES = {"CLOSED_WORKSPACE_PREP", "AWARDEE_ENRICHMENT_READY", "NSN_INTELLIGENCE_REFRESH"}
+QUEUEABLE_JOB_KINDS = {"workspace_intake", "awardee_enrichment", "nsn_build"}
 COMPLETED_QUEUE_COOLDOWN_HOURS = 12
 
 MISSION_BUCKET_LABELS = {
@@ -103,12 +104,45 @@ def _item(
     }
 
 
+def _readiness_for_opportunity(
+    opp: Opportunity,
+    *,
+    lead_count: int,
+    quote_count: int,
+    submission_package_count: int,
+    document_count: int,
+    open_task_count: int,
+    has_submission: bool,
+    nsn: str | None,
+) -> dict[str, Any]:
+    brief = build_contract_brief(
+        opp,
+        {"nsn": nsn},
+        document_count=document_count,
+        vendor_count=lead_count,
+        quote_count=quote_count,
+    )
+    return build_readiness_assessment(
+        opp,
+        document_count=document_count,
+        vendor_count=lead_count,
+        quote_count=quote_count,
+        submission_package_count=submission_package_count,
+        open_task_count=open_task_count,
+        has_nsn=bool(brief.get("nsn")),
+        has_set_aside=bool(brief.get("set_aside_type")),
+        has_submission=has_submission,
+    )
+
+
 def _mission_bucket(item_type: str) -> str:
     normalized = str(item_type or "").upper()
     if normalized in {"RFQ_CLOSING_SOON"}:
         return "due_soon"
     if normalized in {"MISSING_VENDOR_LEADS", "MISSING_PART_FINDER", "NSN_INTELLIGENCE_REFRESH"}:
         return "needs_suppliers"
+    if normalized in {"WORKSPACE_PREP_RUNNING"}:
+        return "submission_prep"
     if normalized in {"RFQ_NOT_SENT"}:
         return "rfq_not_sent"
     if normalized in {"QUOTE_FOLLOW_UP_DUE", "QUOTE_REQUESTED_NO_RESPONSE"}:
@@ -127,7 +161,7 @@ def _mission_bucket(item_type: str) -> str:
         "DIBBS_RFQ_PACKAGE_MISSING",
     }:
         return "submission_prep"
-    if normalized in {"AWARDEE_ENRICHMENT_READY"}:
+    if normalized in {"CLOSED_WORKSPACE_PREP", "AWARDEE_ENRICHMENT_READY"}:
         return "closed_intelligence"
     return "manual_review"
 
@@ -146,7 +180,7 @@ def _display_status(item_type: str, priority: str, *, queue_state: dict[str, Any
         return "OPEN"
     if normalized in {"QUOTE_FOLLOW_UP_DUE"}:
         return "FOLLOW-UP"
-    if normalized in {"AWARDEE_ENRICHMENT_READY"}:
+    if normalized in {"CLOSED_WORKSPACE_PREP", "AWARDEE_ENRICHMENT_READY"}:
         return "CLOSED"
     return "OPEN" if priority in {HIGH, MEDIUM, LOW} else "PENDING"
 
@@ -213,14 +247,11 @@ def _active_queueable_jobs(
     organization_id: int | None,
     user_id: int | None = None,
 ) -> dict[tuple[Any, ...], dict[str, Any]]:
-    query = db.query(SearchJob).filter(
-        SearchJob.status.in_(("queued", "running")),
-        SearchJob.kind.in_(("awardee_enrichment", "nsn_build")),
-    )
-    query = _scope_org(query, SearchJob, organization_id)
-    if user_id is not None:
-        query = query.filter(SearchJob.user_id == user_id)
-    rows = query.all()
+    rows = _active_queueable_job_rows(db, organization_id, user_id=user_id)
+    return _active_queueable_jobs_from_rows(rows)
+
+
+def _active_queueable_jobs_from_rows(rows: list[SearchJob]) -> dict[tuple[Any, ...], dict[str, Any]]:
     active: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
         payload = row.payload if isinstance(row.payload, dict) else {}
@@ -233,6 +264,21 @@ def _active_queueable_jobs(
             "progress": dict(row.progress or {}),
         }
     return active
+
+
+def _active_queueable_job_rows(
+    db: Session,
+    organization_id: int | None,
+    user_id: int | None = None,
+) -> list[SearchJob]:
+    query = db.query(SearchJob).filter(
+        SearchJob.status.in_(("queued", "running")),
+        SearchJob.kind.in_(("workspace_intake", "awardee_enrichment", "nsn_build")),
+    )
+    query = _scope_org(query, SearchJob, organization_id)
+    if user_id is not None:
+        query = query.filter(SearchJob.user_id == user_id)
+    return query.all()
 
 
 def _recent_completed_queueable_jobs(
@@ -317,7 +363,8 @@ def build_daily_work_queue(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     current_time = now or datetime.utcnow()
-    active_queueable_jobs = _active_queueable_jobs(db, organization_id, user_id=user_id)
+    active_job_rows = _active_queueable_job_rows(db, organization_id, user_id=user_id)
+    active_queueable_jobs = _active_queueable_jobs_from_rows(active_job_rows)
     recent_completed_jobs = _recent_completed_queueable_jobs(db, organization_id, user_id=user_id, now=current_time)
     recent_failed_jobs = _recent_failed_queueable_jobs(db, organization_id, user_id=user_id, now=current_time)
 
@@ -329,6 +376,17 @@ def build_daily_work_queue(
         .limit(limit)
         .all()
     )
+    active_workspace_ids = [
+        int((row.payload or {}).get("opportunity_id"))
+        for row in active_job_rows
+        if row.kind == "workspace_intake" and isinstance(row.payload, dict) and (row.payload or {}).get("opportunity_id") is not None
+    ]
+    existing_ids = {opp.id for opp in opportunities}
+    extra_ids = [opp_id for opp_id in active_workspace_ids if opp_id not in existing_ids]
+    if extra_ids:
+        extra_query = db.query(Opportunity).filter(Opportunity.id.in_(extra_ids))
+        extra_query = _scope_org(extra_query, Opportunity, organization_id)
+        opportunities.extend(extra_query.all())
     opp_by_id = {opp.id: opp for opp in opportunities}
     opp_ids = list(opp_by_id)
     if not opp_ids:
@@ -369,6 +427,7 @@ def build_daily_work_queue(
     in_progress_items: list[dict[str, Any]] = []
     recent_completed_items: list[dict[str, Any]] = []
     recent_failed_items: list[dict[str, Any]] = []
+    active_workspace_progress_ids: set[int] = set()
 
     for quote in quotes:
         opp = opp_by_id.get(quote.opportunity_id)
@@ -402,6 +461,16 @@ def build_daily_work_queue(
         days_left = _days_until(opp.due_at, current_time)
         is_open = days_left is None or days_left >= 0
         nsn = _extract_nsn(opp)
+        readiness = _readiness_for_opportunity(
+            opp,
+            lead_count=lead_counts.get(opp.id, 0),
+            quote_count=quote_counts.get(opp.id, 0),
+            submission_package_count=submission_package_counts.get(opp.id, 0),
+            document_count=document_counts.get(opp.id, 0),
+            open_task_count=open_task_counts.get(opp.id, 0),
+            has_submission=bool(submissions.get(opp.id)),
+            nsn=nsn,
+        )
         opportunity_quotes = [quote for quote in quotes if quote.opportunity_id == opp.id]
         requested_quotes = [quote for quote in opportunity_quotes if str(getattr(quote, "status", "") or "").strip().upper() == "REQUESTED"]
         received_quotes = [quote for quote in opportunity_quotes if str(getattr(quote, "status", "") or "").strip().upper() == "RECEIVED"]
@@ -417,7 +486,7 @@ def build_daily_work_queue(
                 opp,
                 f"{opp.solicitation_number} closes soon",
                 "Due today." if days_left == 0 else f"Due in {days_left} day{'s' if days_left != 1 else ''}.",
-                meta={"days_left": days_left},
+                meta={"days_left": days_left, "readiness": readiness},
                 due_at=opp.due_at,
             ))
 
@@ -435,6 +504,7 @@ def build_daily_work_queue(
                     "fsc": getattr(opp, "fsc", None),
                     "title": getattr(opp, "display_title", None) or opp.title,
                     "agency": getattr(opp, "agency", None),
+                    "readiness": readiness,
                 },
             ))
 
@@ -446,7 +516,7 @@ def build_daily_work_queue(
                 "Run Part Finder",
                 f"NSN {nsn} is available, but no Part Finder result is saved yet.",
                 action_label="Open Part Finder",
-                meta={"nsn": nsn},
+                meta={"nsn": nsn, "readiness": readiness},
             ))
 
         if is_open and lead_counts.get(opp.id, 0) > 0 and quote_counts.get(opp.id, 0) == 0:
@@ -457,7 +527,7 @@ def build_daily_work_queue(
                 f"Send RFQ to {lead_counts.get(opp.id, 0)} supplier{'s' if lead_counts.get(opp.id, 0) != 1 else ''}",
                 "Supplier candidates exist, but no RFQ request has been sent yet.",
                 action_label="Open RFQ Draft",
-                meta={"lead_count": lead_counts.get(opp.id, 0), "nsn": nsn},
+                meta={"lead_count": lead_counts.get(opp.id, 0), "nsn": nsn, "readiness": readiness},
                 due_at=opp.due_at,
             ))
 
@@ -468,7 +538,7 @@ def build_daily_work_queue(
                 opp,
                 "Build submission package",
                 "Quote records exist, but no submission package artifact has been saved.",
-                meta={"quote_count": quote_counts.get(opp.id, 0)},
+                meta={"quote_count": quote_counts.get(opp.id, 0), "readiness": readiness},
             ))
 
         if is_open and not_requested_quotes:
@@ -483,6 +553,7 @@ def build_daily_work_queue(
                     "quote_ids": [quote.id for quote in not_requested_quotes],
                     "quote_count": len(not_requested_quotes),
                     "nsn": nsn,
+                    "readiness": readiness,
                 },
                 due_at=opp.due_at,
             ))
@@ -498,6 +569,7 @@ def build_daily_work_queue(
                 meta={
                     "received_quote_count": len(received_quotes),
                     "selected_quote": has_selected_quote,
+                    "readiness": readiness,
                 },
                 due_at=opp.due_at,
             ))
@@ -512,7 +584,7 @@ def build_daily_work_queue(
                     "Start the proposal checklist",
                     "No proposal checklist artifact is saved for this SAM opportunity yet.",
                     action_label="Open Proposal Workspace",
-                    meta={"days_left": days_left},
+                    meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if checklist_counts.get(opp.id, 0) > 0 and compliance_matrix_counts.get(opp.id, 0) == 0:
@@ -523,7 +595,7 @@ def build_daily_work_queue(
                     "Build the compliance matrix",
                     "A proposal checklist exists, but the compliance matrix has not been generated yet.",
                     action_label="Open Proposal Workspace",
-                    meta={"days_left": days_left},
+                    meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if co_email_counts.get(opp.id, 0) == 0:
@@ -534,7 +606,7 @@ def build_daily_work_queue(
                     "Draft contracting officer outreach",
                     "No contracting officer email draft is saved yet for this SAM opportunity.",
                     action_label="Open CO Draft",
-                    meta={"days_left": days_left},
+                    meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if pipeline is None:
@@ -545,7 +617,7 @@ def build_daily_work_queue(
                     "Create a proposal workspace record",
                     "No proposal tracking record exists yet for this SAM opportunity.",
                     action_label="Open Workspace",
-                    meta={},
+                    meta={"readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if pipeline is not None and getattr(pipeline, "target_submit_date", None) is None:
@@ -556,7 +628,7 @@ def build_daily_work_queue(
                     "Set the target submit date",
                     "Proposal tracking exists, but the target submit date is still blank.",
                     action_label="Open Proposal Workspace",
-                    meta={"decision_status": getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None))},
+                    meta={"decision_status": getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None)), "readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if checklist_counts.get(opp.id, 0) > 0 and task_counts.get(opp.id, 0) == 0:
@@ -567,7 +639,7 @@ def build_daily_work_queue(
                     "Seed proposal tasks",
                     "The proposal checklist exists, but no workspace tasks have been created yet.",
                     action_label="Open Proposal Workspace",
-                    meta={"days_left": days_left},
+                    meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if pipeline is not None and open_task_counts.get(opp.id, 0) == 0 and getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None)) in {"IN_PROGRESS", "BID"}:
@@ -578,7 +650,7 @@ def build_daily_work_queue(
                     "Add active proposal tasks",
                     "This opportunity is in an active proposal stage, but there are no open workspace tasks right now.",
                     action_label="Open Proposal Workspace",
-                    meta={"days_left": days_left},
+                    meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
             if pipeline is not None and getattr(getattr(pipeline, "decision_status", None), "value", getattr(pipeline, "decision_status", None)) in {"IN_PROGRESS", "BID"} and submission_package_counts.get(opp.id, 0) == 0:
@@ -589,7 +661,7 @@ def build_daily_work_queue(
                     "Build the submission package",
                     "Proposal work is active, but no submission package artifact has been saved yet.",
                     action_label="Open Submission Package",
-                    meta={"days_left": days_left},
+                    meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
 
@@ -602,12 +674,35 @@ def build_daily_work_queue(
                     "Download the RFQ package",
                     "No RFQ package or document pipeline artifact is saved yet for this DIBBS opportunity.",
                     action_label="Open RFQ Package",
-                    meta={"days_left": days_left, "nsn": nsn},
+                    meta={"days_left": days_left, "nsn": nsn, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
 
         submission = submissions.get(opp.id)
         if days_left is not None and days_left < 0:
+            if (
+                document_counts.get(opp.id, 0) == 0
+                or submission_package_counts.get(opp.id, 0) == 0
+                or lead_counts.get(opp.id, 0) == 0
+                or (nsn and nsn_artifact_counts.get(opp.id, 0) == 0)
+            ):
+                items.append(_item(
+                    "CLOSED_WORKSPACE_PREP",
+                    MEDIUM,
+                    opp,
+                    "Prepare closed workspace intelligence",
+                    "This recently closed solicitation still needs documents, vendor extraction, and intelligence artifacts.",
+                    action_label="Queue Closed Prep",
+                    meta={
+                        "days_since_close": abs(days_left),
+                        "opportunity_fingerprint": _opportunity_fingerprint(opp, nsn),
+                        "missing_documents": document_counts.get(opp.id, 0) == 0,
+                        "missing_submission_package": submission_package_counts.get(opp.id, 0) == 0,
+                        "missing_vendor_leads": lead_counts.get(opp.id, 0) == 0,
+                        "missing_nsn_intelligence": bool(nsn) and nsn_artifact_counts.get(opp.id, 0) == 0,
+                        "readiness": readiness,
+                    },
+                ))
             candidate = _item(
                 "AWARDEE_ENRICHMENT_READY",
                 LOW,
@@ -619,11 +714,14 @@ def build_daily_work_queue(
                     "submission_status": getattr(submission, "status", None),
                     "days_since_close": abs(days_left),
                     "opportunity_fingerprint": _opportunity_fingerprint(opp, nsn),
+                    "readiness": readiness,
                 },
             )
             spec = _queue_job_spec(candidate, organization_id)
             signature = _job_signature(spec["kind"], spec["payload"]) if spec else None
             if signature and signature in active_queueable_jobs:
+                if spec and spec["kind"] == "workspace_intake":
+                    active_workspace_progress_ids.add(opp.id)
                 in_progress_items.append(
                     _decorate_mission_item(
                         {
@@ -673,7 +771,7 @@ def build_daily_work_queue(
                 "Refresh NSN intelligence",
                 f"NSN {nsn} has no saved intelligence artifact yet.",
                 action_label="Open NSN Intelligence",
-                meta={"nsn": nsn, "opportunity_fingerprint": _opportunity_fingerprint(opp, nsn)},
+                meta={"nsn": nsn, "opportunity_fingerprint": _opportunity_fingerprint(opp, nsn), "readiness": readiness},
             )
             spec = _queue_job_spec(candidate, organization_id)
             signature = _job_signature(spec["kind"], spec["payload"]) if spec else None
@@ -719,8 +817,98 @@ def build_daily_work_queue(
             else:
                 items.append(candidate)
 
+    for row in active_job_rows:
+        if row.kind != "workspace_intake" or not isinstance(row.payload, dict):
+            continue
+        opportunity_id = row.payload.get("opportunity_id")
+        try:
+            opportunity_id = int(opportunity_id)
+        except (TypeError, ValueError):
+            continue
+        if opportunity_id in active_workspace_progress_ids:
+            continue
+        opp = opp_by_id.get(opportunity_id)
+        if not opp:
+            continue
+        nsn = _extract_nsn(opp)
+        readiness = _readiness_for_opportunity(
+            opp,
+            lead_count=lead_counts.get(opp.id, 0),
+            quote_count=quote_counts.get(opp.id, 0),
+            submission_package_count=submission_package_counts.get(opp.id, 0),
+            document_count=document_counts.get(opp.id, 0),
+            open_task_count=open_task_counts.get(opp.id, 0),
+            has_submission=bool(submissions.get(opp.id)),
+            nsn=nsn,
+        )
+        days_left = _days_until(opp.due_at, current_time)
+        bucket = "closed_intelligence" if days_left is not None and days_left < 0 else "submission_prep"
+        in_progress_items.append(
+            _decorate_mission_item(
+                {
+                    **_item(
+                        "WORKSPACE_PREP_RUNNING",
+                        MEDIUM,
+                        opp,
+                        "Preparing workspace intelligence",
+                        "Documents, part intelligence, vendor leads, and workspace artifacts are being prepared in the background.",
+                        action_label="Open Workspace",
+                        meta={
+                            "nsn": nsn,
+                            "readiness": readiness,
+                        },
+                    ),
+                    "mission_bucket": bucket,
+                    "mission_bucket_label": MISSION_BUCKET_LABELS.get(bucket, "Submission Prep"),
+                    "queue_state": {
+                        "job_id": row.id,
+                        "kind": row.kind,
+                        "status": row.status,
+                        "started_at": row.started_at.isoformat() if row.started_at else None,
+                        "created_at": row.created_at.isoformat() if row.created_at else None,
+                        "progress": dict(row.progress or {}),
+                    },
+                },
+                queue_state={
+                    "job_id": row.id,
+                    "kind": row.kind,
+                    "status": row.status,
+                    "started_at": row.started_at.isoformat() if row.started_at else None,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "progress": dict(row.progress or {}),
+                },
+            )
+        )
+
     priority_order = {HIGH: 0, MEDIUM: 1, LOW: 2}
-    items = [_decorate_mission_item(item) for item in items]
+    items = [
+        {
+            **_decorate_mission_item(item),
+            "readiness": (item.get("meta") or {}).get("readiness"),
+        }
+        for item in items
+    ]
+    in_progress_items = [
+        {
+            **item,
+            "readiness": (item.get("meta") or {}).get("readiness"),
+        }
+        for item in in_progress_items
+    ]
+    recent_completed_items = [
+        {
+            **item,
+            "readiness": (item.get("meta") or {}).get("readiness"),
+        }
+        for item in recent_completed_items
+    ]
+    recent_failed_items = [
+        {
+            **item,
+            "readiness": (item.get("meta") or {}).get("readiness"),
+        }
+        for item in recent_failed_items
+    ]
     items.sort(key=lambda item: (priority_order.get(item["priority"], 9), item.get("due_at") or "9999", item["type"]))
     in_progress_items.sort(key=lambda item: (item.get("queue_state", {}).get("status") != "running", item["type"], item["title"]))
     recent_completed_items.sort(key=lambda item: (item.get("queue_state", {}).get("completed_at") or "", item["type"], item["title"]), reverse=True)
@@ -792,6 +980,16 @@ def _queue_job_spec(item: dict[str, Any], organization_id: int | None) -> dict[s
             "opportunity_fingerprint": fingerprint,
         }
         return {"kind": "awardee_enrichment", "payload": payload}
+    if item_type == "CLOSED_WORKSPACE_PREP" and opportunity_id:
+        fingerprint = (item.get("meta") or {}).get("opportunity_fingerprint")
+        payload = {
+            "opportunity_id": int(opportunity_id),
+            "organization_id": organization_id,
+            "download_documents": True,
+            "run_usaspending": True,
+            "opportunity_fingerprint": fingerprint,
+        }
+        return {"kind": "workspace_intake", "payload": payload}
     if item_type == "NSN_INTELLIGENCE_REFRESH":
         nsn = _normalize_nsn((item.get("meta") or {}).get("nsn"))
         if not nsn:
@@ -810,6 +1008,8 @@ def _queue_job_spec(item: dict[str, Any], organization_id: int | None) -> dict[s
 
 
 def _job_signature(kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+    if kind == "workspace_intake":
+        return (kind, payload.get("organization_id"), payload.get("opportunity_id"))
     if kind == "awardee_enrichment":
         return (kind, payload.get("organization_id"), payload.get("opportunity_id"))
     if kind == "nsn_build":

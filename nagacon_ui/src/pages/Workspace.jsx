@@ -15,9 +15,9 @@ const PROGRESS_OPTIONS = [
 const TASK_STATUSES = ['OPEN', 'IN_PROGRESS', 'DONE']
 const SUBMISSION_STATUSES = ['DRAFT', 'SUBMITTED', 'AWARDED', 'LOST', 'NO_BID']
 const AGENT_PHASE_LABELS = {
-  phase_1: 'Phase 1',
-  phase_2: 'Phase 2',
-  phase_3: 'Phase 3',
+  phase_1: 'Read the Solicitation',
+  phase_2: 'Reach Out and Qualify',
+  phase_3: 'Prepare to Submit',
 }
 
 const AGENT_FALLBACK_LABELS = {
@@ -39,12 +39,45 @@ function formatAgentFallback(result) {
   const detail = String(result.fallback_detail || '').trim()
   return detail ? `${label}: ${detail}` : label
 }
-const AGENT_DESCRIPTIONS = {
-  opportunity_analyst: 'Analyze the opportunity and summarize risks, signals, and next actions.',
-  compliance_document: 'Review parsed documents and expose compliance-oriented document insights.',
-  vendor_research: 'Rank vendors and USAspending evidence using the research profile.',
-  email_outreach: 'Create an outreach plan from the strongest vendor leads.',
-  proposal_workspace: 'Turn current tasks and artifacts into an execution plan.',
+const AGENT_CATALOG_FALLBACK = {
+  solicitation_analyst: {
+    label: 'Solicitation Analyst',
+    description: 'Reads the solicitation, summarizes what is being bought, and highlights risks, gaps, and next steps.',
+  },
+  compliance_reviewer: {
+    label: 'Compliance Reviewer',
+    description: 'Reviews the loaded notice and documents, extracts requirements, and flags missing submission details.',
+  },
+  market_researcher: {
+    label: 'Market Researcher',
+    description: 'Looks at vendor leads, USAspending history, and market context to support bid decisions.',
+  },
+  outreach_coordinator: {
+    label: 'Outreach Coordinator',
+    description: 'Prepares vendor outreach grounded in the solicitation and the strongest quote targets.',
+  },
+  proposal_coordinator: {
+    label: 'Proposal Coordinator',
+    description: 'Turns tasks, quotes, and artifacts into a practical execution plan for submission.',
+  },
+}
+
+const AGENT_LEGACY_KEY_MAP = {
+  opportunity_analyst: 'solicitation_analyst',
+  compliance_document: 'compliance_reviewer',
+  vendor_research: 'market_researcher',
+  email_outreach: 'outreach_coordinator',
+  proposal_workspace: 'proposal_coordinator',
+}
+
+const getCanonicalAgentKey = (agentKey) => AGENT_LEGACY_KEY_MAP[String(agentKey || '').trim()] || String(agentKey || '').trim()
+
+const getAgentMeta = (agentKey, catalog = {}) => {
+  const canonicalKey = getCanonicalAgentKey(agentKey)
+  return catalog[canonicalKey] || AGENT_CATALOG_FALLBACK[canonicalKey] || {
+    label: canonicalKey.replace(/_/g, ' '),
+    description: '',
+  }
 }
 
 const formatDateTime = (value) => {
@@ -70,6 +103,93 @@ const formatCurrency = (value) => {
 
 const joinList = (values) => (values && values.length ? values.join(' | ') : '-')
 const compactMeta = (parts) => parts.filter((part) => part && part !== '-').join(' | ')
+const dedupeVendorPartRows = (rows, { cageField = 'cage', partField = 'part_number', nameField = 'company_name' } = {}) => {
+  const grouped = new Map()
+  const mergeRows = (existing, row) => {
+    const existingScore = Number(existing?.confidence || existing?.score || 0)
+    const nextScore = Number(row?.confidence || row?.score || 0)
+    const preferred = nextScore > existingScore ? row : existing
+    const fallback = preferred === row ? existing : row
+    return {
+      ...fallback,
+      ...preferred,
+      _originalIndex: existing?._originalIndex ?? row?._originalIndex ?? 0,
+    }
+  }
+  ;(rows || []).forEach((row, index) => {
+    const cage = String(row?.[cageField] || '').trim().toUpperCase()
+    const part = String(row?.[partField] || '').trim().toUpperCase()
+    const name = String(row?.[nameField] || row?.name || '').trim().toUpperCase()
+    const keyBase = cage || name
+    if (!keyBase) return
+    const exactKey = `${keyBase}__${part}`
+    const blankKey = `${keyBase}__`
+    const candidate = { ...row, _originalIndex: index }
+    if (part && grouped.has(blankKey)) {
+      grouped.set(exactKey, mergeRows(grouped.get(blankKey), candidate))
+      grouped.delete(blankKey)
+      return
+    }
+    if (!part) {
+      const existingConcreteKey = Array.from(grouped.keys()).find((key) => key.startsWith(`${keyBase}__`) && key !== blankKey)
+      if (existingConcreteKey) {
+        grouped.set(existingConcreteKey, mergeRows(grouped.get(existingConcreteKey), candidate))
+        return
+      }
+    }
+    if (grouped.has(exactKey)) {
+      grouped.set(exactKey, mergeRows(grouped.get(exactKey), candidate))
+      return
+    }
+    grouped.set(exactKey, candidate)
+  })
+  return Array.from(grouped.values())
+}
+
+const dedupeVendorIdentityRows = (rows = []) => {
+  const grouped = new Map()
+  const mergeRows = (existing, row) => {
+    const existingSources = new Set(existing.source_labels || [])
+    const nextSources = new Set(row.source_labels || [])
+    return {
+      ...existing,
+      ...row,
+      source_labels: Array.from(new Set([...existingSources, ...nextSources])),
+      _rowIndex: existing._rowIndex,
+    }
+  }
+  rows.forEach((row, index) => {
+    const cage = String(row?.cage || '').trim().toUpperCase()
+    const part = String(row?.part_number || '').trim().toUpperCase()
+    const name = String(row?.company_name || row?.name || row?.manufacturer || '').trim()
+    const identity = cage || name.toUpperCase()
+    if (!identity) return
+    const exactKey = `${identity}__${part}`
+    const blankKey = `${identity}__`
+    const candidate = { ...row, _rowIndex: index }
+    if (part && grouped.has(blankKey)) {
+      grouped.set(exactKey, mergeRows(grouped.get(blankKey), candidate))
+      grouped.delete(blankKey)
+      return
+    }
+    if (!part) {
+      const existingConcreteKey = Array.from(grouped.keys()).find((key) => key.startsWith(`${identity}__`) && key !== blankKey)
+      if (existingConcreteKey) {
+        grouped.set(existingConcreteKey, mergeRows(grouped.get(existingConcreteKey), candidate))
+        return
+      }
+    }
+    const existing = grouped.get(exactKey)
+    if (!existing) {
+      grouped.set(exactKey, candidate)
+      return
+    }
+    grouped.set(exactKey, mergeRows(existing, candidate))
+  })
+  return Array.from(grouped.values())
+}
+
+const mergeSupportingText = (...values) => Array.from(new Set(values.filter(Boolean).map((value) => String(value).trim()).filter(Boolean))).join(' | ')
 
 const quoteStatusWeight = (status) => {
   switch (String(status || '').toUpperCase()) {
@@ -117,6 +237,32 @@ const formatDateOnly = (value) => {
     day: 'numeric',
     year: 'numeric',
   })
+}
+
+const formatOutcomeLabel = (value) => {
+  if (!value) return '-'
+  return String(value).replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+const stripRecommendationPrefix = (value) => {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  return text.replace(/^(No Bid|Do Not Bid|Needs Review|Pursue Now|Pursue With Gaps|Hold For Compliance|Hold For Capability|Bid)\s*:\s*/i, '').trim()
+}
+
+const formatGuidancePosture = (value) => {
+  const key = String(value || '').trim().toLowerCase()
+  const labels = {
+    pursue_now: 'Ready to move',
+    pursue_with_gaps: 'Move with gaps',
+    hold_for_compliance: 'Needs compliance work',
+    hold_for_capability: 'Needs capability review',
+    do_not_bid: 'Low-confidence fit',
+    research_only: 'Research only',
+    needs_review: 'Needs review',
+    bid: 'Ready to move',
+  }
+  return labels[key] || humanizeLabel(value, 'Needs review')
 }
 
 const titleCaseWords = (value) => value.replace(/\b\w+/g, (word) => {
@@ -331,7 +477,6 @@ export default function Workspace() {
   const [newChecklistItem, setNewChecklistItem] = useState('')
   const [emailDraft, setEmailDraft] = useState({ subject: '', body: '' })
   const [coEmailDraft, setCoEmailDraft] = useState({ subject: '', body: '' })
-  const [selectedArtifactCompare, setSelectedArtifactCompare] = useState(null)
   const [selectedFileId, setSelectedFileId] = useState(null)
   const [activeIntakeJobId, setActiveIntakeJobId] = useState(null)
   const [quoteFilter, setQuoteFilter] = useState('all')
@@ -363,7 +508,7 @@ export default function Workspace() {
     },
     enabled: !!id,
     retry: 1,
-    staleTime: 30000,
+    staleTime: 120000,
     refetchOnWindowFocus: false,
   })
 
@@ -394,6 +539,17 @@ export default function Workspace() {
     enabled: !!id,
     retry: false,
     staleTime: 30000,
+    refetchOnWindowFocus: false,
+  })
+  const agentRunsQuery = useQuery({
+    queryKey: ['workspace-agent-runs', id],
+    queryFn: async () => {
+      const res = await api.get('/api/workspace/agent-runs', { params: { opp_id: id } })
+      return res.data
+    },
+    enabled: !!id && secondaryDataReady && activeTab === tabIndexes.overview,
+    retry: false,
+    staleTime: 60000,
     refetchOnWindowFocus: false,
   })
 
@@ -600,6 +756,7 @@ export default function Workspace() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+      queryClient.invalidateQueries({ queryKey: ['workspace-agent-runs', id] })
     },
   })
   const generateCoEmailMutation = useMutation({
@@ -609,6 +766,7 @@ export default function Workspace() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', id] })
+      queryClient.invalidateQueries({ queryKey: ['workspace-agent-runs', id] })
     },
   })
   const generateResearchBriefMutation = useMutation({
@@ -858,19 +1016,22 @@ export default function Workspace() {
   }, [activeTab, isDibbsOpportunity, searchParams, setSearchParams])
   const parsedSummary = data?.parsed_summary || {}
   const normalizedFacts = data?.normalized_facts || {}
+  const workspaceRecommendation = data?.recommendation || data?.analysis?.recommendation || {}
+  const procurementProfile = data?.procurement_profile || {}
   const normalizedPoc = normalizedFacts.poc || {}
   const pipeline = pipelineQuery.data || data?.pipeline_item || null
   const artifacts = data?.artifacts || []
   const tasks = data?.tasks || []
   const submission = data?.submission || null
-  const vendorLeads = vendorLeadsQuery.data || []
-  const vendorQuotes = vendorQuotesQuery.data || []
+  const vendorLeads = dedupeVendorPartRows(vendorLeadsQuery.data || [])
+  const vendorQuotes = dedupeVendorPartRows(vendorQuotesQuery.data || [])
   const usaspendingVendors = usaspendingResearchQuery.data?.likely_vendors || []
-  const usaspendingDebug = usaspendingResearchQuery.data?.query_debug || []
   const usaspendingHistoryMatchLabel = usaspendingResearchQuery.data?.history_match_label || ''
   const usaspendingHistoryMatchQueryLabel = usaspendingResearchQuery.data?.history_match_query_label || ''
   const usaspendingHistoryMatchSource = usaspendingResearchQuery.data?.history_match_source || 'none'
   const researchProfile = usaspendingResearchQuery.data?.research_profile || data?.research_profile || {}
+  const publogReference = data?.publog_reference || {}
+  const publogManufacturerCandidates = dedupeVendorPartRows(publogReference.manufacturer_candidates || [])
   const checklistArtifact = artifacts.find((artifact) => artifact.artifact_type === 'CHECKLIST') || null
   const complianceMatrixArtifact = artifacts.find((artifact) => artifact.artifact_type === 'COMPLIANCE_MATRIX') || null
   const emailArtifact =
@@ -887,9 +1048,12 @@ export default function Workspace() {
   const partFinderArtifact = artifacts.find((artifact) => artifact.artifact_type === 'PART_FINDER') || null
   const partFinder = partFinderArtifact?.content_json?.part_finder || {}
   const partFinderPart = partFinder.part || {}
-  const partFinderProviders = partFinder.providers || []
+  const partFinderProviders = dedupeVendorPartRows(partFinder.providers || [], { nameField: 'name' })
   const partFinderAwardees = partFinder.awardees || []
-  const partFinderNextActions = partFinder.next_actions || []
+  const partFinderWbparts = partFinder.wbparts || {}
+  const partFinderWbpartsCrossReferences = partFinderWbparts.cross_references || []
+  const partFinderWbpartsAlternates = partFinderWbparts.part_alternates || []
+  const partFinderWbpartsDemandHistory = partFinderWbparts.demand_history || []
   const packagePriceHistory = submissionPackageArtifact?.content_json?.price_history || {}
   const nsnIntelligence =
     nsnIntelligenceQuery.data
@@ -905,16 +1069,107 @@ export default function Workspace() {
   const nsnAwardConfidence = nsnAwardHistory.confidence_counts || {}
   const storedAwardHistoryRows = nsnAwardHistory.top_awards || []
   const storedAwardees = nsnAwardHistory.top_awardees || []
+  const recommendationSupplierEvidence = workspaceRecommendation?.supplier_evidence || {}
+  const recommendationSupplierCandidates = recommendationSupplierEvidence?.top_candidates || []
+  const sourcingCandidates = (() => {
+    const grouped = new Map()
+
+    const ensureCandidate = (identityKey, seed = {}) => {
+      const existing = grouped.get(identityKey)
+      if (existing) return existing
+      const next = {
+        identityKey,
+        leadId: null,
+        company_name: '',
+        cage: '',
+        part_number: '',
+        status: '',
+        candidate_quality: '',
+        sourceTags: [],
+        contact: {},
+        provider_item: '',
+        why: '',
+        hasLead: false,
+        ...seed,
+      }
+      grouped.set(identityKey, next)
+      return next
+    }
+
+    vendorLeads.forEach((lead) => {
+      const cage = String(lead.cage || '').trim().toUpperCase()
+      const part = String(lead.part_number || '').trim().toUpperCase()
+      const name = String(lead.company_name || '').trim()
+      const identityKey = `${cage || name.toUpperCase()}__${part}`
+      if (!identityKey || identityKey === '__') return
+      const entry = ensureCandidate(identityKey)
+      entry.leadId = lead.id
+      entry.hasLead = true
+      entry.company_name = entry.company_name || lead.company_name || ''
+      entry.cage = entry.cage || lead.cage || ''
+      entry.part_number = entry.part_number || lead.part_number || ''
+      entry.status = lead.status || entry.status
+      entry.provider_item = entry.provider_item || lead.provider_item || ''
+      entry.why = mergeSupportingText(entry.why, lead.notes)
+      entry.contact = {
+        website: lead.provider_website || entry.contact.website || '',
+        email: lead.provider_email || entry.contact.email || '',
+        phone: lead.provider_phone || entry.contact.phone || '',
+      }
+      entry.sourceTags = Array.from(new Set([...entry.sourceTags, lead.source_label || formatBriefText(lead.source_type || 'Vendor Lead', { punctuate: false })]))
+    })
+
+    publogManufacturerCandidates.forEach((candidate) => {
+      const cage = String(candidate.cage || '').trim().toUpperCase()
+      const part = String(candidate.part_number || '').trim().toUpperCase()
+      const name = String(candidate.company_name || candidate.candidate_label || '').trim()
+      const identityKey = `${cage || name.toUpperCase()}__${part}`
+      if (!identityKey || identityKey === '__') return
+      const entry = ensureCandidate(identityKey, {
+        company_name: candidate.company_name || candidate.candidate_label || '',
+        cage: candidate.cage || '',
+        part_number: candidate.part_number || '',
+        candidate_quality: candidate.candidate_quality || '',
+      })
+      entry.company_name = entry.company_name || candidate.company_name || candidate.candidate_label || ''
+      entry.cage = entry.cage || candidate.cage || ''
+      entry.part_number = entry.part_number || candidate.part_number || ''
+      entry.candidate_quality = entry.candidate_quality || candidate.candidate_quality || ''
+      entry.why = mergeSupportingText(
+        entry.why,
+        compactMeta([
+          candidate.relationship_type_label || '',
+          candidate.reference_type_label || '',
+          candidate.source_version ? `Version ${candidate.source_version}` : '',
+        ]),
+      )
+      entry.sourceTags = Array.from(new Set([...entry.sourceTags, 'PUB LOG']))
+    })
+
+    return Array.from(grouped.values()).sort((left, right) => {
+      if (left.hasLead !== right.hasLead) return left.hasLead ? -1 : 1
+      const leftPreferred = left.candidate_quality === 'preferred' ? 1 : 0
+      const rightPreferred = right.candidate_quality === 'preferred' ? 1 : 0
+      if (leftPreferred !== rightPreferred) return rightPreferred - leftPreferred
+      return String(left.company_name || left.cage || '').localeCompare(String(right.company_name || right.cage || ''))
+    })
+  })()
   const analysisAssessment =
-    opportunityAnalysisArtifact?.content_json?.executive_assessment
+    stripRecommendationPrefix(opportunityAnalysisArtifact?.content_json?.executive_assessment)
+    || stripRecommendationPrefix(workspaceRecommendation?.summary)
     || null
   const analysisBidPosture =
     opportunityAnalysisArtifact?.content_json?.bid_posture
+    || workspaceRecommendation?.bid_posture
     || null
-  const analysisReasons = formatBriefList(opportunityAnalysisArtifact?.content_json?.reasons || [])
-  const analysisStrengths = formatBriefList(opportunityAnalysisArtifact?.content_json?.strengths || [])
-  const analysisBlockers = formatBriefList(opportunityAnalysisArtifact?.content_json?.blockers || [])
-  const analysisNextActions = formatBriefList(opportunityAnalysisArtifact?.content_json?.recommended_next_actions || [])
+  const analysisReasons = formatBriefList(opportunityAnalysisArtifact?.content_json?.reasons || workspaceRecommendation?.reasons || [])
+  const analysisStrengths = formatBriefList(opportunityAnalysisArtifact?.content_json?.strengths || workspaceRecommendation?.strengths || [])
+  const analysisBlockers = formatBriefList(opportunityAnalysisArtifact?.content_json?.blockers || workspaceRecommendation?.blockers || [])
+  const analysisNextActions = formatBriefList(
+    opportunityAnalysisArtifact?.content_json?.recommended_next_actions
+    || workspaceRecommendation?.next_actions
+    || []
+  )
   const complianceFacts = complianceArtifact?.content_json?.extracted_facts || []
   const complianceMissingInfo = complianceArtifact?.content_json?.missing_information || []
   const complianceReviewFlags = complianceArtifact?.content_json?.review_flags || []
@@ -1090,6 +1345,71 @@ export default function Workspace() {
     outreachPoc.email ? `POC: ${outreachPoc.email}` : outreachPoc.contact_name ? `POC: ${outreachPoc.contact_name}` : '',
     outreachPoc.submission_office ? `Office: ${outreachPoc.submission_office}` : '',
   ])
+  const currentStateItems = [
+    formatDetailLine('Documents', files.length > 0 ? 'Ready' : 'Missing'),
+    formatDetailLine('Supplier Coverage', vendorLeads.length > 0 ? `${vendorLeads.length} vendor lead${vendorLeads.length === 1 ? '' : 's'}` : 'Need suppliers'),
+    formatDetailLine('Quotes', quoteComparison.some((quote) => quote.normalized_status === 'RECEIVED') ? 'Quotes received' : (vendorQuotes.length > 0 ? 'Tracking started' : 'No quotes yet')),
+    formatDetailLine('Submission Package', submissionPackageArtifact ? 'Started' : 'Not started'),
+  ].filter(Boolean)
+  const topBlockerText = readinessBlockers[0] || 'No blocker is currently flagged.'
+  const nextActionText = workspaceRecommendation?.next_step || analysisNextActions[0] || 'Review the workspace and move the next task forward.'
+  const commandVendorPreview = (() => {
+    const rows = []
+    vendorLeads.forEach((lead) => {
+      rows.push({
+        company_name: lead.company_name || '',
+        cage: lead.cage || '',
+        part_number: lead.part_number || '',
+        score: Number(lead.confidence || 0) + 14,
+        source_labels: ['Lead'],
+      })
+    })
+    vendorQuotes.forEach((quote) => {
+      rows.push({
+        company_name: quote.company_name || '',
+        cage: quote.cage || '',
+        part_number: quote.part_number || '',
+        score: quoteStatusWeight(quote.status) + (Number(quote.unit_price) ? 18 : 8),
+        source_labels: ['Quote'],
+      })
+    })
+    partFinderProviders.forEach((provider) => {
+      rows.push({
+        company_name: provider.name || provider.company_name || '',
+        cage: provider.cage || '',
+        part_number: provider.part_number || partFinderPart.part_number || '',
+        score: Number(provider.score || provider.confidence || 0) + 10,
+        source_labels: ['Part Finder'],
+      })
+    })
+    publogManufacturerCandidates.forEach((candidate) => {
+      rows.push({
+        company_name: candidate.company_name || '',
+        cage: candidate.cage || '',
+        part_number: candidate.part_number || '',
+        score: Number(candidate.confidence || 0) + 12,
+        source_labels: ['PUB LOG'],
+      })
+    })
+    partFinderWbpartsCrossReferences.forEach((candidate) => {
+      rows.push({
+        company_name: candidate.manufacturer || '',
+        cage: candidate.cage || '',
+        part_number: candidate.part_number || '',
+        score: 9,
+        source_labels: ['WBParts'],
+      })
+    })
+    return dedupeVendorIdentityRows(rows)
+      .sort((a, b) => (b.score || 0) - (a.score || 0) || String(a.company_name || '').localeCompare(String(b.company_name || '')))
+      .slice(0, 6)
+  })()
+  const commandVendorLines = commandVendorPreview.map((vendor) => compactMeta([
+    vendor.company_name || 'Vendor candidate',
+    vendor.cage ? `CAGE ${vendor.cage}` : '',
+    vendor.part_number ? `Part ${vendor.part_number}` : '',
+    (vendor.source_labels || []).join(' + '),
+  ]))
 
   const patchVendorQuoteDraft = (quoteId, field, value) => {
     queryClient.setQueryData(['vendor-quotes', id], (current = []) =>
@@ -1449,10 +1769,14 @@ export default function Workspace() {
   }
 
   const analysis = data.analysis || {}
+  const solicitationMemory = analysis.solicitation_memory || data.solicitation_memory || {}
+  const agentFindings = data.agent_findings || {}
+  const workspaceFreshness = data.workspace_freshness || {}
   const vendors = data.vendor_matches || []
   const recentActivity = data.recent_activity || []
-  const agentRuns = data.agent_runs || []
+  const agentRuns = agentRunsQuery.data?.items || data.agent_runs || []
   const agentPhases = data.agent_phases || {}
+  const agentCatalog = data.agent_catalog || {}
   const lastAgentRunResult = runAgentMutation.data || null
   const lastAgentPhaseResult = runAgentPhaseMutation.data || null
   const agentRunError = runAgentMutation.error?.response?.data?.detail || runAgentMutation.error?.message || ''
@@ -1468,6 +1792,9 @@ export default function Workspace() {
     formatBriefText(analysis.ai_summary || opp.prepared_summary || '', { punctuate: false })
   const preparedRequirements = normalizeAnalysisList(analysis.requirements || opp.prepared_requirements || parsedSummary.sam_intelligence?.requirements || [])
   const preparedRiskFlags = normalizeAnalysisList(analysis.risk_flags || opp.prepared_risk_flags || parsedSummary.sam_intelligence?.risk_flags || [])
+  const solicitationMemoryNotes = normalizeAnalysisList(solicitationMemory.pattern_notes || [])
+  const solicitationMemoryExamples = solicitationMemory.examples || []
+  const solicitationMemoryThemes = normalizeAnalysisList(solicitationMemory.common_rationale || [])
   const capabilityMatch = analysis.capability_match || data.capability_match || {}
   const capabilitySignals = normalizeAnalysisList(capabilityMatch.signals || [])
   const capabilityGaps = normalizeAnalysisList(capabilityMatch.gaps || [])
@@ -1477,14 +1804,17 @@ export default function Workspace() {
     preparedSummaryText
     || formatBriefText(opp.summary || documentSummary.summary_text || '', { punctuate: false })
     || 'No contract overview is available yet.'
+  const commandOverviewItems = [
+    formatDetailLine('Due', formatDateTime(factReturnBy)),
+    formatDetailLine('NSN / Part Path', compactMeta([factNsn, partFinderPart.part_number ? `Part ${partFinderPart.part_number}` : ''])),
+    formatDetailLine('Likely Vendors', commandVendorPreview.length ? `${commandVendorPreview.length} vendor candidate${commandVendorPreview.length === 1 ? '' : 's'}` : 'No likely vendors yet'),
+  ].filter(Boolean)
   const overviewTitle = isSamOpportunity ? 'Contract Overview' : 'Part Requirement Overview'
-  const requirementsCardTitle = isSamOpportunity ? 'Requirements To Track' : 'Quote Inputs To Track'
-  const risksCardTitle = isSamOpportunity ? 'Risks To Watch' : 'Sourcing Risks'
   const progressTitle = isSamOpportunity ? 'Opportunity Progress' : 'RFQ Progress'
   const progressSubtitle = isSamOpportunity
     ? 'Use this to track where this opportunity stands in your workflow.'
     : 'Use this to track sourcing, quote, and submission progress for this RFQ.'
-  const readinessCardTitle = isSamOpportunity ? 'Readiness Snapshot' : 'RFQ Readiness'
+  const readinessCardTitle = 'Current State'
   const workspaceProgressCardTitle = isSamOpportunity ? 'Proposal Plan' : 'Opportunity Progress'
   const workspaceTasksCardTitle = isSamOpportunity ? 'Proposal Tasks' : 'Workspace Tasks'
   const checklistArtifactTitle = isSamOpportunity ? 'Proposal Checklist' : 'Checklist Artifact'
@@ -1526,6 +1856,105 @@ export default function Workspace() {
     { label: 'NAICS', value: factNaics },
     { label: 'FSC', value: factFsc },
   ].filter((item) => item.value && item.value !== '-')
+  const procurementProfileItems = [
+    formatDetailLine('Buyer Family', procurementProfile.buyer_family || ''),
+    formatDetailLine('Buyer', procurementProfile.buyer_name || procurementProfile.agency || ''),
+    formatDetailLine('Scope', procurementProfile.procurement_scope ? humanizeLabel(procurementProfile.procurement_scope, '') : ''),
+    formatDetailLine(
+      'Classification',
+      procurementProfile.classification_scheme && procurementProfile.classification_value
+        ? `${procurementProfile.classification_scheme} ${procurementProfile.classification_value}`
+        : ''
+    ),
+    formatDetailLine('Submission Channel', procurementProfile.submission_channel || ''),
+    formatDetailLine('Sourcing Model', procurementProfile.sourcing_model ? humanizeLabel(procurementProfile.sourcing_model, '') : ''),
+  ].filter(Boolean)
+  const solicitationAnalystFinding = agentFindings.solicitation_analyst || {}
+  const complianceReviewerFinding = agentFindings.compliance_reviewer || {}
+  const marketResearcherFinding = agentFindings.market_researcher || {}
+  const capabilityMatcherFinding = agentFindings.capability_matcher || {}
+  const outreachCoordinatorFinding = agentFindings.outreach_coordinator || {}
+  const proposalCoordinatorFinding = agentFindings.proposal_coordinator || {}
+  const solicitationHistorySignals = normalizeAnalysisList(solicitationAnalystFinding.history_signals || [])
+  const solicitationOutcomePatterns = (solicitationAnalystFinding.outcome_patterns || [])
+    .map((item) => item?.label && item?.count ? `${item.label}: ${item.count}` : '')
+    .filter(Boolean)
+  const solicitationResponsePatterns = (solicitationAnalystFinding.response_patterns || [])
+    .map((item) => item?.label && item?.count ? `${item.label}: ${item.count}` : '')
+    .filter(Boolean)
+  const complianceMatrixLines = (complianceReviewerFinding.requirement_matrix || [])
+    .slice(0, 6)
+    .map((item) => compactMeta([
+      item.category || '',
+      item.status ? humanizeLabel(item.status) : '',
+      item.requirement || '',
+    ]))
+    .filter(Boolean)
+  const marketFindingLines = normalizeAnalysisList(marketResearcherFinding.market_findings || [])
+  const marketTargetLines = normalizeAnalysisList(marketResearcherFinding.recommended_targets || [])
+  const capabilitySignalLines = normalizeAnalysisList([
+    ...(capabilityMatcherFinding.signals || []),
+    ...(capabilityMatcherFinding.gaps || []).slice(0, 3).map((item) => `Gap: ${item}`),
+  ])
+  const outreachFindingLines = normalizeAnalysisList([
+    outreachCoordinatorFinding.target_vendor_name
+      ? `Target vendor: ${outreachCoordinatorFinding.target_vendor_name}${outreachCoordinatorFinding.target_vendor_cage ? ` | ${outreachCoordinatorFinding.target_vendor_cage}` : ''}`
+      : '',
+    ...(outreachCoordinatorFinding.follow_up_plan || []),
+  ])
+  const proposalFindingLines = normalizeAnalysisList([
+    proposalCoordinatorFinding.open_task_count !== undefined && proposalCoordinatorFinding.open_task_count !== null
+      ? `Open tasks: ${proposalCoordinatorFinding.open_task_count}`
+      : '',
+    ...(proposalCoordinatorFinding.recommended_sequence || []),
+  ])
+  const workspaceFreshnessLines = normalizeAnalysisList([
+    ...(workspaceFreshness.reasons || []),
+    ...((workspaceFreshness.active_jobs || []).map((job) => {
+      const kind = humanizeLabel(job.kind || '', '')
+      const lane = humanizeLabel(job.worker_lane || '', '')
+      const status = humanizeLabel(job.status || '', '')
+      return [kind, lane ? `${lane} lane` : '', status].filter(Boolean).join(' | ')
+    })),
+  ])
+  const samOperatorItems = isSamOpportunity ? [
+    formatDetailLine('Decision', humanizeLabel(workspaceRecommendation?.recommendation, 'Needs Review')),
+    formatDetailLine('Next Step', workspaceRecommendation?.next_step || ''),
+    formatDetailLine('Response Type', procurementProfile.response_type ? humanizeLabel(procurementProfile.response_type, '') : ''),
+    formatDetailLine('Evaluation Basis', procurementProfile.evaluation_basis ? humanizeLabel(procurementProfile.evaluation_basis, '') : ''),
+    formatDetailLine('Proposal Burden', procurementProfile.proposal_burden ? humanizeLabel(procurementProfile.proposal_burden, '') : ''),
+    formatDetailLine('Attachments', procurementProfile.required_attachment_count ? String(procurementProfile.required_attachment_count) : ''),
+    formatDetailLine('Amendments', procurementProfile.amendment_count ? String(procurementProfile.amendment_count) : ''),
+    formatDetailLine('Place of Performance', procurementProfile.place_of_performance || ''),
+    formatDetailLine('Period of Performance', procurementProfile.period_of_performance || ''),
+  ].filter(Boolean) : []
+  const solicitationMemoryItems = [
+    formatDetailLine('Local Match Count', solicitationMemory.match_count ? String(solicitationMemory.match_count) : ''),
+    formatDetailLine('History Summary', solicitationMemory.summary || ''),
+    formatDetailLine('Vendor Response Pattern', solicitationMemory.strongest_response_pattern ? formatOutcomeLabel(solicitationMemory.strongest_response_pattern) : ''),
+  ].filter(Boolean)
+  const workspaceGuidanceItems = [
+    formatDetailLine('Current Posture', formatGuidancePosture(analysisBidPosture)),
+    formatDetailLine('Next Step', workspaceRecommendation?.next_step || (analysisNextActions[0] || 'Review the workspace and move the next task forward.')),
+    formatDetailLine('Supplier Evidence', recommendationSupplierEvidence?.summary || ''),
+  ].filter(Boolean)
+  const similarHistoryItems = solicitationMemoryExamples.map((item) => {
+    const bits = [
+      item.agency || '',
+      item.naics_code ? `NAICS ${item.naics_code}` : '',
+      item.fsc_code ? `FSC ${item.fsc_code}` : '',
+      item.outcome ? `History ${formatOutcomeLabel(item.outcome)}` : '',
+      item.vendor_response_quality ? `Vendor response ${formatOutcomeLabel(item.vendor_response_quality)}` : '',
+    ].filter(Boolean)
+    const reasons = [...(item.match_reasons || []), ...(item.decision_rationale || []).slice(0, 2)].filter(Boolean).join(' | ')
+    return `${item.title || 'Past opportunity'}${bits.length ? ` - ${bits.join(' | ')}` : ''}${reasons ? ` - ${reasons}` : ''}`
+  })
+  const mergedSolicitationMemoryItems = [
+    ...solicitationMemoryItems,
+    ...solicitationMemoryNotes.slice(0, 2),
+    ...solicitationMemoryThemes.slice(0, 2),
+    ...similarHistoryItems.slice(0, 2),
+  ].filter(Boolean)
   const checklistCompletedCount = checklistDraft.filter((item) => item.done).length
   const checklistTotalCount = checklistDraft.length
   const checklistProgress = checklistTotalCount > 0 ? Math.round((checklistCompletedCount / checklistTotalCount) * 100) : 0
@@ -1678,24 +2107,22 @@ export default function Workspace() {
             </div>
           </div>
 
-          {preparedRequirements.length || (!isSamOpportunity && preparedRiskFlags.length) ? (
+          {isSamOpportunity && (preparedRequirements.length || preparedRiskFlags.length) ? (
             <div className="workspace-summary-grid">
-              <Card title={requirementsCardTitle}>
+              <Card title="Requirements To Track">
                 <div className="artifact-list">
                   {(preparedRequirements.length ? preparedRequirements : ['No clear submission requirements were extracted yet.']).map((item, index) => (
                     <div key={`prepared-requirement-${index}`} className="artifact-list-item">{item}</div>
                   ))}
                 </div>
               </Card>
-              {!isSamOpportunity ? (
-                <Card title={risksCardTitle}>
-                  <div className="artifact-list">
-                    {(preparedRiskFlags.length ? preparedRiskFlags : ['No immediate risks were flagged from the current notice data.']).map((item, index) => (
-                      <div key={`prepared-risk-${index}`} className="artifact-list-item">{item}</div>
-                    ))}
-                  </div>
-                </Card>
-              ) : null}
+              <Card title="Risks To Watch">
+                <div className="artifact-list">
+                  {(preparedRiskFlags.length ? preparedRiskFlags : ['No immediate risks were flagged from the current notice data.']).map((item, index) => (
+                    <div key={`prepared-risk-${index}`} className="artifact-list-item">{item}</div>
+                  ))}
+                </div>
+              </Card>
             </div>
           ) : null}
 
@@ -1839,6 +2266,10 @@ export default function Workspace() {
                     ['FSC', partFinderPart.fsc || factFsc || '-'],
                     ['NIIN', partFinderPart.niin || '-'],
                     ['References', partFinderPart.reference_count ?? '-'],
+                    ['WBParts', partFinderWbparts.status === 'ok'
+                      ? `${partFinderWbparts.summary?.cross_reference_count || 0} cross refs | ${partFinderWbparts.summary?.alternate_count || 0} alternates`
+                      : (partFinderWbparts.status ? humanizeLabel(partFinderWbparts.status) : '-')],
+                    ['WBParts Cache', partFinderWbparts.cache_hit ? 'cached' : (partFinderWbparts.fetched_at ? 'fresh' : '-')],
                     ['Confidence', partFinder.confidence?.identity ? `Identity ${partFinder.confidence.identity} | Supplier ${partFinder.confidence.supplier}` : '-'],
                   ].map(([label, value]) => (
                     <div key={`part-finder-${label}`} className="summary-inline-item">
@@ -1852,6 +2283,12 @@ export default function Workspace() {
                   title="Part Numbers"
                   items={(partFinderPart.part_numbers || []).slice(0, 8).map((item) => item)}
                   emptyMessage="No part/reference numbers found yet."
+                />
+
+                <BriefDetailsBox
+                  title="WBParts Alternates"
+                  items={partFinderWbpartsAlternates.slice(0, 10)}
+                  emptyMessage="No WBParts alternates are cached yet."
                 />
 
                 <div className="bid-readiness-grid">
@@ -1869,83 +2306,83 @@ export default function Workspace() {
                     </div>
                   </div>
                   <div>
-                    <div className="row-title">Awardee Evidence</div>
+                    <div className="row-title">WBParts Cross References</div>
                     <div className="artifact-list">
-                      {(partFinderAwardees.length ? partFinderAwardees.slice(0, 5) : []).map((awardee, index) => (
-                        <div key={`part-awardee-${awardee.cage || awardee.name || index}`} className="artifact-list-item">
-                          {awardee.name || awardee.cage || 'Awardee'}
-                          {awardee.cage ? ` | CAGE ${awardee.cage}` : ''}
-                          {awardee.award_count ? ` | ${awardee.award_count} award${awardee.award_count === 1 ? '' : 's'}` : ''}
-                          {awardee.total_award_amount ? ` | ${formatCurrency(awardee.total_award_amount)}` : ''}
+                      {(partFinderWbpartsCrossReferences.length ? partFinderWbpartsCrossReferences.slice(0, 5) : []).map((row, index) => (
+                        <div key={`part-wbparts-${row.cage || row.part_number || index}`} className="artifact-list-item">
+                          {row.part_number || 'Part unknown'}
+                          {row.cage ? ` | CAGE ${row.cage}` : ''}
+                          {row.manufacturer ? ` | ${row.manufacturer}` : ''}
                         </div>
                       ))}
-                      {!partFinderAwardees.length ? <div className="artifact-list-item">No awardee evidence found yet.</div> : null}
-                    </div>
-                  </div>
-                </div>
-
-                <StructuredList
-                  title="Next Sourcing Actions"
-                  items={partFinderNextActions}
-                  emptyMessage="Refresh Part Finder to generate sourcing actions."
-                />
-              </div>
-              </Card>
-
-              <Card title={readinessCardTitle}>
-              <div className="workspace-action-column">
-                <div className="artifact-note-box">
-                  <div className="row-title">{readinessCardTitle}</div>
-                  <div className="structured-copy">
-                    {`${readinessReadyCount} of ${readinessChecks.length} readiness signals are in place. ${readinessPendingCount} item${readinessPendingCount === 1 ? '' : 's'} still need attention.`}
-                  </div>
-                  <div className="panel-subtitle">
-                    Submission state: {humanizeLabel(submission?.status, 'Draft')}
-                  </div>
-                </div>
-
-                <div className="bid-readiness-vendors">
-                  <BriefDetailsBox
-                    title="Vendor Readiness"
-                    items={[
-                      formatDetailLine(
-                        'Recommended Vendor',
-                        recommendedQuote
-                          ? `${recommendedQuote.company_name || recommendedQuote.cage || 'Vendor'}${recommendedQuote.unit_price ? ` | ${formatCurrency(recommendedQuote.unit_price)}` : ''}${recommendedQuote.lead_time_days ? ` | ${recommendedQuote.lead_time_days}d` : ''}`
-                          : 'No vendor recommendation yet'
-                      ),
-                      formatDetailLine(
-                        'Planned Submission Vendor',
-                        submissionForm.planned_vendor_name || submissionForm.planned_vendor_cage
-                          ? `${submissionForm.planned_vendor_name || 'Vendor'}${submissionForm.planned_vendor_cage ? ` | ${submissionForm.planned_vendor_cage}` : ''}${submissionForm.submitted_unit_price ? ` | ${formatCurrency(submissionForm.submitted_unit_price)}` : ''}`
-                          : 'Not selected yet'
-                      ),
-                    ]}
-                  />
-                </div>
-
-                <div className="bid-readiness-grid">
-                  <div>
-                    <div className="row-title">What Is Ready</div>
-                    <div className="artifact-list">
-                      {(readinessStrengths.length ? readinessStrengths : ['No readiness strengths captured yet.']).map((item, index) => (
-                        <div key={`readiness-strength-${index}`} className="artifact-list-item">{item}</div>
-                      ))}
+                      {!partFinderWbpartsCrossReferences.length ? <div className="artifact-list-item">No WBParts cross references are cached yet.</div> : null}
                     </div>
                   </div>
                   <div>
-                    <div className="row-title">What Still Needs Work</div>
+                    <div className="row-title">WBParts Demand History</div>
                     <div className="artifact-list">
-                      {(readinessBlockers.length ? readinessBlockers : ['No blockers are currently flagged.']).map((item, index) => (
-                        <div key={`readiness-blocker-${index}`} className="artifact-list-item">{item}</div>
+                      {(partFinderWbpartsDemandHistory.length ? partFinderWbpartsDemandHistory.slice(0, 5) : []).map((row, index) => (
+                        <div key={`part-wbparts-demand-${row.part_number || row.request_date || index}`} className="artifact-list-item">
+                          {row.part_number || 'Part unknown'}
+                          {row.request_date ? ` | ${row.request_date}` : ''}
+                          {row.quantity ? ` | Qty ${row.quantity}` : ''}
+                          {row.origin ? ` | ${row.origin}` : ''}
+                        </div>
                       ))}
+                      {!partFinderWbpartsDemandHistory.length ? <div className="artifact-list-item">No WBParts demand history is cached yet.</div> : null}
                     </div>
                   </div>
                 </div>
               </div>
               </Card>
 
-              <Card title="AI Briefing">
+              <Card title="Command Brief">
+                <div className="workspace-action-column">
+                  <div className="workspace-command-grid">
+                    {commandOverviewItems.map((item, index) => {
+                      const [label, ...rest] = item.split(': ')
+                      return (
+                        <div key={`command-overview-${index}`} className="workspace-command-tile">
+                          <div className="summary-inline-label">{label}</div>
+                          <div className="summary-inline-value">{rest.join(': ') || '-'}</div>
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  <div className="artifact-note-box workspace-command-summary-box">
+                    <div className="row-title">Submission State</div>
+                    <div className="structured-copy">
+                      {humanizeLabel(submission?.status, 'Draft')}
+                    </div>
+                    <div className="panel-subtitle">
+                      {analysisAssessment || contractAboutText}
+                    </div>
+                  </div>
+
+                  <div className="bid-readiness-grid">
+                    <BriefDetailsBox title="Current State" items={currentStateItems} emptyMessage="Current state will fill in as the workspace grows." />
+                    <BriefDetailsBox title="Likely Vendors" items={commandVendorLines} emptyMessage="No likely vendors are surfaced yet." />
+                  </div>
+
+                  <div className="bid-readiness-grid">
+                    <div>
+                      <div className="row-title">Top Blocker</div>
+                      <div className="artifact-list">
+                        <div className="artifact-list-item">{topBlockerText}</div>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="row-title">Next Action</div>
+                      <div className="artifact-list">
+                        <div className="artifact-list-item">{nextActionText}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+
+              <Card title="Workspace Guidance">
               <div className="workspace-action-column">
                 <div className="company-form-actions">
                   <Button variant="secondary" loading={generateResearchBriefMutation.isPending} onClick={() => generateResearchBriefMutation.mutate()}>
@@ -1956,28 +2393,60 @@ export default function Workspace() {
                   </Button>
                 </div>
                 <div className="artifact-note-box">
-                  <div className="row-title">What This Contract Is About</div>
-                  <div className="structured-copy">{analysisAssessment || contractAboutText}</div>
+                  <div className="row-title">Current Posture</div>
+                  <div className="artifact-brief-lines">
+                    {(workspaceGuidanceItems.length ? workspaceGuidanceItems : ['Guidance will sharpen as documents, suppliers, and pricing signals fill in.']).map((item, index) => (
+                      <div key={`workspace-guidance-${index}`} className="artifact-brief-line">{item}</div>
+                    ))}
+                  </div>
                 </div>
+                {workspaceFreshnessLines.length > 0 ? (
+                  <StructuredList
+                    title="Workspace Freshness"
+                    items={workspaceFreshnessLines}
+                    emptyMessage={workspaceFreshness.summary || 'Workspace is current.'}
+                  />
+                ) : null}
+                {isSamOpportunity ? (
+                  <BriefDetailsBox
+                    title="SAM Operator Block"
+                    items={samOperatorItems}
+                    emptyMessage="Proposal-specific decision signals will appear as the document set and workspace fill in."
+                  />
+                ) : null}
                 <BriefDetailsBox
-                  title="Key Details"
-                  items={briefingFacts}
-                  emptyMessage="Core solicitation details will appear after documents are processed."
+                  title="Solicitation Memory"
+                  items={mergedSolicitationMemoryItems}
+                  emptyMessage="The system will start building pattern memory after more opportunities have been reviewed here."
                 />
+                {false ? (
                 <StructuredList
-                  title="What Matters"
-                  items={analysisReasons}
-                  emptyMessage="Run the analyst to capture important bid signals."
+                  title="Similar History"
+                  items={solicitationMemoryExamples.map((item) => {
+                    const bits = [
+                      item.agency || '',
+                      item.naics_code ? `NAICS ${item.naics_code}` : '',
+                      item.fsc_code ? `FSC ${item.fsc_code}` : '',
+                      item.outcome ? `History ${formatOutcomeLabel(item.outcome)}` : '',
+                      item.vendor_response_quality ? `Vendor response ${formatOutcomeLabel(item.vendor_response_quality)}` : '',
+                    ].filter(Boolean)
+                    const reasons = [...(item.match_reasons || []), ...(item.decision_rationale || []).slice(0, 2)].filter(Boolean).join(' | ')
+                    return `${item.title || 'Past opportunity'}${bits.length ? ` — ${bits.join(' | ')}` : ''}${reasons ? ` — ${reasons}` : ''}`
+                  })}
+                  emptyMessage="No similar local opportunities have been captured yet."
                 />
-                <StructuredList
-                  title="Needs Attention"
-                  items={analysisBlockers}
-                  emptyMessage="No blockers are currently flagged."
-                />
-                <StructuredList
-                  title="Next Best Actions"
-                  items={analysisNextActions}
-                  emptyMessage="No next actions are currently suggested."
+                ) : null}
+                {recommendationSupplierCandidates.length > 0 ? (
+                  <StructuredList
+                    title="Why These Vendors"
+                    items={recommendationSupplierCandidates.slice(0, 3)}
+                    emptyMessage="No PUB LOG and SAM-backed supplier evidence is ready yet."
+                  />
+                ) : null}
+                <BriefDetailsBox
+                  title="Procurement Profile"
+                  items={procurementProfileItems}
+                  emptyMessage="The workspace will build a procurement profile as source facts become clearer."
                 />
               </div>
               </Card>
@@ -2136,13 +2605,8 @@ export default function Workspace() {
                 </div>
                 <BriefDetailsBox
                   title="Why This Awardee Matters"
-                  items={formatAwardeeSignalList(vendor.why_matched || [])}
+                  items={formatAwardeeSignalList([...(vendor.why_matched || []), ...(vendor.match_reasons || [])])}
                   emptyMessage="No matching rationale is available yet."
-                />
-                <BriefDetailsBox
-                  title="Supporting Evidence"
-                  items={formatAwardeeSignalList(vendor.match_reasons || [])}
-                  emptyMessage="No supporting evidence was captured."
                 />
                 {(vendor.sample_awards || []).slice(0, 2).map((award, awardIndex) => (
                   <div key={`${vendor.vendor}-sam-award-${awardIndex}`} className="vendor-award-snippet">
@@ -2167,87 +2631,96 @@ export default function Workspace() {
 
   const vendorsContent = (
     <div className="workspace-vendors">
-      <Card title="Vendor Leads">
-          <div className="workspace-action-column">
+      <Card title="Sourcing Candidates">
+        <div className="workspace-action-column">
           <div className="company-form-actions">
             <Button loading={generateVendorsMutation.isPending} onClick={() => generateVendorsMutation.mutate()}>
               Generate Vendor Shortlist
             </Button>
           </div>
-          {vendorLeads.length > 0 ? (
+          {sourcingCandidates.length > 0 ? (
             <div className="panel-subtitle">
-              Showing {vendorLeads.length} vendor lead{vendorLeads.length === 1 ? '' : 's'} ready for review.
+              Showing {sourcingCandidates.length} sourcing candidate{sourcingCandidates.length === 1 ? '' : 's'} with lead-backed entries first.
             </div>
           ) : null}
           {vendorLeadsQuery.isLoading ? (
-          <LoadingState label="Loading vendor leads..." />
-        ) : vendorLeads.length === 0 ? (
-          <EmptyState title="No vendor leads yet" subtitle="Generate vendor research or seed USAspending awardees to start outreach." />
+          <LoadingState label="Loading sourcing candidates..." />
+        ) : sourcingCandidates.length === 0 ? (
+          <EmptyState title="No sourcing candidates yet" subtitle="Generate vendor research or seed award history to start sourcing outreach." />
         ) : (
           <div className="vendor-grid">
-            {vendorLeads.map((lead) => (
-              <Card key={lead.id} className="vendor-card">
+            {sourcingCandidates.map((candidate, index) => (
+              <Card key={`${candidate.identityKey}-${candidate.leadId || index}`} className="vendor-card">
                 <div className="vendor-header">
-                  <div className="vendor-id">{lead.company_name || lead.cage || `Lead ${lead.id}`}</div>
-                  <StatusPill status={lead.status || 'NEW'} />
+                  <div className="vendor-id">{candidate.company_name || candidate.cage || `Candidate ${index + 1}`}</div>
+                  {candidate.hasLead ? (
+                    <StatusPill status={candidate.status || 'NEW'} />
+                  ) : (
+                    <Badge
+                      label={humanizeLabel(candidate.candidate_quality || 'supporting', 'Supporting')}
+                      variant={candidate.candidate_quality === 'preferred' ? 'success' : 'info'}
+                    />
+                  )}
                 </div>
                 <div className="panel-subtitle">
                   {compactMeta([
-                    lead.cage ? `CAGE ${lead.cage}` : '',
-                    lead.part_number ? `Part ${lead.part_number}` : '',
-                    lead.source_label || formatBriefText(lead.source_type || 'Unknown', { punctuate: false }),
-                  ]) || 'Lead details are still being organized.'}
+                    candidate.cage ? `CAGE ${candidate.cage}` : '',
+                    candidate.part_number ? `Part ${candidate.part_number}` : '',
+                    candidate.sourceTags.join(' + '),
+                  ]) || 'Sourcing details are still being organized.'}
                 </div>
-                {lead.provider_website || lead.provider_email || lead.provider_phone ? (
+                {candidate.contact.website || candidate.contact.email || candidate.contact.phone ? (
                   <div className="vendor-contact-strip">
-                    {lead.provider_website ? (
-                      <a href={lead.provider_website} target="_blank" rel="noreferrer">
+                    {candidate.contact.website ? (
+                      <a href={candidate.contact.website} target="_blank" rel="noreferrer">
                         Website
                       </a>
                     ) : null}
-                    {lead.provider_email ? <span>{lead.provider_email}</span> : null}
-                    {lead.provider_phone ? <span>{lead.provider_phone}</span> : null}
+                    {candidate.contact.email ? <span>{candidate.contact.email}</span> : null}
+                    {candidate.contact.phone ? <span>{candidate.contact.phone}</span> : null}
                   </div>
                 ) : null}
-                {lead.provider_item ? (
+                {candidate.provider_item ? (
                   <div className="panel-subtitle">
-                    Item: {formatBriefText(lead.provider_item, { punctuate: false })}
+                    Item: {formatBriefText(candidate.provider_item, { punctuate: false })}
                   </div>
                 ) : null}
-                {lead.notes ? (
+                {candidate.why ? (
                   <div className="artifact-note-box">
-                    <div className="row-title">Why This Lead Matters</div>
-                    <div className="structured-copy">{formatBriefText(lead.notes, { punctuate: false })}</div>
+                    <div className="row-title">Why This Candidate Matters</div>
+                    <div className="structured-copy">{formatBriefText(candidate.why, { punctuate: false })}</div>
                   </div>
                 ) : null}
-                <div className="table-action-stack">
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    loading={targetedEmailMutation.isPending}
-                    onClick={() =>
-                      targetedEmailMutation.mutate({
-                        opportunity_id: Number(id),
-                        vendor_lead_id: lead.id,
-                      })
-                    }
-                  >
-                    Draft Outreach
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    loading={promoteVendorLeadMutation.isPending}
-                    onClick={() =>
-                      promoteVendorLeadMutation.mutate({
-                        opportunity_id: Number(id),
-                        vendor_lead_id: lead.id,
-                      })
-                    }
-                  >
-                    Promote to Quote Task
-                  </Button>
-                </div>
+                {candidate.hasLead ? (
+                  <div className="table-action-stack">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={targetedEmailMutation.isPending}
+                      onClick={() =>
+                        targetedEmailMutation.mutate({
+                          opportunity_id: Number(id),
+                          vendor_lead_id: candidate.leadId,
+                        })
+                      }
+                    >
+                      Draft Outreach
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={promoteVendorLeadMutation.isPending}
+                      onClick={() =>
+                        promoteVendorLeadMutation.mutate({
+                          opportunity_id: Number(id),
+                          vendor_lead_id: candidate.leadId,
+                        })
+                      }
+                    >
+                      Promote to Quote Task
+                    </Button>
+                  </div>
+                ) : null}
               </Card>
             ))}
           </div>
@@ -2255,66 +2728,137 @@ export default function Workspace() {
         </div>
       </Card>
 
-        <Card title="Quote Response Tracker">
-          {vendorQuotesQuery.isLoading ? (
-            <LoadingState label="Loading vendor quotes..." />
-          ) : vendorQuotes.length === 0 ? (
-            <EmptyState
-              title="No quote records yet"
-              subtitle="Seed quote records from the current vendor leads, then log responses as vendors reply."
-              action={<Button loading={seedQuotesMutation.isPending} onClick={() => seedQuotesMutation.mutate()}>Seed Quote Tracker</Button>}
-            />
-          ) : (
-            <div className="workspace-action-column">
-              <div className="results-toolbar">
-                <div className="panel-subtitle">Tracking {vendorQuotes.length} vendor quote {vendorQuotes.length === 1 ? 'record' : 'records'}</div>
-                <div className="company-form-actions">
-                  <Button variant="secondary" loading={seedQuotesMutation.isPending} onClick={() => seedQuotesMutation.mutate()}>
-                    Refresh From Leads
-                  </Button>
-                  <Button variant="secondary" onClick={exportQuoteComparisonCsv}>
-                    Export Quote Comparison
-                  </Button>
-                  <Button variant="secondary" onClick={printBidSummary}>
-                    Print Bid Summary
-                  </Button>
-                </div>
+        <Card title="Outreach & Quotes">
+          <div className="workspace-action-column">
+            <div className="results-toolbar">
+              <div className="panel-subtitle">
+                Keep sourcing candidates, outreach drafts, and quote follow-ups in one working lane.
               </div>
-              <div className="quote-follow-up-summary">
-                <button type="button" className={`quote-filter-chip ${quoteFilter === 'all' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('all')}>
-                  All {quoteFollowUpSummary.total}
-                </button>
-                <button type="button" className={`quote-filter-chip ${quoteFilter === 'due' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('due')}>
-                  Due {quoteFollowUpSummary.due}
-                </button>
-                <button type="button" className={`quote-filter-chip ${quoteFilter === 'requested' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('requested')}>
-                  Requested {quoteFollowUpSummary.requested}
-                </button>
-                <button type="button" className={`quote-filter-chip ${quoteFilter === 'received' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('received')}>
-                  Received {quoteFollowUpSummary.received}
-                </button>
-                <button type="button" className={`quote-filter-chip ${quoteFilter === 'not_requested' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('not_requested')}>
-                  Not Requested {quoteFollowUpSummary.notRequested}
-                </button>
+              <div className="company-form-actions">
+                <Button loading={generateEmailMutation.isPending} onClick={() => generateEmailMutation.mutate()}>
+                  {emailArtifact ? 'Refresh Outreach Draft' : 'Generate Outreach Draft'}
+                </Button>
+                <Button variant="secondary" loading={seedQuotesMutation.isPending} onClick={() => seedQuotesMutation.mutate()}>
+                  {vendorQuotes.length > 0 ? 'Refresh From Leads' : 'Seed Quote Tracker'}
+                </Button>
               </div>
-              {quoteFollowUpSummary.due > 0 ? (
-                <div className="quote-follow-up-alert">
-                  <div>
-                    <div className="row-title">Follow-ups Due</div>
-                    <div className="panel-subtitle">{quoteFollowUpSummary.due} vendor {quoteFollowUpSummary.due === 1 ? 'needs' : 'need'} a quote follow-up today.</div>
+            </div>
+
+            {!emailArtifact ? (
+              <EmptyState
+                title="No outreach draft yet"
+                subtitle="Generate a quote-request draft grounded in the solicitation and current sourcing candidates."
+              />
+            ) : (
+              <div className="artifact-embedded-panel">
+                <div className="row-title">Outreach Draft</div>
+                {outreachSourceSummary ? (
+                  <div className="panel-subtitle">{outreachSourceSummary}</div>
+                ) : null}
+                {emailVendorAsks.length ? (
+                  <div className="artifact-note-box">
+                    <div className="row-title">Vendor Ask List</div>
+                    <div className="panel-subtitle">{emailVendorAsks.slice(0, 4).join(' | ')}</div>
                   </div>
-                  <Button size="sm" variant="secondary" onClick={() => setQuoteFilter('due')}>
-                    View Due
+                ) : null}
+                <Input
+                  label="Subject"
+                  value={emailDraft.subject}
+                  onChange={(event) => setEmailDraft((current) => ({ ...current, subject: event.target.value }))}
+                />
+                <div className="company-form-stack">
+                  <label className="textarea-label">Body</label>
+                  <textarea
+                    className="textarea-field textarea-tall"
+                    value={emailDraft.body}
+                    onChange={(event) => setEmailDraft((current) => ({ ...current, body: event.target.value }))}
+                  />
+                </div>
+                <div className="company-form-actions">
+                  <Button
+                    loading={updateArtifactMutation.isPending}
+                    onClick={async () => {
+                      await updateArtifactMutation.mutateAsync({
+                        artifactId: emailArtifact.id,
+                        body: {
+                          content_json: {
+                            ...emailArtifact.content_json,
+                            subject: emailDraft.subject,
+                            body: emailDraft.body,
+                          },
+                        },
+                      })
+                      await outreachLogMutation.mutateAsync({
+                        artifactId: emailArtifact.id,
+                        body: {
+                          action: 'draft_saved',
+                          recipient: emailArtifact.content_json?.target_vendor_email || emailArtifact.content_json?.to,
+                          vendor_name: emailArtifact.content_json?.target_vendor_name || emailArtifact.content_json?.company_name,
+                        },
+                      })
+                    }}
+                  >
+                    Save Draft
                   </Button>
                 </div>
-              ) : null}
-              <div className="vendor-grid">
-                {visibleVendorQuotes.length === 0 ? (
-                  <EmptyState
-                    title="No quotes match this filter"
-                    subtitle="Try another quote status filter or refresh from vendor leads."
-                  />
-                ) : visibleVendorQuotes.map((quote) => (
+              </div>
+            )}
+
+            {vendorQuotesQuery.isLoading ? (
+              <LoadingState label="Loading vendor quotes..." />
+            ) : vendorQuotes.length === 0 ? (
+              <EmptyState
+                title="No quote records yet"
+                subtitle="Seed quote records from the current sourcing candidates, then log responses here as vendors reply."
+              />
+            ) : (
+              <>
+                <div className="results-toolbar">
+                  <div className="panel-subtitle">Tracking {vendorQuotes.length} vendor quote {vendorQuotes.length === 1 ? 'record' : 'records'}</div>
+                  <div className="company-form-actions">
+                    <Button variant="secondary" onClick={exportQuoteComparisonCsv}>
+                      Export Quote Comparison
+                    </Button>
+                    <Button variant="secondary" onClick={printBidSummary}>
+                      Print Bid Summary
+                    </Button>
+                  </div>
+                </div>
+                <div className="quote-follow-up-summary">
+                  <button type="button" className={`quote-filter-chip ${quoteFilter === 'all' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('all')}>
+                    All {quoteFollowUpSummary.total}
+                  </button>
+                  <button type="button" className={`quote-filter-chip ${quoteFilter === 'due' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('due')}>
+                    Due {quoteFollowUpSummary.due}
+                  </button>
+                  <button type="button" className={`quote-filter-chip ${quoteFilter === 'requested' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('requested')}>
+                    Requested {quoteFollowUpSummary.requested}
+                  </button>
+                  <button type="button" className={`quote-filter-chip ${quoteFilter === 'received' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('received')}>
+                    Received {quoteFollowUpSummary.received}
+                  </button>
+                  <button type="button" className={`quote-filter-chip ${quoteFilter === 'not_requested' ? 'quote-filter-active' : ''}`} onClick={() => setQuoteFilter('not_requested')}>
+                    Not Requested {quoteFollowUpSummary.notRequested}
+                  </button>
+                </div>
+                {quoteFollowUpSummary.due > 0 ? (
+                  <div className="quote-follow-up-alert">
+                    <div>
+                      <div className="row-title">Follow-ups Due</div>
+                      <div className="panel-subtitle">{quoteFollowUpSummary.due} vendor {quoteFollowUpSummary.due === 1 ? 'needs' : 'need'} a quote follow-up today.</div>
+                    </div>
+                    <Button size="sm" variant="secondary" onClick={() => setQuoteFilter('due')}>
+                      View Due
+                    </Button>
+                  </div>
+                ) : null}
+                <div className="vendor-grid">
+                  {visibleVendorQuotes.length === 0 ? (
+                    <EmptyState
+                      title="No quotes match this filter"
+                      subtitle="Try another quote status filter or refresh from vendor leads."
+                    />
+                  ) : visibleVendorQuotes.map((quote) => (
                   <Card key={quote.id} className="vendor-card">
                     <div className="vendor-header">
                       <div className="vendor-id">{quote.company_name || quote.cage || `Quote ${quote.id}`}</div>
@@ -2406,10 +2950,11 @@ export default function Workspace() {
                       </Button>
                     </div>
                   </Card>
-                ))}
-              </div>
-            </div>
-          )}
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </Card>
 
       <Card title="Past Awardees">
@@ -2612,56 +3157,6 @@ export default function Workspace() {
           </div>
         )}
       </Card>
-
-      <div className="workspace-summary-grid">
-          <Card title="Vendor Outreach Draft">
-          {!emailArtifact ? (
-            <EmptyState
-              title="No outreach draft yet"
-              subtitle="Generate a quote request draft grounded in the solicitation document and selected vendor context."
-              action={<Button loading={generateEmailMutation.isPending} onClick={() => generateEmailMutation.mutate()}>Generate Email Draft</Button>}
-            />
-          ) : (
-            <div className="workspace-action-column">
-              {outreachSourceSummary ? (
-                <div className="panel-subtitle">{outreachSourceSummary}</div>
-              ) : null}
-              <Input
-                label="Subject"
-                value={emailDraft.subject}
-                onChange={(event) => setEmailDraft((current) => ({ ...current, subject: event.target.value }))}
-              />
-              <div className="company-form-stack">
-                <label className="textarea-label">Body</label>
-                <textarea
-                  className="textarea-field textarea-tall"
-                  value={emailDraft.body}
-                  onChange={(event) => setEmailDraft((current) => ({ ...current, body: event.target.value }))}
-                />
-              </div>
-              <div className="company-form-actions">
-                <Button
-                  loading={updateArtifactMutation.isPending}
-                  onClick={async () => {
-                    await updateArtifactMutation.mutateAsync({
-                      artifactId: emailArtifact.id,
-                      body: {
-                        content_json: {
-                          ...emailArtifact.content_json,
-                          subject: emailDraft.subject,
-                          body: emailDraft.body,
-                        },
-                      },
-                    })
-                  }}
-                >
-                  Save Draft
-                </Button>
-              </div>
-            </div>
-          )}
-        </Card>
-      </div>
     </div>
   )
 
@@ -3363,291 +3858,7 @@ export default function Workspace() {
       ) : null}
 
       {!isSamOpportunity ? (
-        <>
-        <Card title="Email Draft Artifact">
-          {!emailArtifact ? (
-            <EmptyState
-              title="No email draft yet"
-              subtitle="Generate an email draft artifact for vendor outreach."
-            action={<Button loading={generateEmailMutation.isPending} onClick={() => generateEmailMutation.mutate()}>Generate Email Draft</Button>}
-          />
-          ) : (
-            <div className="workspace-action-column">
-              <BriefDetailsBox
-                title="Draft Snapshot"
-                items={[
-                  formatDetailLine('Generated By', emailArtifact.content_json?.provider_status === 'openai' ? 'OpenAI' : 'Fallback workflow'),
-                  formatDetailLine('Model', emailArtifact.content_json?.model_name || '-'),
-                  formatDetailLine('Target Vendor', emailArtifact.content_json?.target_vendor_name || emailArtifact.content_json?.recommended_target_vendor?.company_name || '-'),
-                  formatDetailLine('Source File', emailArtifact.content_json?.document_context?.source_file || '-'),
-                ]}
-              />
-              <div className="artifact-note-box">
-                <div className="row-title">Solicitation Context</div>
-                <div className="panel-subtitle">{joinList(emailArtifact.content_json?.document_context?.document_signals || [])}</div>
-              </div>
-              <div className="artifact-section">
-                <div className="row-title">Vendor Quote Items Requested</div>
-                {emailVendorAsks.length === 0 ? (
-                  <div className="panel-subtitle">No explicit vendor ask items have been generated yet.</div>
-                ) : (
-                  <div className="artifact-list">
-                    {emailVendorAsks.map((item, index) => (
-                      <div key={`email-ask-${index}`} className="artifact-list-item">{item}</div>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <Input
-                label="Subject"
-                value={emailDraft.subject}
-                onChange={(event) => setEmailDraft((current) => ({ ...current, subject: event.target.value }))}
-              />
-            <div className="company-form-stack">
-              <label className="textarea-label">Body</label>
-              <textarea
-                className="textarea-field textarea-tall"
-                value={emailDraft.body}
-                onChange={(event) => setEmailDraft((current) => ({ ...current, body: event.target.value }))}
-              />
-            </div>
-              {emailArtifact.content_json?.document_context?.extracted_preview ? (
-                <div className="artifact-compare-box">
-                  <div className="row-title">Document Preview Used</div>
-                  <div className="row-subtitle debug-prewrap">
-                    {emailArtifact.content_json.document_context.extracted_preview}
-                  </div>
-                </div>
-              ) : null}
-            <div className="company-form-actions">
-              <Button
-                loading={updateArtifactMutation.isPending}
-                onClick={async () => {
-                  await updateArtifactMutation.mutateAsync({
-                    artifactId: emailArtifact.id,
-                    body: {
-                      content_json: {
-                        ...emailArtifact.content_json,
-                        subject: emailDraft.subject,
-                        body: emailDraft.body,
-                      },
-                    },
-                  })
-                  await outreachLogMutation.mutateAsync({
-                    artifactId: emailArtifact.id,
-                    body: {
-                      action: 'draft_saved',
-                      recipient: emailArtifact.content_json?.target_vendor_email || emailArtifact.content_json?.to,
-                      vendor_name: emailArtifact.content_json?.target_vendor_name || emailArtifact.content_json?.company_name,
-                    },
-                  })
-                }}
-              >
-                Save Email Draft
-              </Button>
-            </div>
-          </div>
-        )}
-      </Card>
-
-      <Card title="Opportunity Analysis Artifact">
-        {!analysisAssessment && !opportunityAnalysisArtifact ? (
-          <EmptyState
-            title="No opportunity analysis yet"
-            subtitle="Run the Opportunity Analyst agent to generate a plain-English summary, risks, and recommended next actions."
-          />
-        ) : (
-          <div className="workspace-action-column">
-            <div><strong>Assessment:</strong> {analysisAssessment || '-'}</div>
-            <div><strong>Reasons:</strong> {(analysisReasons || []).join(' | ') || '-'}</div>
-            <div><strong>Risks / Blockers:</strong> {(analysisBlockers || []).join(' | ') || '-'}</div>
-            <div><strong>Next Actions:</strong> {(analysisNextActions || []).join(' | ') || '-'}</div>
-          </div>
-        )}
-      </Card>
-
-        <Card title="Compliance Brief Artifact">
-          {!complianceArtifact ? (
-            <EmptyState
-              title="No compliance brief yet"
-              subtitle="Run the Compliance Document agent to summarize document findings and submission requirements."
-            />
-          ) : (
-            <div className="workspace-action-column">
-              <BriefDetailsBox
-                title="Compliance Snapshot"
-                items={
-                  complianceFacts.length > 0
-                    ? complianceFacts.map((fact) => formatDetailLine(fact.label, fact.label === 'Return By' ? formatDateTime(fact.value) : fact.value))
-                    : [
-                        formatDetailLine('Return By', formatDateTime(complianceArtifact.content_json?.compliance_fields?.return_by)),
-                        formatDetailLine('Quantity', complianceArtifact.content_json?.compliance_fields?.quantity || '-'),
-                        formatDetailLine('Solicitation', complianceArtifact.content_json?.compliance_fields?.solicitation_number || '-'),
-                        formatDetailLine('PR Number', complianceArtifact.content_json?.compliance_fields?.pr_number || '-'),
-                        formatDetailLine('Source File', complianceArtifact.content_json?.compliance_fields?.source_file || '-'),
-                        formatDetailLine('Set-Aside', complianceArtifact.content_json?.compliance_fields?.set_aside_hint || '-'),
-                      ]
-                }
-              />
-              <div className="artifact-note-box">
-                <div className="row-title">Compliance Snapshot</div>
-                <div className="panel-subtitle">
-                  Document count: {complianceArtifact.content_json?.document_count || 0} | Submission office: {complianceArtifact.content_json?.compliance_fields?.submission_office_hint || '-'} | Set-aside: {complianceArtifact.content_json?.compliance_fields?.set_aside_hint || '-'}
-                </div>
-              </div>
-              <div className="artifact-section">
-                <div className="row-title">Document Findings</div>
-                <div className="artifact-list">
-                  {(complianceArtifact.content_json?.document_findings || []).map((item, index) => (
-                    <div key={`finding-${index}`} className="artifact-list-item">{item}</div>
-                  ))}
-                </div>
-              </div>
-              <div className="artifact-section">
-                <div className="row-title">Requirements To Track</div>
-                <div className="artifact-list">
-                  {(complianceArtifact.content_json?.submission_requirements || []).map((item, index) => (
-                    <div key={`submission-${index}`} className="artifact-list-item">{item}</div>
-                  ))}
-                  {(complianceArtifact.content_json?.compliance_fields?.clauses_or_requirements || []).map((item, index) => (
-                    <div key={`clause-${index}`} className="artifact-list-item">{item}</div>
-                  ))}
-                </div>
-              </div>
-              <div className="artifact-section">
-                <div className="row-title">Missing Or Unconfirmed Information</div>
-                {complianceMissingInfo.length === 0 && !(complianceArtifact.content_json?.missing_documents || []).length ? (
-                  <div className="panel-subtitle">No obvious missing information was flagged from the current documents.</div>
-                ) : (
-                  <div className="artifact-list">
-                    {complianceMissingInfo.map((item, index) => (
-                      <div key={`missing-${index}`} className="artifact-list-item">{item}</div>
-                    ))}
-                    {(complianceArtifact.content_json?.missing_documents || []).map((item, index) => (
-                      <div key={`missing-doc-${index}`} className="artifact-list-item">{item}</div>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <div className="artifact-section">
-                <div className="row-title">Vendor Quote Items To Request</div>
-                {complianceVendorAsks.length === 0 ? (
-                  <div className="panel-subtitle">No explicit vendor request items were generated yet.</div>
-                ) : (
-                  <div className="artifact-list">
-                    {complianceVendorAsks.map((item, index) => (
-                      <div key={`vendor-request-${index}`} className="artifact-list-item">{item}</div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </Card>
-
-      <Card title="Vendor Research Artifact">
-        {!vendorResearchArtifact ? (
-          <EmptyState
-            title="No vendor research yet"
-            subtitle="Run the Vendor Research agent to capture likely vendors, approved sources, and query evidence."
-          />
-        ) : (
-          <div className="workspace-action-column">
-            <div><strong>Top Workspace Leads:</strong> {(vendorResearchArtifact.content_json?.top_workspace_leads || []).length}</div>
-            <div><strong>Likely Vendors:</strong> {(vendorResearchArtifact.content_json?.likely_vendors || []).length}</div>
-            {(vendorResearchArtifact.content_json?.top_workspace_leads || []).slice(0, 3).map((lead, index) => (
-              <div key={`lead-${index}`} className="row-subtitle">
-                {lead.company_name} | {lead.cage || '-'} | {lead.source_type || '-'} | confidence {lead.confidence ?? '-'}
-              </div>
-            ))}
-            {(vendorResearchArtifact.content_json?.likely_vendors || []).slice(0, 3).map((vendor, index) => (
-              <div key={`vendor-${index}`} className="row-subtitle">
-                {vendor.vendor} | {(vendor.why_matched || []).join(', ') || '-'}
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      <Card title="Vendor Shortlist Artifact">
-        {!vendorListArtifact ? (
-          <EmptyState
-            title="No vendor shortlist yet"
-            subtitle="Generate vendor research to create the shortlist artifact."
-            action={<Button loading={generateVendorsMutation.isPending} onClick={() => generateVendorsMutation.mutate()}>Generate Vendor Shortlist</Button>}
-          />
-        ) : (
-          <div className="workspace-action-column">
-            <div><strong>Approved Sources:</strong> {vendorListArtifact.content_json?.approved_source_count || 0}</div>
-            <div><strong>CAGE Codes:</strong> {(vendorListArtifact.content_json?.cage_codes || []).slice(0, 8).join(', ') || '-'}</div>
-            <div><strong>Part Numbers:</strong> {(vendorListArtifact.content_json?.part_numbers || []).slice(0, 8).join(', ') || '-'}</div>
-            <div><strong>Profile Terms:</strong> {(vendorListArtifact.content_json?.research_profile?.keyword_terms || []).join(', ') || '-'}</div>
-          </div>
-        )}
-      </Card>
-
-      <Card title="Research Brief Artifact">
-        {!researchBriefArtifact ? (
-          <EmptyState
-            title="No research brief yet"
-            subtitle="Generate a research brief to capture parsed signals, risks, and USAspending vendor evidence."
-            action={
-              <Button loading={generateResearchBriefMutation.isPending} onClick={() => generateResearchBriefMutation.mutate()}>
-                Generate Research Brief
-              </Button>
-            }
-          />
-        ) : (
-          <div className="workspace-action-column">
-            <div><strong>Summary:</strong> {researchBriefArtifact.content_json?.summary?.title || opp.display_title || opp.title}</div>
-            <div><strong>Status:</strong> {researchBriefArtifact.content_json?.summary?.solicitation_status || solicitationStatus}</div>
-            <div><strong>Likely Vendors:</strong> {(researchBriefArtifact.content_json?.usaspending_snapshot?.likely_vendors || []).length}</div>
-            <div><strong>Risks:</strong> {(researchBriefArtifact.content_json?.risks || []).join(' | ') || '-'}</div>
-            <details className="workspace-detail-panel">
-              <summary>View research brief detail</summary>
-              <div className="artifact-compare-box">
-                <div className="row-subtitle debug-prewrap">
-                  {JSON.stringify(researchBriefArtifact.content_json || {}, null, 2)}
-                </div>
-              </div>
-            </details>
-          </div>
-        )}
-      </Card>
-
-      <Card title="Submission Package Artifact">
-        {!submissionPackageArtifact ? (
-          <EmptyState
-            title="No saved submission package yet"
-            subtitle="Save the current submission package so this review state is preserved as a workspace artifact."
-            action={
-              <Button loading={generateSubmissionPackageMutation.isPending} onClick={() => generateSubmissionPackageMutation.mutate()}>
-                Save Submission Package
-              </Button>
-            }
-          />
-        ) : (
-          <div className="workspace-action-column">
-            <BriefDetailsBox
-              title="Saved Snapshot"
-              items={[
-                formatDetailLine('Generated', formatDateTime(submissionPackageArtifact.created_at)),
-                formatDetailLine('Status', submissionPackageArtifact.content_json?.submission?.status || '-'),
-                formatDetailLine('Planned Vendor', submissionPackageArtifact.content_json?.planned_vendor?.company_name || submissionPackageArtifact.content_json?.planned_vendor?.cage || '-'),
-                formatDetailLine('Outcome', submissionPackageArtifact.content_json?.submission?.outcome_summary || submissionPackageArtifact.content_json?.submission?.status || '-'),
-              ]}
-            />
-            <div className="artifact-note-box">
-              <div className="row-title">Snapshot Summary</div>
-              <div className="panel-subtitle">
-                {submissionPackageArtifact.content_json?.summary?.title || opp.display_title || opp.title}
-              </div>
-            </div>
-          </div>
-        )}
-      </Card>
-
-      <Card title="Artifact Center">
+        <Card title="Artifact Center">
         <div className="company-form-actions">
           <a className="action-btn-small" href={`${API_BASE_URL}/api/export/bid_package?opportunity_id=${id}`} target="_blank" rel="noreferrer">
             Export Bid Package
@@ -3677,33 +3888,11 @@ export default function Workspace() {
                       Outreach {entry.action} to {entry.vendor_name || entry.recipient || 'recipient'} at {formatDateTime(entry.timestamp)}
                     </div>
                   ))}
-                  {selectedArtifactCompare?.artifactId === artifact.id ? (
-                    <div className="artifact-compare-box">
-                      <div className="row-subtitle"><strong>Current title:</strong> {artifact.title}</div>
-                      <div className="row-subtitle"><strong>Previous title:</strong> {selectedArtifactCompare.version?.title || '-'}</div>
-                      <div className="row-subtitle debug-prewrap">
-                        {JSON.stringify(selectedArtifactCompare.version?.content_json || {}, null, 2)}
-                      </div>
-                    </div>
-                  ) : null}
                 </div>
                 <div className="workspace-action-column">
                   <StatusPill status={artifact.artifact_type} />
                   {(artifact.version_history || []).length > 0 ? (
                     <>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() =>
-                          setSelectedArtifactCompare({
-                            artifactId: artifact.id,
-                            versionIndex: (artifact.version_history || []).length - 1,
-                            version: (artifact.version_history || [])[artifact.version_history.length - 1],
-                          })
-                        }
-                      >
-                        Compare Last Version
-                      </Button>
                       <Button
                         size="sm"
                         variant="secondary"
@@ -3760,17 +3949,16 @@ export default function Workspace() {
           </div>
         )}
       </Card>
-        </>
       ) : null}
     </div>
   )
 
   const agentsContent = (
     <div className="workspace-scoring-panel">
-      <Card title="Phased Agent Center">
+      <Card title="Bid Team Workflow">
         <div className="workspace-action-column">
           <div className="panel-subtitle">
-            Agents are phased so we can keep outputs traceable: analysis first, then outreach, then execution planning.
+            The workspace team runs in sequence so the solicitation gets read first, then vendor outreach is prepared, then the execution plan is tightened for submission.
           </div>
           {lastAgentPhaseResult ? (
             <div className="workspace-mode-banner">
@@ -3802,7 +3990,9 @@ export default function Workspace() {
             {Object.entries(agentPhases).map(([phase, agents]) => (
               <Card key={phase} title={AGENT_PHASE_LABELS[phase] || phase}>
                 <div className="workspace-action-column">
-                  <div className="row-subtitle">{(agents || []).join(', ')}</div>
+                  <div className="row-subtitle">
+                    {(agents || []).map((agentKey) => getAgentMeta(agentKey, agentCatalog).label).join(', ')}
+                  </div>
                   <Button
                     loading={runAgentPhaseMutation.isPending && runAgentPhaseMutation.variables === phase}
                     onClick={() => runAgentPhaseMutation.mutate(phase)}
@@ -3816,11 +4006,14 @@ export default function Workspace() {
         </div>
       </Card>
 
-      <Card title="Individual Agents">
+      <Card title="Team Roles">
         <div className="workspace-action-column">
+          <div className="panel-subtitle">
+            Start with the Solicitation Analyst when you want the system to read the notice or package and tell you what it means.
+          </div>
           {lastAgentRunResult ? (
             <div className="workspace-mode-banner">
-              <div className="row-title">{String(lastAgentRunResult.agent_key || '').replace(/_/g, ' ')} completed</div>
+              <div className="row-title">{getAgentMeta(lastAgentRunResult.agent_key, agentCatalog).label} completed</div>
               <div className="panel-subtitle">
                 Model: {lastAgentRunResult.model_name || 'workspace_phased_agent'}
               </div>
@@ -3842,55 +4035,118 @@ export default function Workspace() {
               <div className="panel-subtitle">{agentRunError}</div>
             </div>
           ) : null}
-          {Object.entries(AGENT_DESCRIPTIONS).map(([agentKey, description]) => (
+          {Object.keys(agentCatalog).length ? Object.entries(agentCatalog).map(([agentKey, meta]) => (
             <div key={agentKey} className="artifact-history-row">
               <div>
-                <div className="row-title">{agentKey.replace(/_/g, ' ')}</div>
-                <div className="row-subtitle">{description}</div>
+                <div className="row-title">{meta.label || agentKey.replace(/_/g, ' ')}</div>
+                <div className="row-subtitle">{meta.description || ''}</div>
               </div>
               <Button
                 size="sm"
                 loading={runAgentMutation.isPending && runAgentMutation.variables === agentKey}
                 onClick={() => runAgentMutation.mutate(agentKey)}
               >
-                Run Agent
+                Run Role
+              </Button>
+            </div>
+          )) : Object.entries(AGENT_CATALOG_FALLBACK).map(([agentKey, meta]) => (
+            <div key={agentKey} className="artifact-history-row">
+              <div>
+                <div className="row-title">{meta.label}</div>
+                <div className="row-subtitle">{meta.description}</div>
+              </div>
+              <Button
+                size="sm"
+                loading={runAgentMutation.isPending && runAgentMutation.variables === agentKey}
+                onClick={() => runAgentMutation.mutate(agentKey)}
+              >
+                Run Role
               </Button>
             </div>
           ))}
         </div>
       </Card>
 
-      <Card title="Agent Run History">
-        {agentRuns.length === 0 ? (
-          <EmptyState
-            title="No agent runs yet"
-            subtitle="Run a phase or individual agent to start building traceable AI outputs in the workspace."
-          />
-        ) : (
-          <div className="workspace-action-column">
-            {agentRuns.map((run) => (
-              <div key={run.id} className="artifact-history-row">
-                <div>
-                  <div className="row-title">{String(run.agent_key || run.agent_type || '').replace(/_/g, ' ')}</div>
-                  <div className="row-subtitle">
-                    Created {formatDateTime(run.created_at)}{run.completed_at ? ` | Completed ${formatDateTime(run.completed_at)}` : ''}
-                  </div>
-                  {run.error_message ? <div className="row-subtitle">{run.error_message}</div> : null}
-                  {run.output_payload ? (
-                    <details className="workspace-detail-panel">
-                      <summary>View agent output</summary>
-                      <div className="row-subtitle debug-prewrap">
-                        {JSON.stringify(run.output_payload, null, 2)}
-                      </div>
-                    </details>
-                  ) : null}
-                </div>
-                <StatusPill status={run.status || 'pending'} />
+      <Card title="Current Agent Findings">
+        <div className="workspace-summary-grid">
+          <Card title="Solicitation Analyst">
+            <div className="workspace-action-column">
+              <div className="panel-subtitle">
+                {stripRecommendationPrefix(solicitationAnalystFinding.summary || '') || 'No analyst summary yet.'}
               </div>
-            ))}
-          </div>
-        )}
+              <StructuredList
+                title="History Signals"
+                items={solicitationHistorySignals.length ? solicitationHistorySignals : [...solicitationOutcomePatterns.slice(0, 2), ...solicitationResponsePatterns.slice(0, 2)]}
+                emptyMessage="No local pattern signals yet."
+              />
+            </div>
+          </Card>
+
+          <Card title="Compliance Reviewer">
+            <div className="workspace-action-column">
+              <div className="panel-subtitle">
+                {complianceMatrixLines.length
+                  ? 'Structured requirements and review items are ready from the current document set.'
+                  : 'No structured requirement matrix has been generated yet.'}
+              </div>
+              <StructuredList
+                title="Requirement Matrix"
+                items={complianceMatrixLines}
+                emptyMessage="Run the Compliance Reviewer to build the requirement matrix."
+              />
+            </div>
+          </Card>
+
+          <Card title="Market Researcher">
+            <div className="workspace-action-column">
+              <StructuredList
+                title="Market Findings"
+                items={marketFindingLines}
+                emptyMessage="No market findings are available yet."
+              />
+              <StructuredList
+                title="Suggested Targets"
+                items={marketTargetLines}
+                emptyMessage="No suggested targets have been surfaced yet."
+              />
+            </div>
+          </Card>
+
+          <Card title="Capability Matcher">
+            <div className="workspace-action-column">
+              <div className="panel-subtitle">
+                {capabilityMatcherFinding.summary || 'Capability fit has not been reviewed yet.'}
+              </div>
+              <StructuredList
+                title="Capability Signals"
+                items={capabilitySignalLines}
+                emptyMessage="No capability signals are available yet."
+              />
+            </div>
+          </Card>
+
+          <Card title="Outreach Coordinator">
+            <div className="workspace-action-column">
+              <StructuredList
+                title="Outreach Notes"
+                items={outreachFindingLines}
+                emptyMessage="No outreach plan has been generated yet."
+              />
+            </div>
+          </Card>
+
+          <Card title="Proposal Coordinator">
+            <div className="workspace-action-column">
+              <StructuredList
+                title="Execution Notes"
+                items={proposalFindingLines}
+                emptyMessage="No execution plan has been generated yet."
+              />
+            </div>
+          </Card>
+        </div>
       </Card>
+
     </div>
   )
 
@@ -4313,26 +4569,6 @@ export default function Workspace() {
         )}
       </Card>
 
-      <Card title="Research Debug">
-        {usaspendingDebug.length === 0 ? (
-          <EmptyState title="No query trace yet" subtitle="Run USAspending research to inspect the fallback payload path when you actually need it." />
-        ) : (
-          <div className="workspace-action-column">
-            {usaspendingDebug.map((entry, index) => (
-              <div key={`debug-${index}`} className="artifact-history-row">
-                <div>
-                  <div className="row-title">{entry.label}</div>
-                  <div className="row-subtitle">Results: {entry.count || 0}</div>
-                  <details className="workspace-detail-panel">
-                    <summary>View query payload</summary>
-                    <div className="row-subtitle debug-prewrap">{JSON.stringify(entry.filters || {}, null, 2)}</div>
-                  </details>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
     </div>
   )
 

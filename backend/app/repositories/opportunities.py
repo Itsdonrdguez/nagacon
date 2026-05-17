@@ -10,6 +10,7 @@ from app.models.opportunity import Opportunity
 from app.schemas.opportunity import OpportunityCreate, OpportunityUpdate
 from app.utils.exceptions import DuplicateRecordError
 from app.utils.opportunity_lifecycle import ARCHIVE_CUTOFF_DAYS
+from app.utils.set_asides import normalize_set_aside, set_aside_display_label
 
 
 class OpportunityRepository:
@@ -99,11 +100,16 @@ class OpportunityRepository:
         nsn: str | None = None,
         agency: str | None = None,
         state: str | None = None,
+        naics_codes: list[str] | None = None,
+        fsc_codes: list[str] | None = None,
     ):
+        def _clean_codes(values: list[str] | None) -> list[str]:
+            return [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
+
         if source:
             query = query.filter(Opportunity.source == source)
 
-        set_aside_value = str(set_aside_type or "").strip()
+        set_aside_value = normalize_set_aside(set_aside_type)
         if set_aside_value == "none":
             query = query.filter(or_(Opportunity.set_aside.is_(None), Opportunity.set_aside == ""))
         elif set_aside_value:
@@ -152,6 +158,14 @@ class OpportunityRepository:
         if state:
             query = query.filter(Opportunity.place_of_performance.ilike(f"%{state.strip()}%"))
 
+        cleaned_naics = _clean_codes(naics_codes)
+        if cleaned_naics:
+            query = query.filter(Opportunity.naics.in_(cleaned_naics))
+
+        cleaned_fsc = _clean_codes(fsc_codes)
+        if cleaned_fsc:
+            query = query.filter(Opportunity.fsc.in_(cleaned_fsc))
+
         if due_window:
             from datetime import datetime, timedelta
 
@@ -187,6 +201,14 @@ class OpportunityRepository:
             .limit(200)
             .all()
         ]
+        exact_labels = []
+        seen_exact = set()
+        for item in set_asides:
+            value = str(item or "").strip()
+            if not value or value in seen_exact:
+                continue
+            seen_exact.add(value)
+            exact_labels.append({"value": value, "label": set_aside_display_label(value) or value})
         sources = [
             row[0]
             for row in self._scoped_query()
@@ -204,10 +226,13 @@ class OpportunityRepository:
                 {"value": "8a", "label": "8(a)"},
                 {"value": "sdvosb", "label": "SDVOSB"},
                 {"value": "wosb", "label": "WOSB"},
+                {"value": "edwosb", "label": "EDWOSB"},
                 {"value": "hubzone", "label": "HUBZone"},
                 {"value": "veteran", "label": "Veteran-Owned"},
+                {"value": "unrestricted", "label": "Full and Open"},
                 {"value": "none", "label": "No Set-Aside"},
             ],
+            "set_aside_exact_labels": exact_labels,
             "status_filters": [
                 {"value": "open", "label": "Active"},
                 {"value": "7d", "label": "Closing Soon"},
@@ -231,6 +256,8 @@ class OpportunityRepository:
         nsn: str | None = None,
         agency: str | None = None,
         state: str | None = None,
+        naics_codes: list[str] | None = None,
+        fsc_codes: list[str] | None = None,
     ) -> list[Opportunity]:
         query = self._apply_filters(
             self._scoped_query(),
@@ -241,6 +268,8 @@ class OpportunityRepository:
             nsn=nsn,
             agency=agency,
             state=state,
+            naics_codes=naics_codes,
+            fsc_codes=fsc_codes,
         )
         items = query.order_by(Opportunity.id.desc()).offset(offset).limit(limit).all()
         return self._backfill_dibbs_dates(items)
@@ -257,6 +286,8 @@ class OpportunityRepository:
         nsn: str | None = None,
         agency: str | None = None,
         state: str | None = None,
+        naics_codes: list[str] | None = None,
+        fsc_codes: list[str] | None = None,
         sort_by: str | None = None,
         sort_order: str = "asc",
     ) -> tuple[list[Opportunity], int]:
@@ -269,6 +300,8 @@ class OpportunityRepository:
             nsn=nsn,
             agency=agency,
             state=state,
+            naics_codes=naics_codes,
+            fsc_codes=fsc_codes,
         )
         total = base_query.count()
         open_first = case(
@@ -382,10 +415,19 @@ class OpportunityRepository:
             key = opp.source_opportunity_id or opp.solicitation_number or opp.title
             raise DuplicateRecordError(f"Duplicate opportunity detected for {opp.source}/{key}")
     SET_ASIDE_FILTERS = {
-        "small_business": ["small business", "total small", "sbsa"],
-        "8a": ["8(a)", "8a"],
+        "SMALL_BUSINESS": ["small business", "small_business", "total small", "sbsa"],
+        "EIGHT_A": ["8(a)", "8a", "eight_a"],
+        "8a": ["8(a)", "8a", "eight_a"],
         "sdvosb": ["sdvosb", "service-disabled"],
+        "SDVOSB": ["sdvosb", "service-disabled", "service_disabled"],
         "wosb": ["wosb", "women-owned", "woman-owned"],
+        "WOSB": ["wosb", "women-owned", "woman-owned"],
+        "edwosb": ["edwosb", "economically disadvantaged women"],
+        "EDWOSB": ["edwosb", "economically disadvantaged women"],
         "hubzone": ["hubzone", "hub zone"],
-        "veteran": ["veteran-owned", "vosb"],
+        "HUBZONE": ["hubzone", "hub zone"],
+        "veteran": ["veteran-owned", "veteran_owned", "vosb"],
+        "VOSB": ["veteran-owned", "veteran_owned", "vosb"],
+        "unrestricted": ["unrestricted", "full and open", "not set aside"],
+        "UNRESTRICTED": ["unrestricted", "full and open", "not set aside"],
     }

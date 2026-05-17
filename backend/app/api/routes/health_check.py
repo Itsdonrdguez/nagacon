@@ -89,6 +89,9 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
     org = ensure_default_organization(db)
     pdf_download_path = get_setting(db, "pdf_download_path", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_path = get_setting(db, "master_catalog_export_path", default="", organization_id=getattr(org, "id", None)) or ""
+    master_catalog_export_last_attempted_at = get_setting(db, "master_catalog_export_last_attempted_at", default="", organization_id=getattr(org, "id", None)) or ""
+    master_catalog_export_last_status = get_setting(db, "master_catalog_export_last_status", default="", organization_id=getattr(org, "id", None)) or ""
+    master_catalog_export_last_reason = get_setting(db, "master_catalog_export_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_written_at = get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_row_count = get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=getattr(org, "id", None)) or "0"
     storage_backend = str(getattr(settings, "STORAGE_BACKEND", "local") or "local").lower()
@@ -110,6 +113,9 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
         "storage_local_root": str(storage_root()) if storage_backend == "local" else None,
         "pdf_download_path": pdf_download_path or None,
         "master_catalog_export_path": master_catalog_export_path or None,
+        "master_catalog_export_last_attempted_at": master_catalog_export_last_attempted_at or None,
+        "master_catalog_export_last_status": master_catalog_export_last_status or None,
+        "master_catalog_export_last_reason": master_catalog_export_last_reason or None,
         "master_catalog_export_last_written_at": master_catalog_export_last_written_at or None,
         "master_catalog_export_last_row_count": int(master_catalog_export_last_row_count or 0),
         "publog_data_dir": _path_status(getattr(settings, "PUBLOG_DATA_DIR", "")),
@@ -123,7 +129,9 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
     checks["storage_root"] = runtime["storage_local_root"] or "REMOTE"
     checks["pdf_download_path"] = runtime["pdf_download_path"] or "USING STORAGE ROOT"
     checks["master_catalog_export_path"] = runtime["master_catalog_export_path"] or "NOT CONFIGURED"
+    checks["master_catalog_export_status"] = runtime["master_catalog_export_last_status"] or "UNKNOWN"
     checks["master_catalog_export_rows"] = str(runtime["master_catalog_export_last_row_count"])
+    checks["master_catalog_export_last_attempted_at"] = runtime["master_catalog_export_last_attempted_at"] or "NEVER"
     checks["master_catalog_export_last_written_at"] = runtime["master_catalog_export_last_written_at"] or "NEVER"
     checks["publog_data_dir"] = (
         f"OK ({runtime['publog_data_dir']['path']})"

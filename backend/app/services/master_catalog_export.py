@@ -105,8 +105,14 @@ def build_master_catalog_rows(db: Session, organization_id: int | None = None) -
 
 def write_master_catalog_export(db: Session, organization_id: int | None = None) -> dict[str, str | int | bool | None]:
     target = resolve_master_catalog_export_path(db, organization_id=organization_id)
+    org_id = organization_id
+    if org_id is None:
+        org = ensure_default_organization(db)
+        org_id = getattr(org, "id", None)
     if target is None:
-        return {"written": False, "reason": "path_not_configured", "path": None, "row_count": 0}
+        result = {"written": False, "reason": "path_not_configured", "status": "NOT_CONFIGURED", "path": None, "row_count": 0}
+        _persist_export_status(db, organization_id=org_id, result=result)
+        return result
 
     rows = build_master_catalog_rows(db, organization_id=organization_id)
     ensure_dir(target.parent)
@@ -115,18 +121,31 @@ def write_master_catalog_export(db: Session, organization_id: int | None = None)
         writer.writeheader()
         writer.writerows(rows)
 
-    org_id = organization_id
-    if org_id is None:
-        org = ensure_default_organization(db)
-        org_id = getattr(org, "id", None)
-    upsert_setting(db, "master_catalog_export_last_written_at", datetime.utcnow().isoformat(), organization_id=org_id)
-    upsert_setting(db, "master_catalog_export_last_row_count", str(len(rows)), organization_id=org_id)
-
-    return {
+    result = {
         "written": True,
+        "status": "OK",
         "path": str(target),
         "row_count": len(rows),
     }
+    _persist_export_status(db, organization_id=org_id, result=result)
+    return result
+
+
+def _persist_export_status(
+    db: Session,
+    *,
+    organization_id: int | None,
+    result: dict[str, str | int | bool | None],
+) -> None:
+    now = datetime.utcnow().isoformat()
+    upsert_setting(db, "master_catalog_export_last_attempted_at", now, organization_id=organization_id)
+    upsert_setting(db, "master_catalog_export_last_status", str(result.get("status") or "UNKNOWN"), organization_id=organization_id)
+    upsert_setting(db, "master_catalog_export_last_reason", str(result.get("reason") or ""), organization_id=organization_id)
+    if result.get("path"):
+        upsert_setting(db, "master_catalog_export_last_path", str(result.get("path") or ""), organization_id=organization_id)
+    if result.get("written"):
+        upsert_setting(db, "master_catalog_export_last_written_at", now, organization_id=organization_id)
+        upsert_setting(db, "master_catalog_export_last_row_count", str(int(result.get("row_count") or 0)), organization_id=organization_id)
 
 
 def _build_cage_name_map(db: Session, organization_id: int | None = None) -> dict[str, str]:

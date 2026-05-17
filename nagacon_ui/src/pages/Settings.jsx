@@ -78,6 +78,21 @@ export default function Settings() {
     },
   })
 
+  const exportNowMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/settings/integrations/master-catalog/export-now')
+      return res.data
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['integration-settings'] })
+      queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
+      queryClient.setQueryData(['integration-settings'], (current) => ({
+        ...(current || {}),
+        ...data,
+      }))
+    },
+  })
+
   const isLoading = integrationSettingsQuery.isLoading || providerSettingsQuery.isLoading
   const queryError = integrationSettingsQuery.error || providerSettingsQuery.error
   const currentOrg = providerSettingsQuery.data?.organization || integrationSettingsQuery.data?.organization || null
@@ -286,8 +301,26 @@ export default function Settings() {
             >
               Clear Catalog Export Path
             </Button>
+            <Button
+              variant="secondary"
+              loading={exportNowMutation.isPending}
+              onClick={() => exportNowMutation.mutate()}
+            >
+              Export Now
+            </Button>
             {saveIntegrationMutation.data ? <span className="form-success">Integration settings saved.</span> : null}
             {saveIntegrationMutation.error ? <span className="form-error">{saveIntegrationMutation.error.message || 'Failed to save external API keys.'}</span> : null}
+            {exportNowMutation.data?.master_catalog_export_status?.written ? (
+              <span className="form-success">Master catalog export updated.</span>
+            ) : null}
+            {exportNowMutation.data?.master_catalog_export_status && !exportNowMutation.data?.master_catalog_export_status?.written ? (
+              <span className="form-error">
+                {exportNowMutation.data.master_catalog_export_status.reason === 'path_not_configured'
+                  ? 'Set a catalog export path before exporting.'
+                  : 'Master catalog export did not complete.'}
+              </span>
+            ) : null}
+            {exportNowMutation.error ? <span className="form-error">{exportNowMutation.error.message || 'Failed to export master catalog.'}</span> : null}
           </div>
           <div className="settings-summary-box">
             <div className="row-title">Current status</div>
@@ -301,6 +334,15 @@ export default function Settings() {
             </div>
             <div className="row-subtitle">
               Master catalog export: {integrationSettingsQuery.data?.master_catalog_export_path || 'Not configured'}
+            </div>
+            <div className="row-subtitle">
+              Catalog status: {integrationSettingsQuery.data?.master_catalog_export_last_status || 'Unknown'}
+              {integrationSettingsQuery.data?.master_catalog_export_last_reason
+                ? ` | ${integrationSettingsQuery.data.master_catalog_export_last_reason}`
+                : ''}
+            </div>
+            <div className="row-subtitle">
+              Last catalog attempt: {integrationSettingsQuery.data?.master_catalog_export_last_attempted_at || 'Never'}
             </div>
             <div className="row-subtitle">
               Last catalog write: {integrationSettingsQuery.data?.master_catalog_export_last_written_at || 'Never'} | Rows: {integrationSettingsQuery.data?.master_catalog_export_last_row_count || 0}

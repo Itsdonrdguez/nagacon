@@ -35,6 +35,9 @@ def get_integration_settings(db: Session = Depends(get_db)):
     raw = get_setting(db, "external_api_keys", default="", organization_id=getattr(org, "id", None)) or ""
     pdf_download_path = get_setting(db, "pdf_download_path", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_path = get_setting(db, "master_catalog_export_path", default="", organization_id=getattr(org, "id", None)) or ""
+    master_catalog_export_last_attempted_at = get_setting(db, "master_catalog_export_last_attempted_at", default="", organization_id=getattr(org, "id", None)) or ""
+    master_catalog_export_last_status = get_setting(db, "master_catalog_export_last_status", default="", organization_id=getattr(org, "id", None)) or ""
+    master_catalog_export_last_reason = get_setting(db, "master_catalog_export_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_written_at = get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_row_count = get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=getattr(org, "id", None)) or "0"
     keys = _split_keys(raw)
@@ -47,6 +50,9 @@ def get_integration_settings(db: Session = Depends(get_db)):
         "configured": len(keys) > 0,
         "pdf_download_path": pdf_download_path,
         "master_catalog_export_path": master_catalog_export_path,
+        "master_catalog_export_last_attempted_at": master_catalog_export_last_attempted_at,
+        "master_catalog_export_last_status": master_catalog_export_last_status,
+        "master_catalog_export_last_reason": master_catalog_export_last_reason,
         "master_catalog_export_last_written_at": master_catalog_export_last_written_at,
         "master_catalog_export_last_row_count": int(master_catalog_export_last_row_count or 0),
     }
@@ -97,9 +103,30 @@ def update_integration_settings(payload: dict, db: Session = Depends(get_db)):
         "configured": len(keys) > 0,
         "pdf_download_path": pdf_download_path,
         "master_catalog_export_path": master_catalog_export_path,
+        "master_catalog_export_last_attempted_at": get_setting(db, "master_catalog_export_last_attempted_at", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_status": get_setting(db, "master_catalog_export_last_status", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_reason": get_setting(db, "master_catalog_export_last_reason", default="", organization_id=org_id) or "",
         "master_catalog_export_last_written_at": get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=org_id) or "",
         "master_catalog_export_last_row_count": int(get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=org_id) or 0),
         "master_catalog_export_status": export_status,
+    }
+
+
+@router.post("/integrations/master-catalog/export-now")
+def export_master_catalog_now(db: Session = Depends(get_db)):
+    org = ensure_default_organization(db)
+    org_id = getattr(org, "id", None)
+    result = write_master_catalog_export(db, organization_id=org_id)
+    return {
+        "status": "ok",
+        "organization": _org_payload(org),
+        "master_catalog_export_status": result,
+        "master_catalog_export_path": get_setting(db, "master_catalog_export_path", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_attempted_at": get_setting(db, "master_catalog_export_last_attempted_at", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_status": get_setting(db, "master_catalog_export_last_status", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_reason": get_setting(db, "master_catalog_export_last_reason", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_written_at": get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=org_id) or "",
+        "master_catalog_export_last_row_count": int(get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=org_id) or 0),
     }
 
 

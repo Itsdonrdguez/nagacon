@@ -176,6 +176,19 @@ const formatDate = (value) => {
   })
 }
 
+const formatDateTime = (value) => {
+  if (!value) return ''
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return ''
+  return parsed.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
 const parseDate = (value) => {
   if (!value) return null
   const parsed = new Date(value)
@@ -343,6 +356,7 @@ export default function WorkQueue() {
   const recentCompletedItems = data.recent_completed_items || []
   const recentFailedItems = data.recent_failed_items || []
   const collectionSummary = data.collection_summary || {}
+  const masterCatalogExport = data.master_catalog_export || {}
 
   const backgroundJobQuery = useQuery({
     queryKey: ['work-queue-background-job', backgroundJobId],
@@ -715,7 +729,7 @@ export default function WorkQueue() {
         </Card>
       ) : null}
 
-      {(queueTodayResult || collectionSummary.tracked_total || backgroundJobQuery.data) ? (
+      {(queueTodayResult || collectionSummary.tracked_total || backgroundJobQuery.data || masterCatalogExport.path || masterCatalogExport.last_attempted_at || masterCatalogExport.last_status) ? (
         <Card title="Collection Activity">
           <div className="work-queue-activity-grid">
             {queueTodayResult ? (
@@ -746,6 +760,23 @@ export default function WorkQueue() {
                   Latest job: {String(backgroundJobQuery.data.status || '').toUpperCase()}
                   {backgroundJobQuery.data.progress?.current_label ? ` | ${backgroundJobQuery.data.progress.current_label}` : ''}
                 </div>
+              ) : null}
+            </div>
+            <div className="settings-summary-box">
+              <div className="row-title">Master Catalog Export</div>
+              <div className="row-subtitle">
+                Status {masterCatalogExport.last_status || 'Unknown'}
+                {masterCatalogExport.last_row_count ? ` | Rows ${masterCatalogExport.last_row_count}` : ''}
+              </div>
+              <div className="row-subtitle">
+                {masterCatalogExport.path || 'Path not configured'}
+              </div>
+              <div className="panel-subtitle">
+                Last attempt: {formatDateTime(masterCatalogExport.last_attempted_at) || 'Never'}
+                {masterCatalogExport.last_written_at ? ` | Last write: ${formatDateTime(masterCatalogExport.last_written_at)}` : ''}
+              </div>
+              {masterCatalogExport.last_reason ? (
+                <div className="panel-subtitle">{masterCatalogExport.last_reason}</div>
               ) : null}
             </div>
           </div>

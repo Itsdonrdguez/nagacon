@@ -13,6 +13,7 @@ from app.models.opportunity import Opportunity
 from app.models.pipeline_item import PipelineItem
 from app.models.search_job import SearchJob
 from app.models.vendor import VendorLead, VendorQuote
+from app.services.app_settings_service import get_setting
 from app.models.workspace import WorkspaceArtifact, WorkspaceTask
 from app.services.opportunity_brief import build_contract_brief, build_readiness_assessment
 from app.services.search_jobs import record_search_job, start_search_job
@@ -947,6 +948,14 @@ def build_daily_work_queue(
         "failed": recent_failed_summary.get("FAILED", 0),
     }
     collection_summary["tracked_total"] = sum(collection_summary.values())
+    master_catalog_export = {
+        "path": get_setting(db, "master_catalog_export_path", default="", organization_id=organization_id) or "",
+        "last_attempted_at": get_setting(db, "master_catalog_export_last_attempted_at", default="", organization_id=organization_id) or "",
+        "last_status": get_setting(db, "master_catalog_export_last_status", default="", organization_id=organization_id) or "",
+        "last_reason": get_setting(db, "master_catalog_export_last_reason", default="", organization_id=organization_id) or "",
+        "last_written_at": get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=organization_id) or "",
+        "last_row_count": int(get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=organization_id) or 0),
+    }
 
     return {
         "items": items,
@@ -963,6 +972,7 @@ def build_daily_work_queue(
         "recent_completed_total": len(recent_completed_items),
         "recent_failed_total": len(recent_failed_items),
         "cooldown_hours": COMPLETED_QUEUE_COOLDOWN_HOURS,
+        "master_catalog_export": master_catalog_export,
         "generated_at": current_time.isoformat(),
     }
 

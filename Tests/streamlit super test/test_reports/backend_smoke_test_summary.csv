@@ -1,4 +1,0 @@
-opportunity_id,solicitation_number,title,parse_ok,checklist_ok,vendors_ok,email_ok,seed_quotes_ok,quotes_count,vendor_artifact_count,vendor_artifact_has_vendors,download_pdfs_ok,file_count,official_pdf_count,snapshot_count,export_ok
-3,3610-01-725-1172,3610-01-725-1172,True,True,True,True,True,0,0,False,True,1,0,1,True
-2,3610-01-723-6246,3610-01-723-6246,True,True,True,True,True,0,0,False,True,1,0,1,True
-1,3610-01-721-4071,3610-01-721-4071,True,True,True,True,True,0,0,False,True,1,0,1,True

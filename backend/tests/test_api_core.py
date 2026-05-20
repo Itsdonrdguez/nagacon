@@ -12,6 +12,7 @@ from app.api import workspace as workspace_api
 from app.api import work_queue as work_queue_api
 from app.api import files as files_api
 from app.api.routes import company as company_api
+from app.api.routes import health_check as health_check_api
 from app.api.routes import nsn as nsn_api
 from app.api.routes import pipeline as pipeline_api
 from app.api.routes import providers as providers_api
@@ -69,6 +70,148 @@ def test_opportunities_search_returns_paginated_payload(client, monkeypatch):
     assert payload["items"][0]["id"] == 7
     assert payload["items"][0]["workspace_url"] == "/workspace/7"
     assert payload["items"][0]["solicitation_status"] == "OPEN"
+
+
+def test_serialize_opportunities_marks_workspace_when_prep_artifacts_exist():
+    opportunity = SimpleNamespace(
+        id=77,
+        source="DIBBS",
+        source_opportunity_id="D-77",
+        solicitation_number="SOL-77",
+        title="Prepared Valve",
+        agency="DLA",
+        sub_agency=None,
+        office=None,
+        url="https://example.test/opps/77",
+        posted_at=None,
+        due_at=None,
+        naics="332911",
+        fsc="4820",
+        set_aside="Small Business",
+        place_of_performance=None,
+        raw_text=None,
+        parsed_json=None,
+        raw_payload=None,
+        status="new",
+        workspace_url="/workspace/77",
+        workspace_api_url="/api/workspace/summary?opp_id=77",
+        raw_title="Prepared Valve",
+        display_title="Prepared Valve",
+        source_uniform_title="Prepared Valve",
+        summary_text="Summary",
+    )
+
+    class FakeCountQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def group_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+    class FakeListQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+    class FakeDB:
+        def query(self, *entities):
+            if len(entities) == 1 and entities[0] is opportunities_api.PipelineItem:
+                return FakeListQuery([])
+            if len(entities) == 1 and entities[0] is opportunities_api.SearchJob:
+                return FakeListQuery([])
+            if len(entities) == 1 and entities[0] is opportunities_api.BidSubmission.opportunity_id:
+                return FakeListQuery([])
+            if len(entities) == 2 and entities[0] is opportunities_api.OpportunityFile.opportunity_id:
+                return FakeCountQuery([(77, 1)])
+            if len(entities) == 2 and entities[0] is opportunities_api.WorkspaceArtifact.opportunity_id:
+                return FakeCountQuery([])
+            if len(entities) == 2 and entities[0] is opportunities_api.VendorLead.opportunity_id:
+                return FakeCountQuery([])
+            raise AssertionError(f"Unexpected query entities: {entities}")
+
+    payload = opportunities_api._serialize_opportunities_with_pipeline(FakeDB(), [opportunity], organization_id=1)
+
+    assert payload[0]["has_workspace"] is True
+
+
+def test_serialize_opportunities_does_not_treat_submission_only_as_prepared():
+    opportunity = SimpleNamespace(
+        id=78,
+        source="DIBBS",
+        source_opportunity_id="D-78",
+        solicitation_number="SOL-78",
+        title="Submission Only",
+        agency="DLA",
+        sub_agency=None,
+        office=None,
+        url="https://example.test/opps/78",
+        posted_at=None,
+        due_at=None,
+        naics="332911",
+        fsc="4820",
+        set_aside="Small Business",
+        place_of_performance=None,
+        raw_text=None,
+        parsed_json=None,
+        raw_payload=None,
+        status="new",
+        workspace_url="/workspace/78",
+        workspace_api_url="/api/workspace/summary?opp_id=78",
+        raw_title="Submission Only",
+        display_title="Submission Only",
+        source_uniform_title="Submission Only",
+        summary_text="Summary",
+    )
+
+    class FakeCountQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def group_by(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+    class FakeListQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+    class FakeDB:
+        def query(self, *entities):
+            if len(entities) == 1 and entities[0] is opportunities_api.PipelineItem:
+                return FakeListQuery([])
+            if len(entities) == 2 and entities[0] is opportunities_api.OpportunityFile.opportunity_id:
+                return FakeCountQuery([])
+            if len(entities) == 2 and entities[0] is opportunities_api.WorkspaceArtifact.opportunity_id:
+                return FakeCountQuery([])
+            if len(entities) == 2 and entities[0] is opportunities_api.VendorLead.opportunity_id:
+                return FakeCountQuery([])
+            raise AssertionError(f"Unexpected query entities: {entities}")
+
+    payload = opportunities_api._serialize_opportunities_with_pipeline(FakeDB(), [opportunity], organization_id=1)
+
+    assert payload[0]["has_workspace"] is False
 
 
 def test_company_profile_create_uses_repository(client, monkeypatch):
@@ -299,6 +442,101 @@ def test_workspace_usaspending_route_returns_research_payload(client, monkeypatc
     assert payload["likely_vendors"][0]["vendor"] == "Acme Federal"
 
 
+def test_health_route_stays_lightweight(client, monkeypatch):
+    monkeypatch.setattr(
+        health_check_api,
+        "ensure_default_organization",
+        lambda db: SimpleNamespace(id=1, name="Default Organization", slug="default"),
+    )
+    monkeypatch.setattr(health_check_api, "get_setting", lambda *args, **kwargs: "")
+    monkeypatch.setattr(health_check_api, "get_effective_sam_api_key_source", lambda db, user_id=None: "user")
+    monkeypatch.setattr(health_check_api, "get_effective_sam_api_key", lambda db, user_id=None: "SAM-key")
+
+    class FakeQuery:
+        def __init__(self, result):
+            self.result = result
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return self.result
+
+        def count(self):
+            return 1
+
+    class FakeDB:
+        def execute(self, *args, **kwargs):
+            return 1
+
+        def query(self, model):
+            if model is health_check_api.Opportunity:
+                return FakeQuery(SimpleNamespace(id=9))
+            raise AssertionError(f"Unexpected model queried: {model}")
+
+    def override_get_db():
+        yield FakeDB()
+
+    client.app.dependency_overrides[health_check_api.get_db] = override_get_db
+    response = client.get("/api/health/")
+    client.app.dependency_overrides.pop(health_check_api.get_db, None)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "diagnostics" not in payload
+    assert payload["checks"]["database"] == "OK"
+
+
+def test_health_diagnostics_runs_expensive_checks(client, monkeypatch):
+    monkeypatch.setattr(
+        health_check_api,
+        "ensure_default_organization",
+        lambda db: SimpleNamespace(id=1, name="Default Organization", slug="default"),
+    )
+    monkeypatch.setattr(health_check_api, "get_setting", lambda *args, **kwargs: "")
+    monkeypatch.setattr(health_check_api, "get_effective_sam_api_key_source", lambda db, user_id=None: "user")
+    monkeypatch.setattr(health_check_api, "get_effective_sam_api_key", lambda db, user_id=None: "SAM-key")
+    monkeypatch.setattr(health_check_api, "find_predecessor_opportunities", lambda db, opp_id: [SimpleNamespace(id=1), SimpleNamespace(id=2)])
+    monkeypatch.setattr(health_check_api, "search_usaspending_for_opportunity", lambda opp, db=None: {"awards_found": 3})
+
+    class FakeQuery:
+        def __init__(self, result):
+            self.result = result
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return self.result
+
+        def count(self):
+            return 1
+
+        def filter(self, *args, **kwargs):
+            return self
+
+    class FakeDB:
+        def execute(self, *args, **kwargs):
+            return 1
+
+        def query(self, model):
+            if model is health_check_api.Opportunity:
+                return FakeQuery(SimpleNamespace(id=9))
+            raise AssertionError(f"Unexpected model queried: {model}")
+
+    def override_get_db():
+        yield FakeDB()
+
+    client.app.dependency_overrides[health_check_api.get_db] = override_get_db
+    response = client.get("/api/health/diagnostics")
+    client.app.dependency_overrides.pop(health_check_api.get_db, None)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["diagnostics"]["predecessor_engine"] == "OK (2 matches)"
+    assert payload["diagnostics"]["usaspending"] == "OK (3 awards)"
+
+
 def test_generate_research_brief_route_returns_artifact(client, monkeypatch):
     opportunity = SimpleNamespace(id=33, title="Valve Body", display_title="Valve Body")
     artifact = SimpleNamespace(
@@ -520,7 +758,8 @@ def test_settings_route_preserves_existing_external_api_keys_on_blank_save(clien
     monkeypatch.setattr("app.api.routes.settings.ensure_default_organization", lambda db: default_org)
 
     def fake_upsert(db, setting_key, setting_value, organization_id=None):
-        stored["value"] = setting_value
+        if setting_key == "external_api_keys":
+            stored["value"] = setting_value
         return SimpleNamespace(id=5)
 
     monkeypatch.setattr("app.api.routes.settings.upsert_setting", fake_upsert)
@@ -575,6 +814,66 @@ def test_provider_settings_blank_secret_fields_are_not_saved(client, monkeypatch
     assert payload["status"] == "saved"
     assert "sam_api_key" not in [key for key, _ in saved_keys]
     assert "openai_api_key" not in [key for key, _ in saved_keys]
+
+
+def test_integration_settings_include_and_save_auto_workspace_prep(client, monkeypatch):
+    default_org = SimpleNamespace(id=9, name="Default Organization", slug="default")
+    stored = {}
+
+    monkeypatch.setattr("app.api.routes.settings.ensure_default_organization", lambda db: default_org)
+
+    def fake_get_setting(db, key, default="", organization_id=None):
+        return stored.get(key, default)
+
+    def fake_upsert(db, setting_key, setting_value, organization_id=None):
+        stored[setting_key] = setting_value
+        return SimpleNamespace(id=5)
+
+    monkeypatch.setattr("app.api.routes.settings.get_setting", fake_get_setting)
+    monkeypatch.setattr("app.api.routes.settings.upsert_setting", fake_upsert)
+    monkeypatch.setattr("app.api.routes.settings.write_master_catalog_export", lambda db, organization_id=None: {"written": False, "reason": "path_not_configured"})
+
+    response = client.put("/api/settings/integrations", json={"auto_workspace_prep_enabled": False})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert stored["auto_workspace_prep_enabled"] == "false"
+    assert payload["auto_workspace_prep_enabled"] is False
+
+
+def test_workspace_prep_run_now_route_returns_status(client, monkeypatch):
+    default_org = SimpleNamespace(id=9, name="Default Organization", slug="default")
+
+    monkeypatch.setattr("app.api.routes.settings.ensure_default_organization", lambda db: default_org)
+    monkeypatch.setattr(
+        "app.api.routes.settings.queue_workspace_prep_for_opportunities",
+        lambda db, organization_id=None, manual=False: {
+            "queued": 3,
+            "candidates": 8,
+            "skipped_existing": 2,
+            "skipped_backpressure": 1,
+            "status": "deferred_backpressure",
+        },
+    )
+    monkeypatch.setattr(
+        "app.api.routes.settings.get_setting",
+        lambda db, key, default="", organization_id=None: {
+            "auto_workspace_prep_enabled": "true",
+            "auto_workspace_prep_last_attempted_at": "2026-05-20T10:00:00",
+            "auto_workspace_prep_last_status": "deferred_backpressure",
+            "auto_workspace_prep_last_reason": "workspace_intake_backpressure",
+            "auto_workspace_prep_last_completed_at": "",
+            "auto_workspace_prep_last_queued_count": "3",
+            "auto_workspace_prep_last_candidate_count": "8",
+        }.get(key, default),
+    )
+
+    response = client.post("/api/settings/integrations/workspace-prep/run-now")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workspace_prep_status"]["queued"] == 3
+    assert payload["auto_workspace_prep_enabled"] is True
 
 
 def test_current_organization_route_returns_default_org(client, monkeypatch):

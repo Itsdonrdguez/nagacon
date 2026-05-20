@@ -76,6 +76,7 @@ class OpportunityUpdate(BaseModel):
 
 class OpportunityRead(OpportunityBase):
     id: int
+    has_workspace: bool = False
     decision_status: str | None = None
     pipeline_owner: str | None = None
     target_submit_date: datetime | None = None

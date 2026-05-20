@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.pipeline_item import PipelineItem
-from app.models.search_job import SearchJob
+from app.models.opportunity_file import OpportunityFile
+from app.models.vendor import VendorLead
+from app.models.workspace import WorkspaceArtifact
 from app.repositories.opportunities import OpportunityRepository
 from app.schemas.opportunity import IngestResult, OpportunityCreate, OpportunityRead, OpportunityUpdate, RawOpportunity
 from app.services.search_jobs import start_search_job
 from app.services.opportunities.ingest import ingest_raw_opportunities
+from app.services.work_queue import workspace_intake_backpressure_snapshot
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
 
@@ -27,19 +31,54 @@ def _opportunity_repo(db: Session, organization_id: int | None):
         return OpportunityRepository(db)
 
 
+def _count_related_by_opportunity(db: Session, model, opp_ids: list[int], organization_id: int | None):
+    if not opp_ids:
+        return {}
+    query = db.query(model.opportunity_id, func.count(model.id)).filter(model.opportunity_id.in_(opp_ids))
+    if organization_id is not None and hasattr(model, "organization_id"):
+        query = query.filter(model.organization_id == organization_id)
+    return {int(opp_id): int(count) for opp_id, count in query.group_by(model.opportunity_id).all()}
+
+
 def _serialize_opportunities_with_pipeline(db: Session, items: list, organization_id: int | None):
     opp_ids = [getattr(item, "id", None) for item in items if getattr(item, "id", None) is not None]
     pipeline_lookup = {}
+    file_counts = {}
+    artifact_counts = {}
+    nsn_intelligence_counts = {}
+    lead_counts = {}
     if opp_ids:
-        query = db.query(PipelineItem).filter(PipelineItem.opportunity_id.in_(opp_ids))
-        if organization_id is not None:
-            query = query.filter(PipelineItem.organization_id == organization_id)
-        pipeline_lookup = {row.opportunity_id: row for row in query.all()}
+        try:
+            query = db.query(PipelineItem).filter(PipelineItem.opportunity_id.in_(opp_ids))
+            if organization_id is not None:
+                query = query.filter(PipelineItem.organization_id == organization_id)
+            pipeline_lookup = {row.opportunity_id: row for row in query.all()}
+            file_counts = _count_related_by_opportunity(db, OpportunityFile, opp_ids, organization_id)
+            artifact_counts = _count_related_by_opportunity(db, WorkspaceArtifact, opp_ids, organization_id)
+            nsn_intelligence_counts = _count_related_by_opportunity(
+                db,
+                WorkspaceArtifact,
+                opp_ids,
+                organization_id,
+                artifact_type="NSN_INTELLIGENCE",
+            )
+            lead_counts = _count_related_by_opportunity(db, VendorLead, opp_ids, organization_id)
+        except Exception:
+            if hasattr(db, "rollback"):
+                db.rollback()
 
     payload = []
     for item in items:
         serialized = OpportunityRead.model_validate(item).model_dump()
         pipeline = pipeline_lookup.get(getattr(item, "id", None))
+        opp_id = getattr(item, "id", None)
+        serialized["has_workspace"] = bool(
+            pipeline
+            or file_counts.get(opp_id, 0) > 0
+            or artifact_counts.get(opp_id, 0) > 0
+            or lead_counts.get(opp_id, 0) > 0
+            or nsn_intelligence_counts.get(opp_id, 0) > 0
+        )
         if pipeline:
             serialized["decision_status"] = getattr(getattr(pipeline, "decision_status", None), "value", pipeline.decision_status)
             serialized["pipeline_owner"] = getattr(pipeline, "owner", None)
@@ -179,16 +218,25 @@ def bulk_prepare_workspace(
 
     download_documents = bool(payload.get("download_documents", True))
     run_usaspending = bool(payload.get("run_usaspending", True))
+    backpressure = workspace_intake_backpressure_snapshot(db, org_id)
+    queue_budget = len(opps)
+    available_slots = backpressure.get("available_slots")
+    if isinstance(available_slots, int) and available_slots > 0:
+        queue_budget = min(queue_budget, available_slots)
 
     queued_jobs: list[dict[str, object]] = []
     skipped_duplicates: list[int] = []
     archived_skips: list[int] = []
+    backpressure_skips: list[int] = []
     for opp in opps:
         if getattr(opp, "opportunity_lifecycle", None) == "ARCHIVED":
             archived_skips.append(int(opp.id))
             continue
         if int(opp.id) in active_ids:
             skipped_duplicates.append(int(opp.id))
+            continue
+        if queue_budget <= 0:
+            backpressure_skips.append(int(opp.id))
             continue
         job = start_search_job(
             "workspace_intake",
@@ -208,6 +256,7 @@ def bulk_prepare_workspace(
                 "title": getattr(opp, "display_title", None) or getattr(opp, "title", None),
             }
         )
+        queue_budget = max(0, queue_budget - 1)
 
     return {
         "status": "ok",
@@ -216,8 +265,11 @@ def bulk_prepare_workspace(
         "queued_jobs": queued_jobs,
         "skipped_duplicate_count": len(skipped_duplicates),
         "skipped_duplicate_opportunity_ids": skipped_duplicates,
+        "skipped_backpressure_count": len(backpressure_skips),
+        "skipped_backpressure_opportunity_ids": backpressure_skips,
         "archived_skip_count": len(archived_skips),
         "archived_skip_opportunity_ids": archived_skips,
+        "workspace_intake_backpressure": backpressure,
     }
 
 

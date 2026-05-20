@@ -48,12 +48,14 @@ def build_nsn_intelligence(
     _emit(progress_callback, "providers", "Seeding organization provider candidates", 3, 4)
     summary = get_nsn_catalog_summary(db, target.nsn)
     _emit(progress_callback, "summary", "Finalizing NSN intelligence summary", 4, 4)
+    errors = list(refresh_result.get("errors") or [])
     return {
         "status": "ok" if refresh_result.get("status") == "ok" else refresh_result.get("status"),
         "nsn": target.nsn,
         "publog": publog_result,
         "refresh": refresh_result,
         "summary": summary,
+        "errors": errors,
     }
 
 

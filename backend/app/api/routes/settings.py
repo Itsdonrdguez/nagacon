@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.services.app_settings_service import get_setting, upsert_setting
+from app.services.auto_ingest_scheduler import queue_workspace_prep_for_opportunities
 from app.services.master_catalog_export import write_master_catalog_export
 from app.services.org_service import ensure_default_organization
 from app.services.provider_settings_service import get_provider_settings
@@ -40,6 +41,13 @@ def get_integration_settings(db: Session = Depends(get_db)):
     master_catalog_export_last_reason = get_setting(db, "master_catalog_export_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_written_at = get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_row_count = get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=getattr(org, "id", None)) or "0"
+    auto_workspace_prep_enabled = get_setting(db, "auto_workspace_prep_enabled", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_attempted_at = get_setting(db, "auto_workspace_prep_last_attempted_at", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_status = get_setting(db, "auto_workspace_prep_last_status", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_reason = get_setting(db, "auto_workspace_prep_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_completed_at = get_setting(db, "auto_workspace_prep_last_completed_at", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_queued_count = get_setting(db, "auto_workspace_prep_last_queued_count", default="0", organization_id=getattr(org, "id", None)) or "0"
+    auto_workspace_prep_last_candidate_count = get_setting(db, "auto_workspace_prep_last_candidate_count", default="0", organization_id=getattr(org, "id", None)) or "0"
     keys = _split_keys(raw)
     return {
         "organization": _org_payload(org),
@@ -55,6 +63,13 @@ def get_integration_settings(db: Session = Depends(get_db)):
         "master_catalog_export_last_reason": master_catalog_export_last_reason,
         "master_catalog_export_last_written_at": master_catalog_export_last_written_at,
         "master_catalog_export_last_row_count": int(master_catalog_export_last_row_count or 0),
+        "auto_workspace_prep_enabled": str(auto_workspace_prep_enabled).strip().lower() in {"1", "true", "yes", "on"} if auto_workspace_prep_enabled != "" else True,
+        "auto_workspace_prep_last_attempted_at": auto_workspace_prep_last_attempted_at,
+        "auto_workspace_prep_last_status": auto_workspace_prep_last_status,
+        "auto_workspace_prep_last_reason": auto_workspace_prep_last_reason,
+        "auto_workspace_prep_last_completed_at": auto_workspace_prep_last_completed_at,
+        "auto_workspace_prep_last_queued_count": int(auto_workspace_prep_last_queued_count or 0),
+        "auto_workspace_prep_last_candidate_count": int(auto_workspace_prep_last_candidate_count or 0),
     }
 
 
@@ -65,9 +80,11 @@ def update_integration_settings(payload: dict, db: Session = Depends(get_db)):
     existing_value = get_setting(db, "external_api_keys", default="", organization_id=org_id) or ""
     existing_pdf_download_path = get_setting(db, "pdf_download_path", default="", organization_id=org_id) or ""
     existing_master_catalog_export_path = get_setting(db, "master_catalog_export_path", default="", organization_id=org_id) or ""
+    existing_auto_workspace_prep_enabled = get_setting(db, "auto_workspace_prep_enabled", default="", organization_id=org_id)
     csv_value = (payload.get("external_api_keys_csv") or "").strip()
     pdf_download_path = (payload.get("pdf_download_path") or "").strip()
     master_catalog_export_path = (payload.get("master_catalog_export_path") or "").strip()
+    auto_workspace_prep_enabled = payload.get("auto_workspace_prep_enabled")
     clear_requested = bool(payload.get("clear_external_api_keys"))
     clear_pdf_path = bool(payload.get("clear_pdf_download_path"))
     clear_master_catalog_export_path = bool(payload.get("clear_master_catalog_export_path"))
@@ -83,9 +100,17 @@ def update_integration_settings(payload: dict, db: Session = Depends(get_db)):
         pdf_download_path = ""
     if clear_master_catalog_export_path:
         master_catalog_export_path = ""
+    if auto_workspace_prep_enabled is None:
+        auto_workspace_prep_enabled = existing_auto_workspace_prep_enabled
     record = upsert_setting(db, "external_api_keys", csv_value, organization_id=getattr(org, "id", None))
     upsert_setting(db, "pdf_download_path", pdf_download_path, organization_id=getattr(org, "id", None))
     upsert_setting(db, "master_catalog_export_path", master_catalog_export_path, organization_id=getattr(org, "id", None))
+    upsert_setting(
+        db,
+        "auto_workspace_prep_enabled",
+        "true" if str(auto_workspace_prep_enabled).strip().lower() in {"1", "true", "yes", "on"} else "false",
+        organization_id=getattr(org, "id", None),
+    )
     keys = _split_keys(csv_value)
     export_status = (
         write_master_catalog_export(db, organization_id=org_id)
@@ -108,6 +133,13 @@ def update_integration_settings(payload: dict, db: Session = Depends(get_db)):
         "master_catalog_export_last_reason": get_setting(db, "master_catalog_export_last_reason", default="", organization_id=org_id) or "",
         "master_catalog_export_last_written_at": get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=org_id) or "",
         "master_catalog_export_last_row_count": int(get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=org_id) or 0),
+        "auto_workspace_prep_enabled": (get_setting(db, "auto_workspace_prep_enabled", default="true", organization_id=org_id) or "true").strip().lower() in {"1", "true", "yes", "on"},
+        "auto_workspace_prep_last_attempted_at": get_setting(db, "auto_workspace_prep_last_attempted_at", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_status": get_setting(db, "auto_workspace_prep_last_status", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_reason": get_setting(db, "auto_workspace_prep_last_reason", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_completed_at": get_setting(db, "auto_workspace_prep_last_completed_at", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_queued_count": int(get_setting(db, "auto_workspace_prep_last_queued_count", default="0", organization_id=org_id) or 0),
+        "auto_workspace_prep_last_candidate_count": int(get_setting(db, "auto_workspace_prep_last_candidate_count", default="0", organization_id=org_id) or 0),
         "master_catalog_export_status": export_status,
     }
 
@@ -127,6 +159,25 @@ def export_master_catalog_now(db: Session = Depends(get_db)):
         "master_catalog_export_last_reason": get_setting(db, "master_catalog_export_last_reason", default="", organization_id=org_id) or "",
         "master_catalog_export_last_written_at": get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=org_id) or "",
         "master_catalog_export_last_row_count": int(get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=org_id) or 0),
+    }
+
+
+@router.post("/integrations/workspace-prep/run-now")
+def run_workspace_prep_now(db: Session = Depends(get_db)):
+    org = ensure_default_organization(db)
+    org_id = getattr(org, "id", None)
+    result = queue_workspace_prep_for_opportunities(db, organization_id=org_id, manual=True)
+    return {
+        "status": "ok",
+        "organization": _org_payload(org),
+        "workspace_prep_status": result,
+        "auto_workspace_prep_enabled": (get_setting(db, "auto_workspace_prep_enabled", default="true", organization_id=org_id) or "true").strip().lower() in {"1", "true", "yes", "on"},
+        "auto_workspace_prep_last_attempted_at": get_setting(db, "auto_workspace_prep_last_attempted_at", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_status": get_setting(db, "auto_workspace_prep_last_status", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_reason": get_setting(db, "auto_workspace_prep_last_reason", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_completed_at": get_setting(db, "auto_workspace_prep_last_completed_at", default="", organization_id=org_id) or "",
+        "auto_workspace_prep_last_queued_count": int(get_setting(db, "auto_workspace_prep_last_queued_count", default="0", organization_id=org_id) or 0),
+        "auto_workspace_prep_last_candidate_count": int(get_setting(db, "auto_workspace_prep_last_candidate_count", default="0", organization_id=org_id) or 0),
     }
 
 

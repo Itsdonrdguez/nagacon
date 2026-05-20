@@ -9,6 +9,7 @@ from app.models.provider import Provider, ProviderItem  # noqa: F401
 from app.models.price_history import PriceHistory  # noqa: F401
 from app.models.award_history import AwardHistory  # noqa: F401
 from app.models.search_job import SearchJob  # noqa: F401
+from app.models.closed_solicitation_processing import ClosedSolicitationProcessingRecord  # noqa: F401
 from app.models.nsn_catalog import (  # noqa: F401
     NsnCatalogImportRun,
     NsnAwardEvidence,

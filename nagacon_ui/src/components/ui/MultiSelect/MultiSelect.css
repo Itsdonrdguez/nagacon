@@ -85,6 +85,13 @@
   gap: 0.35rem;
 }
 
+.multi-select-instruction {
+  font-size: 0.78rem;
+  color: #64748b;
+  line-height: 1.35;
+  padding: 0 0.1rem;
+}
+
 .multi-select-option {
   display: flex;
   align-items: flex-start;

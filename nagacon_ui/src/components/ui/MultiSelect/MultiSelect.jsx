@@ -49,7 +49,7 @@ export default function MultiSelect({
   }, [options, search])
 
   const customValue = useMemo(() => normalizeValue(search), [search, normalizeValue])
-  const canAddCustom = allowCustom && customValue && !options.some((option) => option.value === customValue)
+  const canAddCustom = allowCustom && customValue && !options.some((option) => option.value === customValue) && !selectedSet.has(customValue)
 
   const selectedSummary = useMemo(() => {
     if (!normalizedValue.length) return 'Select one or more'
@@ -77,6 +77,54 @@ export default function MultiSelect({
     setSearch('')
   }
 
+  function addCustomValuesFromInput(rawValue) {
+    const nextValues = String(rawValue || '')
+      .split(/[,\n;]+/)
+      .map((item) => normalizeValue(item))
+      .filter(Boolean)
+
+    if (!nextValues.length) return false
+
+    const knownOptionValues = new Set(options.map((option) => option.value))
+    const merged = [...normalizedValue]
+    let changed = false
+
+    nextValues.forEach((nextValue) => {
+      if (selectedSet.has(nextValue)) return
+      if (knownOptionValues.has(nextValue)) {
+        merged.push(nextValue)
+        changed = true
+        return
+      }
+      if (allowCustom) {
+        merged.push(nextValue)
+        changed = true
+      }
+    })
+
+    if (!changed) return false
+    updateSelection(merged)
+    setSearch('')
+    return true
+  }
+
+  function handleSearchKeyDown(event) {
+    if (event.key === 'Enter') {
+      if (addCustomValuesFromInput(search)) {
+        event.preventDefault()
+      }
+    }
+  }
+
+  function handleSearchPaste(event) {
+    if (!allowCustom) return
+    const pastedText = event.clipboardData?.getData('text') || ''
+    if (!/[,\n;]/.test(pastedText)) return
+    if (addCustomValuesFromInput(pastedText)) {
+      event.preventDefault()
+    }
+  }
+
   return (
     <div className="multi-select-wrapper" ref={wrapperRef}>
       {label ? <label className="input-label">{label}</label> : null}
@@ -97,9 +145,16 @@ export default function MultiSelect({
             className="multi-select-search"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
+            onKeyDown={handleSearchKeyDown}
+            onPaste={handleSearchPaste}
             placeholder={placeholder}
             autoFocus
           />
+          {allowCustom ? (
+            <div className="multi-select-instruction">
+              Type one or more {customTypeLabel}s separated by commas, then press Enter to add them.
+            </div>
+          ) : null}
           <div className="multi-select-options">
             {filteredOptions.map((option) => {
               const checked = selectedSet.has(option.value)

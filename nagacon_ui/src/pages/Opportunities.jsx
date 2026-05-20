@@ -649,7 +649,7 @@ export default function Opportunities() {
                           disabled={opp.bid_eligible === false}
                           onClick={() => createPipelineMutation.mutate(opp.id)}
                         >
-                          {opp.bid_eligible === false ? 'Research Only' : 'Create Workspace'}
+                          {opp.bid_eligible === false ? 'Research Only' : (opp.has_workspace ? 'Prepare Workspace' : 'Create Workspace')}
                         </Button>
                       ) : null}
                       {opp.solicitation_status === 'CLOSED' && opp.opportunity_lifecycle !== 'ARCHIVED' ? (

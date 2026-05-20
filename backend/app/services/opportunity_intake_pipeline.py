@@ -189,7 +189,7 @@ def run_opportunity_intake_pipeline(
     if download_documents:
         run_and_progress(
             "download_documents",
-            lambda: download_pdfs_for_opportunity(db, opp.id, always_snapshot=True, prefer_dibbs_solicitation_detail=True),
+            lambda: download_pdfs_for_opportunity(db, opp.id, always_snapshot=False, prefer_dibbs_solicitation_detail=True),
         )
 
     parsed = run_and_progress("parse_opportunity", lambda: ensure_parsed(db, opp)) or {}

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.repositories.providers import ProviderRepository
@@ -712,8 +713,6 @@ def seed_vendor_leads_from_providers(
         filters.append(Provider.cage.in_(parsed_cages))
     if not filters:
         return {"created": 0, "updated": 0, "matched": 0}
-
-    from sqlalchemy import or_
 
     sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
     sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id)

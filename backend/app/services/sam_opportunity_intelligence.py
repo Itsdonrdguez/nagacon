@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from app.models.opportunity import Opportunity, OpportunityAnalysis
@@ -85,6 +85,22 @@ def _extract_requirements(text: str) -> list[str]:
     return deduped[:8]
 
 
+def _normalize_comparable_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _days_until_due(due_at: datetime | None) -> int | None:
+    due_value = _normalize_comparable_datetime(due_at)
+    if due_value is None:
+        return None
+    current_time = datetime.now(timezone.utc)
+    return int((due_value - current_time).total_seconds() // 86400)
+
+
 def _build_summary(
     *,
     title: str | None,
@@ -128,8 +144,8 @@ def build_sam_opportunity_intelligence(opp: Opportunity) -> dict[str, Any]:
     requirements = _extract_requirements(description)
 
     risk_flags: list[str] = []
-    if getattr(opp, "due_at", None):
-        days_until_due = (opp.due_at - datetime.utcnow()).days
+    days_until_due = _days_until_due(getattr(opp, "due_at", None))
+    if days_until_due is not None:
         if days_until_due <= 3:
             risk_flags.append("Response window is extremely short.")
         elif days_until_due <= 7:
@@ -158,8 +174,8 @@ def build_sam_opportunity_intelligence(opp: Opportunity) -> dict[str, Any]:
         title=getattr(opp, "title", None),
         agency=getattr(opp, "agency", None),
         due_at=getattr(opp, "due_at", None),
-        naics=getattr(opp, "naics", None),
-        set_aside=getattr(opp, "set_aside", None),
+        naics=getattr(opp, "naics_code", None),
+        set_aside=getattr(opp, "set_aside_type", None),
         place_of_performance=getattr(opp, "place_of_performance", None),
         description=description,
     )

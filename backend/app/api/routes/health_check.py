@@ -8,11 +8,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.deps import get_current_user, get_db
 from app.models.opportunity import Opportunity
+from app.research.predecessor_history import find_predecessor_opportunities
 from app.services.app_settings_service import get_setting
 from app.services.org_service import ensure_default_organization
-from app.services.research.usaspending_research_service import search_usaspending_for_opportunity
 from app.services.provider_settings_service import get_effective_sam_api_key, get_effective_sam_api_key_source
-from app.research.predecessor_history import find_predecessor_opportunities
+from app.services.research.usaspending_research_service import search_usaspending_for_opportunity
 from app.services.search_jobs import DEFAULT_LANE, QUEUE_LANE, VENDOR_LANE
 from app.services.storage import storage_root
 
@@ -35,8 +35,7 @@ def _path_status(value: str | None) -> dict[str, str | bool | None]:
     }
 
 
-@router.get("/")
-def health_check(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+def _base_runtime(db: Session, current_user) -> tuple[dict[str, str], dict[str, object], int | None]:
     checks: dict[str, str] = {}
     opp_id = None
 
@@ -69,23 +68,6 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
         else "MISSING"
     )
 
-    if opp_id:
-        try:
-            preds = find_predecessor_opportunities(db, opp_id)
-            checks["predecessor_engine"] = f"OK ({len(preds)} matches)"
-        except Exception as e:
-            checks["predecessor_engine"] = f"ERROR: {e}"
-
-        try:
-            opp = db.query(Opportunity).filter(Opportunity.id == opp_id).first()
-            research = search_usaspending_for_opportunity(opp, db=db)
-            checks["usaspending"] = f"OK ({research.get('awards_found', 0)} awards)"
-        except Exception as e:
-            checks["usaspending"] = f"ERROR: {e}"
-    else:
-        checks["predecessor_engine"] = "SKIPPED"
-        checks["usaspending"] = "SKIPPED"
-
     org = ensure_default_organization(db)
     pdf_download_path = get_setting(db, "pdf_download_path", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_path = get_setting(db, "master_catalog_export_path", default="", organization_id=getattr(org, "id", None)) or ""
@@ -94,13 +76,27 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
     master_catalog_export_last_reason = get_setting(db, "master_catalog_export_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_written_at = get_setting(db, "master_catalog_export_last_written_at", default="", organization_id=getattr(org, "id", None)) or ""
     master_catalog_export_last_row_count = get_setting(db, "master_catalog_export_last_row_count", default="0", organization_id=getattr(org, "id", None)) or "0"
+    daily_work_last_run_date = get_setting(db, "daily_work_last_run_date", default="", organization_id=getattr(org, "id", None)) or ""
+    daily_work_last_run_at = get_setting(db, "daily_work_last_run_at", default="", organization_id=getattr(org, "id", None)) or ""
+    daily_work_last_attempted_at = get_setting(db, "daily_work_last_attempted_at", default="", organization_id=getattr(org, "id", None)) or ""
+    daily_work_last_status = get_setting(db, "daily_work_last_status", default="", organization_id=getattr(org, "id", None)) or ""
+    daily_work_last_reason = get_setting(db, "daily_work_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_enabled = get_setting(db, "auto_workspace_prep_enabled", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_attempted_at = get_setting(db, "auto_workspace_prep_last_attempted_at", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_status = get_setting(db, "auto_workspace_prep_last_status", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_reason = get_setting(db, "auto_workspace_prep_last_reason", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_completed_at = get_setting(db, "auto_workspace_prep_last_completed_at", default="", organization_id=getattr(org, "id", None)) or ""
+    auto_workspace_prep_last_queued_count = get_setting(db, "auto_workspace_prep_last_queued_count", default="0", organization_id=getattr(org, "id", None)) or "0"
     storage_backend = str(getattr(settings, "STORAGE_BACKEND", "local") or "local").lower()
+
     runtime = {
         "app_env": str(getattr(settings, "APP_ENV", "dev") or "dev"),
         "app_role": str(getattr(settings, "APP_ROLE", "web") or "web"),
         "local_mode": bool(getattr(settings, "LOCAL_MODE", False)),
         "search_job_runner": str(getattr(settings, "SEARCH_JOB_RUNNER", "thread") or "thread"),
         "search_job_stale_seconds": int(getattr(settings, "SEARCH_JOB_STALE_SECONDS", 1800) or 1800),
+        "search_job_active_limit": int(getattr(settings, "SEARCH_JOB_ACTIVE_LIMIT", 5) or 5),
+        "search_job_background_active_limit": int(getattr(settings, "SEARCH_JOB_BACKGROUND_ACTIVE_LIMIT", 4) or 4),
         "sam_api_key_source": sam_key_source,
         "search_job_lane_concurrency": {
             QUEUE_LANE: int(getattr(settings, "SEARCH_JOB_QUEUE_MAX_CONCURRENCY", 2) or 2),
@@ -108,6 +104,11 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
             DEFAULT_LANE: int(getattr(settings, "SEARCH_JOB_MAX_CONCURRENCY", 4) or 4),
         },
         "auto_ingest_enabled": bool(getattr(settings, "AUTO_INGEST_ENABLED", True)),
+        "daily_work_enabled": bool(getattr(settings, "DAILY_WORK_ENABLED", True)),
+        "daily_work_limit": int(getattr(settings, "DAILY_WORK_LIMIT", 200) or 200),
+        "daily_work_run_hour_local": int(getattr(settings, "DAILY_WORK_RUN_HOUR_LOCAL", 6) or 6),
+        "daily_work_timezone": str(getattr(settings, "DAILY_WORK_TIMEZONE", "America/New_York") or "America/New_York"),
+        "auto_workspace_prep_enabled": str(auto_workspace_prep_enabled).strip().lower() in {"1", "true", "yes", "on"} if auto_workspace_prep_enabled != "" else bool(getattr(settings, "AUTO_WORKSPACE_PREP_ENABLED", True)),
         "auto_file_prune_enabled": bool(getattr(settings, "AUTO_FILE_PRUNE_ENABLED", True)),
         "storage_backend": storage_backend,
         "storage_local_root": str(storage_root()) if storage_backend == "local" else None,
@@ -118,6 +119,16 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
         "master_catalog_export_last_reason": master_catalog_export_last_reason or None,
         "master_catalog_export_last_written_at": master_catalog_export_last_written_at or None,
         "master_catalog_export_last_row_count": int(master_catalog_export_last_row_count or 0),
+        "daily_work_last_run_date": daily_work_last_run_date or None,
+        "daily_work_last_run_at": daily_work_last_run_at or None,
+        "daily_work_last_attempted_at": daily_work_last_attempted_at or None,
+        "daily_work_last_status": daily_work_last_status or None,
+        "daily_work_last_reason": daily_work_last_reason or None,
+        "auto_workspace_prep_last_attempted_at": auto_workspace_prep_last_attempted_at or None,
+        "auto_workspace_prep_last_status": auto_workspace_prep_last_status or None,
+        "auto_workspace_prep_last_reason": auto_workspace_prep_last_reason or None,
+        "auto_workspace_prep_last_completed_at": auto_workspace_prep_last_completed_at or None,
+        "auto_workspace_prep_last_queued_count": int(auto_workspace_prep_last_queued_count or 0),
         "publog_data_dir": _path_status(getattr(settings, "PUBLOG_DATA_DIR", "")),
         "publog_dvd_zip": _path_status(getattr(settings, "PUBLOG_DVD_ZIP", "")),
         "wbparts_enabled": bool(getattr(settings, "WBPARTS_ENABLED", True)),
@@ -133,6 +144,15 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
     checks["master_catalog_export_rows"] = str(runtime["master_catalog_export_last_row_count"])
     checks["master_catalog_export_last_attempted_at"] = runtime["master_catalog_export_last_attempted_at"] or "NEVER"
     checks["master_catalog_export_last_written_at"] = runtime["master_catalog_export_last_written_at"] or "NEVER"
+    checks["daily_work_last_run_date"] = runtime["daily_work_last_run_date"] or "NEVER"
+    checks["daily_work_last_run_at"] = runtime["daily_work_last_run_at"] or "NEVER"
+    checks["daily_work_last_attempted_at"] = runtime["daily_work_last_attempted_at"] or "NEVER"
+    checks["daily_work_last_status"] = runtime["daily_work_last_status"] or "UNKNOWN"
+    checks["auto_workspace_prep_enabled"] = _bool_label(runtime["auto_workspace_prep_enabled"])
+    checks["auto_workspace_prep_last_attempted_at"] = runtime["auto_workspace_prep_last_attempted_at"] or "NEVER"
+    checks["auto_workspace_prep_last_status"] = runtime["auto_workspace_prep_last_status"] or "UNKNOWN"
+    checks["auto_workspace_prep_last_completed_at"] = runtime["auto_workspace_prep_last_completed_at"] or "NEVER"
+    checks["auto_workspace_prep_last_queued_count"] = str(runtime["auto_workspace_prep_last_queued_count"])
     checks["publog_data_dir"] = (
         f"OK ({runtime['publog_data_dir']['path']})"
         if runtime["publog_data_dir"]["configured"] and runtime["publog_data_dir"]["exists"]
@@ -144,4 +164,40 @@ def health_check(db: Session = Depends(get_db), current_user=Depends(get_current
         else ("MISSING" if runtime["publog_dvd_zip"]["configured"] else "NOT CONFIGURED")
     )
 
+    return checks, runtime, opp_id
+
+
+@router.get("/")
+def health_check(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    checks, runtime, _ = _base_runtime(db, current_user)
     return {"status": "running", "checks": checks, "runtime": runtime}
+
+
+@router.get("/diagnostics")
+def health_diagnostics(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    checks, runtime, opp_id = _base_runtime(db, current_user)
+    diagnostics: dict[str, str] = {}
+
+    if opp_id:
+        try:
+            preds = find_predecessor_opportunities(db, opp_id)
+            diagnostics["predecessor_engine"] = f"OK ({len(preds)} matches)"
+        except Exception as e:
+            diagnostics["predecessor_engine"] = f"ERROR: {e}"
+
+        try:
+            opp = db.query(Opportunity).filter(Opportunity.id == opp_id).first()
+            research = search_usaspending_for_opportunity(opp, db=db)
+            diagnostics["usaspending"] = f"OK ({research.get('awards_found', 0)} awards)"
+        except Exception as e:
+            diagnostics["usaspending"] = f"ERROR: {e}"
+    else:
+        diagnostics["predecessor_engine"] = "SKIPPED"
+        diagnostics["usaspending"] = "SKIPPED"
+
+    return {
+        "status": "running",
+        "checks": checks,
+        "runtime": runtime,
+        "diagnostics": diagnostics,
+    }

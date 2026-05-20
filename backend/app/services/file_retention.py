@@ -7,6 +7,7 @@ from typing import Any
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.models.workspace import WorkspaceArtifact
+from app.services.closed_solicitation_processing import process_closed_solicitation_file, process_closed_solicitation_files_for_opportunity
 from app.services.storage import delete_reference, delete_reference_tree, storage_root
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
 from sqlalchemy.orm import Session, object_session
@@ -153,8 +154,6 @@ def prune_eligible_files_for_system(
     pruned_count = 0
     skipped_count = 0
     items: list[dict[str, Any]] = []
-    cleanup_dirs: set[str] = set()
-
     for file_record in files:
         opportunity = getattr(file_record, "opportunity", None)
         retention = classify_opportunity_file_retention(file_record, opportunity)
@@ -162,38 +161,25 @@ def prune_eligible_files_for_system(
             skipped_count += 1
             continue
 
-        original_ref = file_record.file_path
-        deleted = delete_reference(original_ref)
-        cleanup_dir = _storage_cleanup_dir_for_reference(original_ref)
-        if cleanup_dir:
-            cleanup_dirs.add(cleanup_dir)
-        metadata = dict(getattr(file_record, "parsed_metadata", None) or {})
-        metadata["_retention"] = {
-            **dict(metadata.get("_retention") or {}),
-            "status": "pruned",
-            "reason": retention.reason,
-            "pruned_at": datetime.utcnow().isoformat(),
-            "original_file_path": original_ref,
-            "deleted_from_storage": bool(deleted),
-        }
-        file_record.file_path = f"pruned://opportunity-file/{file_record.id}"
-        file_record.parsed_metadata = metadata
-        db.add(file_record)
-        pruned_count += 1
+        result = process_closed_solicitation_file(
+            db,
+            file_record,
+            opportunity=opportunity,
+            source_url=getattr(file_record, "source_url", None),
+        )
+        if result.get("deleted"):
+            pruned_count += 1
         items.append(
             {
                 "id": file_record.id,
                 "opportunity_id": file_record.opportunity_id,
                 "filename": file_record.filename,
-                "status": "pruned",
+                "status": result.get("extraction_status"),
                 "reason": retention.reason,
-                "deleted_from_storage": bool(deleted),
+                "deleted_from_storage": bool(result.get("deleted")),
+                "audit_record_id": result.get("audit_record_id"),
             }
         )
-
-    if pruned_count:
-        db.commit()
-        _remove_storage_dirs(cleanup_dirs)
 
     return {
         "pruned_count": pruned_count,
@@ -209,69 +195,12 @@ def prune_closed_opportunity_files_and_storage(
     require_closed: bool = True,
     source: str = "closed_workspace_cleanup",
 ) -> dict[str, Any]:
-    opportunity = db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
-    if not opportunity:
-        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "opportunity_not_found"}
-
-    lifecycle = derive_opportunity_lifecycle(getattr(opportunity, "due_at", None))
-    if require_closed and lifecycle == "ACTIVE":
-        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "opportunity_active"}
-
-    files = (
-        db.query(OpportunityFile)
-        .filter(OpportunityFile.opportunity_id == opportunity_id)
-        .all()
+    return process_closed_solicitation_files_for_opportunity(
+        db,
+        opportunity_id,
+        require_closed=require_closed,
+        source=source,
     )
-    if not files:
-        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "no_files"}
-
-    if any(not _closed_workspace_cleanup_ready(file_record, opportunity) for file_record in files):
-        return {"pruned_count": 0, "folder_deleted": False, "skipped_reason": "downstream_processing_incomplete"}
-
-    pruned_count = 0
-    cleanup_dirs: set[str] = set()
-    items: list[dict[str, Any]] = []
-    for file_record in files:
-        original_ref = getattr(file_record, "file_path", None)
-        if not original_ref or str(original_ref).startswith("pruned://"):
-            continue
-        deleted = delete_reference(original_ref)
-        cleanup_dir = _storage_cleanup_dir_for_reference(original_ref)
-        if cleanup_dir:
-            cleanup_dirs.add(cleanup_dir)
-        metadata = dict(getattr(file_record, "parsed_metadata", None) or {})
-        metadata["_retention"] = {
-            **dict(metadata.get("_retention") or {}),
-            "status": "pruned",
-            "reason": source,
-            "pruned_at": datetime.utcnow().isoformat(),
-            "original_file_path": original_ref,
-            "deleted_from_storage": bool(deleted),
-            "folder_cleanup_requested": True,
-        }
-        file_record.file_path = f"pruned://opportunity-file/{file_record.id}"
-        file_record.parsed_metadata = metadata
-        db.add(file_record)
-        pruned_count += 1
-        items.append(
-            {
-                "id": file_record.id,
-                "filename": file_record.filename,
-                "deleted_from_storage": bool(deleted),
-            }
-        )
-
-    folder_deleted = False
-    if pruned_count:
-        db.commit()
-        folder_deleted = _remove_storage_dirs(cleanup_dirs)
-
-    return {
-        "pruned_count": pruned_count,
-        "folder_deleted": folder_deleted,
-        "items": items,
-        "lifecycle": lifecycle,
-    }
 
 
 def _downstream_processing_complete(

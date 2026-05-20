@@ -51,6 +51,34 @@ def _effective_pdf_download_base_dir(db: Session, opp: Opportunity, explicit_bas
     return clean or None
 
 
+def _flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _should_write_download_debug_log() -> bool:
+    return _flag_enabled(getattr(settings, "PDF_DOWNLOAD_DEBUG_LOGS_ENABLED", False))
+
+
+def effective_pdf_download_root(
+    db: Session,
+    *,
+    opp: Opportunity | None = None,
+    organization_id: int | None = None,
+    explicit_base_dir: str | None = None,
+):
+    if opp is not None:
+        base_dir = _effective_pdf_download_base_dir(db, opp, explicit_base_dir)
+    elif explicit_base_dir and str(explicit_base_dir).strip():
+        base_dir = str(explicit_base_dir).strip()
+    else:
+        configured = get_setting(db, "pdf_download_path", default="", organization_id=organization_id) or ""
+        base_dir = str(configured).strip() or None
+    return storage_root(base_dir)
+
+
 def _matching_file_records(
     db: Session,
     opportunity_id: int,
@@ -849,7 +877,7 @@ def download_pdfs_for_opportunity(
     db: Session,
     opportunity_id: int,
     base_dir: str | None = None,
-    always_snapshot: bool = True,
+    always_snapshot: bool = False,
     prefer_dibbs_solicitation_detail: bool = True,
 ) -> dict[str, Any]:
     opp = db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
@@ -860,7 +888,7 @@ def download_pdfs_for_opportunity(
     sol = opp.solicitation_number or f"opportunity_{opp.id}"
     sol_compact = _compact_solicitation(opp.solicitation_number) or ""
     folder = _safe_dirname(sol)
-    out_dir = ensure_dir(storage_root(_effective_pdf_download_base_dir(db, opp, base_dir)) / folder / "documents")
+    out_dir = ensure_dir(effective_pdf_download_root(db, opp=opp, explicit_base_dir=base_dir) / folder / "documents")
 
     created = 0
     skipped = 0
@@ -1034,10 +1062,11 @@ def download_pdfs_for_opportunity(
             if not downloaded_files:
                 official_pdf_error = official_pdf_error or "no_dibbs_pdfs_downloaded"
 
-            try:
-                debug_log_path = _write_debug_log(out_dir, opp, debug_payload)
-            except Exception as exc:
-                errors.append(f"debug_log_write_failed -> {exc}")
+            if _should_write_download_debug_log():
+                try:
+                    debug_log_path = _write_debug_log(out_dir, opp, debug_payload)
+                except Exception as exc:
+                    errors.append(f"debug_log_write_failed -> {exc}")
 
             if _should_create_fallback_snapshot(always_snapshot, downloaded_files):
                 c, s, e = _create_snapshot_pdf(db, opp, page, out_dir)

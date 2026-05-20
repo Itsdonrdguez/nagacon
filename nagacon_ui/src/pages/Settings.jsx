@@ -8,6 +8,7 @@ export default function Settings() {
   const [externalApiKeysCsv, setExternalApiKeysCsv] = useState('')
   const [pdfDownloadPath, setPdfDownloadPath] = useState('')
   const [masterCatalogExportPath, setMasterCatalogExportPath] = useState('')
+  const [autoWorkspacePrepEnabled, setAutoWorkspacePrepEnabled] = useState(true)
   const [providerForm, setProviderForm] = useState({
     sam_api_key: '',
     openai_api_key: '',
@@ -40,6 +41,7 @@ export default function Settings() {
       setExternalApiKeysCsv('')
       setPdfDownloadPath(integrationSettingsQuery.data.pdf_download_path || '')
       setMasterCatalogExportPath(integrationSettingsQuery.data.master_catalog_export_path || '')
+      setAutoWorkspacePrepEnabled(integrationSettingsQuery.data.auto_workspace_prep_enabled !== false)
     }
   }, [integrationSettingsQuery.data])
 
@@ -81,6 +83,21 @@ export default function Settings() {
   const exportNowMutation = useMutation({
     mutationFn: async () => {
       const res = await api.post('/api/settings/integrations/master-catalog/export-now')
+      return res.data
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['integration-settings'] })
+      queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
+      queryClient.setQueryData(['integration-settings'], (current) => ({
+        ...(current || {}),
+        ...data,
+      }))
+    },
+  })
+
+  const workspacePrepNowMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/settings/integrations/workspace-prep/run-now')
       return res.data
     },
     onSuccess: (data) => {
@@ -266,6 +283,14 @@ export default function Settings() {
               placeholder="C:\\NagaCon\\exports\\master_catalog.csv"
             />
           </div>
+          <label className="inline-checkbox">
+            <input
+              type="checkbox"
+              checked={autoWorkspacePrepEnabled}
+              onChange={(event) => setAutoWorkspacePrepEnabled(event.target.checked)}
+            />
+            Automatically prepare opportunity workspaces when core artifacts are still missing.
+          </label>
           <div className="panel-subtitle">
             Set a local folder where opportunity PDFs and notice files should be downloaded. Leave blank to use the default local storage root.
           </div>
@@ -279,6 +304,7 @@ export default function Settings() {
                 external_api_keys_csv: externalApiKeysCsv,
                 pdf_download_path: pdfDownloadPath,
                 master_catalog_export_path: masterCatalogExportPath,
+                auto_workspace_prep_enabled: autoWorkspacePrepEnabled,
               })}
             >
               Save Integration Settings
@@ -308,6 +334,13 @@ export default function Settings() {
             >
               Export Now
             </Button>
+            <Button
+              variant="secondary"
+              loading={workspacePrepNowMutation.isPending}
+              onClick={() => workspacePrepNowMutation.mutate()}
+            >
+              Run Workspace Prep Now
+            </Button>
             {saveIntegrationMutation.data ? <span className="form-success">Integration settings saved.</span> : null}
             {saveIntegrationMutation.error ? <span className="form-error">{saveIntegrationMutation.error.message || 'Failed to save external API keys.'}</span> : null}
             {exportNowMutation.data?.master_catalog_export_status?.written ? (
@@ -321,6 +354,15 @@ export default function Settings() {
               </span>
             ) : null}
             {exportNowMutation.error ? <span className="form-error">{exportNowMutation.error.message || 'Failed to export master catalog.'}</span> : null}
+            {workspacePrepNowMutation.data?.workspace_prep_status?.queued > 0 ? (
+              <span className="form-success">
+                Queued {workspacePrepNowMutation.data.workspace_prep_status.queued} workspace prep job{workspacePrepNowMutation.data.workspace_prep_status.queued === 1 ? '' : 's'}.
+              </span>
+            ) : null}
+            {workspacePrepNowMutation.data?.workspace_prep_status?.status === 'deferred_backpressure' ? (
+              <span className="form-error">Workspace prep is waiting for queue capacity.</span>
+            ) : null}
+            {workspacePrepNowMutation.error ? <span className="form-error">{workspacePrepNowMutation.error.message || 'Failed to queue workspace prep.'}</span> : null}
           </div>
           <div className="settings-summary-box">
             <div className="row-title">Current status</div>
@@ -334,6 +376,15 @@ export default function Settings() {
             </div>
             <div className="row-subtitle">
               Master catalog export: {integrationSettingsQuery.data?.master_catalog_export_path || 'Not configured'}
+            </div>
+            <div className="row-subtitle">
+              Workspace prep: {integrationSettingsQuery.data?.auto_workspace_prep_enabled === false ? 'Paused' : 'Automatic'}
+            </div>
+            <div className="row-subtitle">
+              Workspace prep status: {integrationSettingsQuery.data?.auto_workspace_prep_last_status || 'Unknown'}
+            </div>
+            <div className="row-subtitle">
+              Workspace prep last queued: {integrationSettingsQuery.data?.auto_workspace_prep_last_queued_count ?? 0}
             </div>
             <div className="row-subtitle">
               Catalog status: {integrationSettingsQuery.data?.master_catalog_export_last_status || 'Unknown'}

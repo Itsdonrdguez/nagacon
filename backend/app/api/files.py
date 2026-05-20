@@ -19,6 +19,7 @@ from app.services.pdf_service import dedupe_opportunity_file_records, download_p
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs
 from app.services.search_jobs import start_search_job
 from app.services.storage import delete_reference, download_response as build_storage_download_response, file_exists, local_temp_path
+from app.services.work_queue import workspace_intake_backpressure_snapshot
 from app.services.workspace_service import generate_submission_package
 
 
@@ -255,7 +256,7 @@ def get_file_insights(file_id: int, db: Session = Depends(get_db), current_org=D
 def download_pdfs(
     opportunity_id: int | None = Query(default=None),
     body: dict | None = Body(default=None),
-    always_snapshot: bool = True,
+    always_snapshot: bool = False,
     prefer_dibbs_solicitation_detail: bool = True,
     run_inline: bool = False,
     db: Session = Depends(get_db),
@@ -271,6 +272,15 @@ def download_pdfs(
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     if not run_inline:
+        backpressure = workspace_intake_backpressure_snapshot(db, org_id)
+        if backpressure.get("blocked"):
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "workspace_intake queue is at capacity",
+                    "workspace_intake_backpressure": backpressure,
+                },
+            )
         return start_search_job(
             "workspace_intake",
             {

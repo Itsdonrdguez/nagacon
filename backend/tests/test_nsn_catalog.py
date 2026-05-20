@@ -446,3 +446,58 @@ def test_refresh_nsn_intelligence_stores_snapshot(monkeypatch):
     assert result["confidence"]["award_providers_inserted"] == 2
     assert snapshots[0].compact_nsn == "4110015342682"
     assert snapshots[0].source_scope == "refresh"
+
+
+def test_refresh_nsn_intelligence_handles_usaspending_timeout(monkeypatch):
+    snapshots = []
+
+    class FakeDB:
+        def add(self, item):
+            snapshots.append(item)
+
+        def commit(self):
+            snapshots[-1].id = 77
+
+        def refresh(self, item):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.search_usaspending_for_nsn",
+        lambda db, nsn, limit=50: (_ for _ in ()).throw(__import__("requests").exceptions.ConnectTimeout("timed out")),
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.get_nsn_catalog_summary",
+        lambda db, nsn: {
+            "target": {"nsn": "4110-01-534-2682", "compact_nsn": "4110015342682"},
+            "identity": {"status": "not_in_local_catalog"},
+            "references": [],
+            "interchangeability": [],
+            "vendor_recommendations": [],
+            "providers": [],
+            "award_history": {"count": 0},
+            "pricing": {"count": 0},
+            "confidence": {"identity": "low"},
+            "next_actions": ["Import or refresh PUB LOG catalog data for this NSN."],
+        },
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_catalog",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 1, "updated": 0},
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_award_evidence",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 0, "updated": 0},
+    )
+
+    result = __import__("app.services.nsn_catalog.refresh", fromlist=["refresh_nsn_intelligence"]).refresh_nsn_intelligence(
+        FakeDB(),
+        "4110015342682",
+        run_usaspending=True,
+        seed_providers=True,
+    )
+
+    assert result["status"] == "partial_success"
+    assert result["snapshot_id"] == 77
+    assert result["summary"]["usaspending"] is None
+    assert "ConnectTimeout" in result["summary"]["usaspending_error"]
+    assert result["errors"]

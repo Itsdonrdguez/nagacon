@@ -26,6 +26,10 @@ from app.services.worker_traceback_report import write_worker_traceback_report
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
 _executors: dict[str, ThreadPoolExecutor] = {}
+_active_run_gate: threading.BoundedSemaphore | None = None
+_active_run_gate_limit: int | None = None
+_background_run_gate: threading.BoundedSemaphore | None = None
+_background_run_gate_limit: int | None = None
 
 QUEUE_LANE = "queue"
 VENDOR_LANE = "vendor"
@@ -54,6 +58,35 @@ def _max_concurrency() -> int:
         return max(1, int(getattr(settings, "SEARCH_JOB_MAX_CONCURRENCY", 4) or 4))
     except Exception:
         return 4
+
+
+def _active_execution_limit() -> int:
+    try:
+        return max(1, int(getattr(settings, "SEARCH_JOB_ACTIVE_LIMIT", 5) or 5))
+    except Exception:
+        return 5
+
+
+def _background_execution_limit() -> int:
+    try:
+        configured = int(getattr(settings, "SEARCH_JOB_BACKGROUND_ACTIVE_LIMIT", 4) or 4)
+    except Exception:
+        configured = 4
+    return max(0, min(configured, _active_execution_limit()))
+
+
+def _recovery_batch_size() -> int:
+    try:
+        return max(1, int(getattr(settings, "SEARCH_JOB_RECOVERY_BATCH_SIZE", 10) or 10))
+    except Exception:
+        return 10
+
+
+def _recovery_min_age_seconds() -> int:
+    try:
+        return max(5, int(getattr(settings, "SEARCH_JOB_RECOVERY_MIN_AGE_SECONDS", 60) or 60))
+    except Exception:
+        return 60
 
 
 def job_lane(kind: str | None) -> str:
@@ -86,6 +119,38 @@ def _thread_executor(lane: str) -> ThreadPoolExecutor:
             )
             _executors[lane] = executor
         return executor
+
+
+def _active_execution_gate() -> threading.BoundedSemaphore:
+    global _active_run_gate, _active_run_gate_limit
+    limit = _active_execution_limit()
+    with _lock:
+        if _active_run_gate is None or _active_run_gate_limit != limit:
+            _active_run_gate = threading.BoundedSemaphore(limit)
+            _active_run_gate_limit = limit
+        return _active_run_gate
+
+
+def _background_execution_gate() -> threading.BoundedSemaphore:
+    global _background_run_gate, _background_run_gate_limit
+    limit = _background_execution_limit()
+    with _lock:
+        if _background_run_gate is None or _background_run_gate_limit != limit:
+            _background_run_gate = threading.BoundedSemaphore(max(1, limit or 1))
+            _background_run_gate_limit = limit
+        return _background_run_gate
+
+
+def _is_user_priority_job(payload: dict[str, Any] | None) -> bool:
+    payload = payload if isinstance(payload, dict) else {}
+    user_id = payload.get("user_id")
+    try:
+        if user_id is not None and int(user_id) > 0:
+            return True
+    except Exception:
+        pass
+    queued_by = str(payload.get("queued_by") or "").strip().lower()
+    return queued_by.startswith("manual")
 
 
 def _now() -> str:
@@ -267,6 +332,12 @@ def _append_progress(job_id: str, event: dict[str, Any]) -> None:
 
 
 def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
+    is_user_priority = _is_user_priority_job(payload)
+    gate = _active_execution_gate()
+    background_gate = _background_execution_gate()
+    if not is_user_priority and _background_execution_limit() > 0:
+        background_gate.acquire()
+    gate.acquire()
     db = SessionLocal()
     try:
         _update_job(
@@ -425,6 +496,9 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
         )
     finally:
         db.close()
+        gate.release()
+        if not is_user_priority and _background_execution_limit() > 0:
+            background_gate.release()
 
 
 def _maybe_refresh_master_catalog_export(db, kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -446,6 +520,10 @@ def _stale_cutoff() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=stale_seconds)
 
 
+def _queued_recovery_cutoff() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=_recovery_min_age_seconds())
+
+
 def _heartbeat_dt(row: SearchJob) -> datetime | None:
     progress = row.progress if isinstance(row.progress, dict) else {}
     return (
@@ -453,6 +531,30 @@ def _heartbeat_dt(row: SearchJob) -> datetime | None:
         or getattr(row, "updated_at", None)
         or row.started_at
     )
+
+
+def _load_db_job_into_memory(row: SearchJob) -> dict[str, Any]:
+    snapshot = _db_snapshot(row)
+    with _lock:
+        existing = _jobs.get(row.id)
+        if existing:
+            return _snapshot(existing)
+        _jobs[row.id] = {
+            "id": row.id,
+            "kind": row.kind,
+            "worker_lane": dict(row.payload or {}).get("worker_lane") or job_lane(row.kind),
+            "organization_id": row.organization_id,
+            "user_id": row.user_id,
+            "status": row.status,
+            "progress": dict(row.progress or {"completed_steps": 0, "total_steps": 0, "percent": 0, "heartbeat_at": _now()}),
+            "payload": dict(row.payload or {}),
+            "result": row.result,
+            "error": row.error,
+            "started_at": snapshot.get("started_at"),
+            "completed_at": snapshot.get("completed_at"),
+            "events": list(row.events or []),
+        }
+        return _snapshot(_jobs[row.id])
 
 
 def recover_stale_running_jobs() -> int:
@@ -497,6 +599,45 @@ def recover_stale_running_jobs() -> int:
     return recovered
 
 
+def recover_queued_jobs_for_thread_runner(*, limit: int | None = None) -> int:
+    if uses_external_worker():
+        return 0
+    db = SessionLocal()
+    recovered = 0
+    max_items = max(1, int(limit or _recovery_batch_size()))
+    cutoff = _queued_recovery_cutoff()
+    try:
+        rows = (
+            _queued_job_query(db)
+            .filter(SearchJob.created_at <= cutoff)
+            .limit(max_items * 4)
+            .all()
+        )
+        for row in rows:
+            with _lock:
+                if row.id in _jobs:
+                    continue
+            lane = dict(row.payload or {}).get("worker_lane") or job_lane(row.kind)
+            _load_db_job_into_memory(row)
+            _thread_executor(lane).submit(_run_job, row.id, row.kind, dict(row.payload or {}))
+            recovered += 1
+            if recovered >= max_items:
+                break
+    finally:
+        db.close()
+    return recovered
+
+
+def recover_stale_jobs_now(*, limit: int | None = None) -> dict[str, int | str]:
+    stale_running_recovered = recover_stale_running_jobs()
+    queued_redispatched = recover_queued_jobs_for_thread_runner(limit=limit)
+    return {
+        "runner_mode": _runner_mode(),
+        "stale_running_recovered": stale_running_recovered,
+        "queued_redispatched": queued_redispatched,
+    }
+
+
 def claim_next_queued_job(*, lane: str | None = None) -> dict[str, Any] | None:
     recover_stale_running_jobs()
     db = SessionLocal()
@@ -535,24 +676,7 @@ def claim_next_queued_job(*, lane: str | None = None) -> dict[str, Any] | None:
             if updated:
                 db.commit()
                 db.refresh(row)
-                snapshot = _db_snapshot(row)
-                with _lock:
-                    _jobs[row.id] = {
-                        "id": row.id,
-                        "kind": row.kind,
-                        "worker_lane": dict(row.payload or {}).get("worker_lane") or job_lane(row.kind),
-                        "organization_id": row.organization_id,
-                        "user_id": row.user_id,
-                        "status": row.status,
-                        "progress": dict(row.progress or {"completed_steps": 0, "total_steps": 0, "percent": 0, "heartbeat_at": _now()}),
-                        "payload": dict(row.payload or {}),
-                        "result": row.result,
-                        "error": row.error,
-                        "started_at": snapshot.get("started_at"),
-                        "completed_at": snapshot.get("completed_at"),
-                        "events": list(row.events or []),
-                    }
-                return snapshot
+                return _load_db_job_into_memory(row)
             db.rollback()
     finally:
         db.close()

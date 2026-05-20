@@ -45,6 +45,7 @@ from app.api.files import router as files_router
 from app.api.integrations import router as integrations_router
 from app.services.auto_ingest_scheduler import start_auto_ingest_worker, stop_auto_ingest_worker
 from app.services.auto_file_prune_scheduler import start_auto_file_prune_worker, stop_auto_file_prune_worker
+from app.services.search_job_recovery_scheduler import start_search_job_recovery_worker, stop_search_job_recovery_worker
 
 load_dotenv()
 
@@ -129,6 +130,7 @@ LEGACY_COMPAT_ROUTERS = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    start_search_job_recovery_worker(app)
     start_auto_ingest_worker(app)
     start_auto_file_prune_worker(app)
     try:
@@ -136,6 +138,7 @@ async def lifespan(app: FastAPI):
     finally:
         stop_auto_file_prune_worker(app)
         stop_auto_ingest_worker(app)
+        stop_search_job_recovery_worker(app)
 
 
 def create_app() -> FastAPI:

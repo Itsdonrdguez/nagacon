@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -115,11 +116,20 @@ def write_master_catalog_export(db: Session, organization_id: int | None = None)
         return result
 
     rows = build_master_catalog_rows(db, organization_id=organization_id)
-    ensure_dir(target.parent)
-    with target.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["fsc", "nsn", "vendor", "part_number"])
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        ensure_dir(target.parent)
+        _write_master_catalog_csv(target, rows)
+    except Exception as exc:
+        result = {
+            "written": False,
+            "status": "FAILED",
+            "reason": "write_failed",
+            "path": str(target),
+            "row_count": len(rows),
+            "error": str(exc),
+        }
+        _persist_export_status(db, organization_id=org_id, result=result)
+        return result
 
     result = {
         "written": True,
@@ -129,6 +139,27 @@ def write_master_catalog_export(db: Session, organization_id: int | None = None)
     }
     _persist_export_status(db, organization_id=org_id, result=result)
     return result
+
+
+def _write_master_catalog_csv(target: Path, rows: list[dict[str, str]]) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        newline="",
+        encoding="utf-8",
+        dir=str(target.parent),
+        prefix=f"{target.stem}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        writer = csv.DictWriter(handle, fieldnames=["fsc", "nsn", "vendor", "part_number"])
+        writer.writeheader()
+        writer.writerows(rows)
+    try:
+        temp_path.replace(target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _persist_export_status(

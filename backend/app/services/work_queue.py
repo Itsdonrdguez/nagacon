@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.bid_submission import BidSubmission
 from app.models.opportunity import Opportunity
 from app.models.pipeline_item import PipelineItem
@@ -234,6 +235,26 @@ def _opportunity_fingerprint(opp: Opportunity, nsn: str | None = None) -> str:
     return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()
 
 
+def _setting_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(getattr(settings, name, default) or default)
+    except Exception:
+        value = default
+    return max(minimum, value)
+
+
+def _workspace_intake_max_pending() -> int:
+    queue_concurrency = _setting_int("SEARCH_JOB_QUEUE_MAX_CONCURRENCY", 2, minimum=1)
+    default = max(8, queue_concurrency * 12)
+    return _setting_int("WORKSPACE_INTAKE_MAX_PENDING", 0, minimum=0)
+
+
+def _workspace_intake_automation_batch_limit() -> int:
+    queue_concurrency = _setting_int("SEARCH_JOB_QUEUE_MAX_CONCURRENCY", 2, minimum=1)
+    default = max(1, queue_concurrency * 2)
+    return _setting_int("WORKSPACE_INTAKE_AUTOMATION_BATCH_LIMIT", 0, minimum=0)
+
+
 def _count_by_opportunity(db: Session, model, organization_id: int | None, artifact_type: str | None = None) -> dict[int, int]:
     query = db.query(model.opportunity_id, func.count(model.id))
     query = _scope_org(query, model, organization_id)
@@ -280,6 +301,33 @@ def _active_queueable_job_rows(
     if user_id is not None:
         query = query.filter(SearchJob.user_id == user_id)
     return query.all()
+
+
+def workspace_intake_backpressure_snapshot(
+    db: Session,
+    organization_id: int | None,
+    *,
+    user_id: int | None = None,
+    active_rows: list[SearchJob] | None = None,
+) -> dict[str, Any]:
+    rows = list(active_rows) if active_rows is not None else _active_queueable_job_rows(db, organization_id, user_id=user_id)
+    workspace_rows = [row for row in rows if str(getattr(row, "kind", "") or "").strip().lower() == "workspace_intake"]
+    queued = sum(1 for row in workspace_rows if str(getattr(row, "status", "") or "").strip().lower() == "queued")
+    running = sum(1 for row in workspace_rows if str(getattr(row, "status", "") or "").strip().lower() == "running")
+    pending = queued + running
+    max_pending = _workspace_intake_max_pending()
+    batch_limit = _workspace_intake_automation_batch_limit()
+    available_slots = None if max_pending <= 0 else max(0, max_pending - pending)
+    return {
+        "kind": "workspace_intake",
+        "queued": queued,
+        "running": running,
+        "pending": pending,
+        "max_pending": max_pending,
+        "automation_batch_limit": batch_limit,
+        "available_slots": available_slots,
+        "blocked": bool(max_pending > 0 and (available_slots or 0) <= 0),
+    }
 
 
 def _recent_completed_queueable_jobs(
@@ -430,32 +478,6 @@ def build_daily_work_queue(
     recent_failed_items: list[dict[str, Any]] = []
     active_workspace_progress_ids: set[int] = set()
 
-    for quote in quotes:
-        opp = opp_by_id.get(quote.opportunity_id)
-        if not opp:
-            continue
-        status = str(quote.status or "").upper()
-        if status == "REQUESTED" and quote.next_follow_up_at and quote.next_follow_up_at <= current_time:
-            items.append(_item(
-                "QUOTE_FOLLOW_UP_DUE",
-                HIGH,
-                opp,
-                f"Follow up with {quote.company_name or quote.cage}",
-                f"Quote request is due for follow-up. CAGE {quote.cage}.",
-                meta={"quote_id": quote.id, "cage": quote.cage, "company_name": quote.company_name},
-                due_at=quote.next_follow_up_at,
-            ))
-        elif status == "REQUESTED" and not quote.unit_price:
-            items.append(_item(
-                "QUOTE_REQUESTED_NO_RESPONSE",
-                MEDIUM,
-                opp,
-                f"Awaiting quote from {quote.company_name or quote.cage}",
-                "Quote has been requested but no price has been logged yet.",
-                meta={"quote_id": quote.id, "cage": quote.cage, "company_name": quote.company_name},
-                due_at=quote.next_follow_up_at,
-            ))
-
     for opp in opportunities:
         if is_archived_opportunity(getattr(opp, "due_at", None), now=current_time):
             continue
@@ -520,18 +542,6 @@ def build_daily_work_queue(
                 meta={"nsn": nsn, "readiness": readiness},
             ))
 
-        if is_open and lead_counts.get(opp.id, 0) > 0 and quote_counts.get(opp.id, 0) == 0:
-            items.append(_item(
-                "RFQ_NOT_SENT",
-                HIGH if days_left is not None and days_left <= 3 else MEDIUM,
-                opp,
-                f"Send RFQ to {lead_counts.get(opp.id, 0)} supplier{'s' if lead_counts.get(opp.id, 0) != 1 else ''}",
-                "Supplier candidates exist, but no RFQ request has been sent yet.",
-                action_label="Open RFQ Draft",
-                meta={"lead_count": lead_counts.get(opp.id, 0), "nsn": nsn, "readiness": readiness},
-                due_at=opp.due_at,
-            ))
-
         if is_open and quote_counts.get(opp.id, 0) > 0 and not requested_quotes and not received_quotes and submission_package_counts.get(opp.id, 0) == 0:
             items.append(_item(
                 "MISSING_SUBMISSION_PACKAGE",
@@ -540,23 +550,6 @@ def build_daily_work_queue(
                 "Build submission package",
                 "Quote records exist, but no submission package artifact has been saved.",
                 meta={"quote_count": quote_counts.get(opp.id, 0), "readiness": readiness},
-            ))
-
-        if is_open and not_requested_quotes:
-            items.append(_item(
-                "RFQ_NOT_SENT",
-                HIGH if days_left is not None and days_left <= 3 else MEDIUM,
-                opp,
-                f"Send RFQ to {len(not_requested_quotes)} supplier{'s' if len(not_requested_quotes) != 1 else ''}",
-                "Quote records exist, but outreach has not been marked sent yet.",
-                action_label="Open RFQ Draft",
-                meta={
-                    "quote_ids": [quote.id for quote in not_requested_quotes],
-                    "quote_count": len(not_requested_quotes),
-                    "nsn": nsn,
-                    "readiness": readiness,
-                },
-                due_at=opp.due_at,
             ))
 
         if is_open and (received_quotes or has_selected_quote):
@@ -596,17 +589,6 @@ def build_daily_work_queue(
                     "Build the compliance matrix",
                     "A proposal checklist exists, but the compliance matrix has not been generated yet.",
                     action_label="Open Proposal Workspace",
-                    meta={"days_left": days_left, "readiness": readiness},
-                    due_at=opp.due_at,
-                ))
-            if co_email_counts.get(opp.id, 0) == 0:
-                items.append(_item(
-                    "SAM_CO_EMAIL_MISSING",
-                    MEDIUM,
-                    opp,
-                    "Draft contracting officer outreach",
-                    "No contracting officer email draft is saved yet for this SAM opportunity.",
-                    action_label="Open CO Draft",
                     meta={"days_left": days_left, "readiness": readiness},
                     due_at=opp.due_at,
                 ))
@@ -1042,14 +1024,34 @@ def queue_daily_work(db: Session, organization_id: int | None = None, user_id: i
     queue = build_daily_work_queue(db, organization_id=organization_id, user_id=user_id, limit=limit)
     items = list(queue.get("items") or [])
     active_signatures = _active_job_signatures(db, organization_id)
+    workspace_intake_backpressure = workspace_intake_backpressure_snapshot(db, organization_id)
+    workspace_intake_budget = len(items)
+    available_slots = workspace_intake_backpressure.get("available_slots")
+    automation_batch_limit = workspace_intake_backpressure.get("automation_batch_limit")
+    if isinstance(available_slots, int) and available_slots > 0:
+        workspace_intake_budget = min(workspace_intake_budget, available_slots)
+    if isinstance(automation_batch_limit, int) and automation_batch_limit > 0:
+        workspace_intake_budget = min(workspace_intake_budget, automation_batch_limit)
     queued_jobs: list[dict[str, Any]] = []
     skipped_duplicates: list[dict[str, Any]] = []
+    skipped_backpressure: list[dict[str, Any]] = []
 
     for item in items:
         if item.get("type") not in QUEUEABLE_TYPES:
             continue
         spec = _queue_job_spec(item, organization_id)
         if not spec:
+            continue
+        if spec["kind"] == "workspace_intake" and workspace_intake_budget <= 0:
+            skipped_backpressure.append(
+                {
+                    "item_id": item.get("id"),
+                    "type": item.get("type"),
+                    "kind": spec["kind"],
+                    "target": spec["payload"].get("opportunity_id"),
+                    "reason": "workspace_intake_backpressure",
+                }
+            )
             continue
         signature = _job_signature(spec["kind"], spec["payload"])
         if signature in active_signatures:
@@ -1065,6 +1067,8 @@ def queue_daily_work(db: Session, organization_id: int | None = None, user_id: i
         spec["payload"]["user_id"] = user_id
         job = start_search_job(spec["kind"], spec["payload"])
         active_signatures.add(signature)
+        if spec["kind"] == "workspace_intake":
+            workspace_intake_budget = max(0, workspace_intake_budget - 1)
         queued_jobs.append(
             {
                 "item_id": item.get("id"),
@@ -1084,8 +1088,11 @@ def queue_daily_work(db: Session, organization_id: int | None = None, user_id: i
         "queueable_items": sum(1 for item in items if item.get("type") in QUEUEABLE_TYPES),
         "queued_count": len(queued_jobs),
         "skipped_duplicate_count": len(skipped_duplicates),
+        "skipped_backpressure_count": len(skipped_backpressure),
         "queued_jobs": queued_jobs,
         "skipped_duplicates": skipped_duplicates,
+        "skipped_backpressure": skipped_backpressure,
+        "workspace_intake_backpressure": workspace_intake_backpressure,
     }
     batch_job = record_search_job(
         "work_queue_batch",

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api import workspace as workspace_api
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_db, get_optional_organization
 from app.core.security import require_integration_api_key
 from app.repositories.opportunities import OpportunityRepository
 from app.repositories.pipeline import PipelineRepository
@@ -59,7 +59,7 @@ def integration_search_opportunities(
     set_aside_type: str | None = None,
     due_window: str | None = None,
     db: Session = Depends(get_db),
-    current_org=Depends(get_current_organization),
+    current_org=Depends(get_optional_organization),
 ):
     items, total = _opportunity_repo(db, getattr(current_org, "id", None)).search(
         page=page,
@@ -78,7 +78,7 @@ def integration_search_opportunities(
 
 
 @router.get("/opportunities/{opportunity_id}")
-def integration_get_opportunity(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def integration_get_opportunity(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_optional_organization)):
     opp = _opportunity_repo(db, getattr(current_org, "id", None)).get(opportunity_id)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
@@ -86,26 +86,26 @@ def integration_get_opportunity(opportunity_id: int, db: Session = Depends(get_d
 
 
 @router.get("/workspace/{opportunity_id}/summary")
-def integration_workspace_summary(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def integration_workspace_summary(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_optional_organization)):
     return workspace_api.workspace_summary(opp_id=opportunity_id, db=db, current_org=current_org)
 
 
 @router.post("/workspace/{opportunity_id}/run-agent")
-def integration_run_workspace_agent(opportunity_id: int, payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def integration_run_workspace_agent(opportunity_id: int, payload: dict, db: Session = Depends(get_db), current_org=Depends(get_optional_organization)):
     body = dict(payload or {})
     body["opportunity_id"] = opportunity_id
     return workspace_api.run_workspace_agent_route(payload=body, db=db, current_org=current_org)
 
 
 @router.post("/workspace/{opportunity_id}/run-phase")
-def integration_run_workspace_phase(opportunity_id: int, payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def integration_run_workspace_phase(opportunity_id: int, payload: dict, db: Session = Depends(get_db), current_org=Depends(get_optional_organization)):
     body = dict(payload or {})
     body["opportunity_id"] = opportunity_id
     return workspace_api.run_workspace_agent_phase(payload=body, db=db, current_org=current_org)
 
 
 @router.get("/workspace/{opportunity_id}/usaspending")
-def integration_workspace_usaspending(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def integration_workspace_usaspending(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_optional_organization)):
     return workspace_api.workspace_usaspending_vendors(opp_id=opportunity_id, db=db, current_org=current_org)
 
 
@@ -117,7 +117,7 @@ def integration_pipeline_board(
     include_closed: bool = False,
     limit: int = 100,
     db: Session = Depends(get_db),
-    current_org=Depends(get_current_organization),
+    current_org=Depends(get_optional_organization),
 ):
     items = _pipeline_repo(db, getattr(current_org, "id", None)).list_board(
         q=q,

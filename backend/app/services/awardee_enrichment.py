@@ -12,10 +12,11 @@ from app.schemas.provider import ProviderCreate, ProviderItemCreate
 from app.services.intelligence.nsn_intelligence_service import build_nsn_research_target, run_nsn_intelligence
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.providers.identity_resolver import resolve_provider_identities
+from app.utils.utc import utcnow
 
 
 def award_followup_status(opp: Opportunity, *, now: datetime | None = None) -> dict[str, Any]:
-    current = now or datetime.utcnow()
+    current = now or utcnow()
     due_at = getattr(opp, "due_at", None)
     confirmed_count = (
         getattr(opp, "_award_history_count", None)

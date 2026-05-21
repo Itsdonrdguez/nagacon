@@ -21,6 +21,7 @@ from app.services.intelligence.nsn_intelligence_service import build_nsn_researc
 from app.services.pdf_service import effective_pdf_download_root
 from app.services.storage import delete_reference, delete_reference_tree, local_temp_path, storage_root
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
+from app.utils.utc import utcnow
 
 
 STATUS_QUEUED = "queued"
@@ -38,7 +39,7 @@ def process_closed_solicitation_file(
     opportunity: Opportunity | None = None,
     source_url: str | None = None,
 ) -> dict[str, Any]:
-    now = datetime.utcnow()
+    now = utcnow()
     opportunity = opportunity or getattr(file_record, "opportunity", None)
     if opportunity is None and getattr(file_record, "opportunity_id", None) is not None:
         opportunity = db.query(Opportunity).filter(Opportunity.id == file_record.opportunity_id).first()
@@ -580,7 +581,7 @@ def _upsert_processing_record(
     record.processed_at = processed_at or record.processed_at
     record.deletion_timestamp = deletion_timestamp or record.deletion_timestamp
     record.error_message = error_message
-    record.last_seen_at = snapshot.get("last_seen_at") or datetime.utcnow()
+    record.last_seen_at = snapshot.get("last_seen_at") or utcnow()
     record.last_processed_at = snapshot.get("last_processed_at") or processed_at or record.last_processed_at
     record.source_updated_at = snapshot.get("source_updated_at") or record.source_updated_at
 

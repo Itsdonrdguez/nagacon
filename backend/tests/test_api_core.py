@@ -2,8 +2,11 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.api import opportunities as opportunities_api
 from app.api import data_health as data_health_api
+from app.api import dibbs_enrich as dibbs_enrich_api
 from app.api import integrations as integrations_api
 from app.api import notifications as notifications_api
 from app.api import saas_readiness as saas_readiness_api
@@ -11,17 +14,608 @@ from app.api import source_freshness as source_freshness_api
 from app.api import workspace as workspace_api
 from app.api import work_queue as work_queue_api
 from app.api import files as files_api
+from app.api import vendors as vendors_api
 from app.api.routes import company as company_api
 from app.api.routes import health_check as health_check_api
 from app.api.routes import nsn as nsn_api
 from app.api.routes import pipeline as pipeline_api
 from app.api.routes import providers as providers_api
 from app.api.routes import auth as auth_api
+from app.api.routes import settings as settings_api
+from app import main as main_app
+from app.core.config import settings
+from app.services.auth_service import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
+from app.services import company_profile_ingest as company_profile_ingest_service
 from app.repositories import providers as providers_repository
 from app.core import security as security_core
 from app.schemas.company import CompanyProfileCreate
+from app.schemas.opportunity import IngestResult
 from app.utils.enums import PipelineStatus
 from app.services.research.usaspending_research_service import _rank_vendors
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("get", "/api/quotes/opportunities/1", None),
+        ("post", "/api/quotes/", {"opportunity_id": 1, "vendor_id": 1, "line_item": "Valve", "quantity": 1, "unit_cost": 10, "markup_pct": 5}),
+        ("get", "/api/submissions?opportunity_id=1", None),
+        ("post", "/api/submissions/upsert", {"opportunity_id": 1, "submitted": False}),
+        ("post", "/api/dibbs/pull", {"fsc": "6515", "limit": 1}),
+        ("post", "/api/research/usaspending/opportunities/1", None),
+        ("post", "/api/vendor-email/opportunities/1/draft", None),
+        ("post", "/api/scoring/run", {"limit": 1}),
+        ("post", "/api/vendor-discovery/opportunities/1", None),
+        ("post", "/api/vendors/usaspending/search", {"naics_code": "561720", "limit": 1}),
+        ("post", "/api/vendors/opportunities/1/suppress-non-dibbs", None),
+        ("post", "/api/opportunities/ingest", []),
+        ("post", "/api/search-jobs", {"kind": "manual"}),
+        ("post", "/api/parts/find", {"opportunity_ids": [1]}),
+        ("get", "/api/vendors/leads?opportunity_id=1", None),
+        ("get", "/api/files/list?opportunity_id=1", None),
+        ("get", "/api/workspace/summary?opp_id=1", None),
+        ("post", "/api/scrapers/dibbs/run", {"fsc": "6515", "limit": 1}),
+        ("post", "/api/agents/orchestrate", {"opportunity_id": 1}),
+        ("get", "/api/analytics/summary", None),
+        ("post", "/api/settings/integrations/workspace-prep/run-now", None),
+    ],
+)
+def test_sensitive_routes_require_auth_when_dev_fallback_disabled(unauth_client, method, path, payload):
+    response = getattr(unauth_client, method)(path, json=payload) if payload is not None else getattr(unauth_client, method)(path)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication required"
+
+
+def test_signup_disabled_returns_403(client, monkeypatch):
+    monkeypatch.setattr(settings, "SIGNUP_ENABLED", False, raising=False)
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "new.user@example.com", "password": "verysecurepassword", "full_name": "New User"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Signup is disabled"
+
+
+def test_cookie_session_requires_csrf_header_for_unsafe_request(client, monkeypatch):
+    monkeypatch.setattr(
+        settings_api,
+        "ensure_default_organization",
+        lambda db: SimpleNamespace(id=1, name="Default Organization", slug="default"),
+    )
+    monkeypatch.setattr(settings_api, "queue_workspace_prep_for_opportunities", lambda *args, **kwargs: {"queued_count": 0, "candidate_count": 0})
+    monkeypatch.setattr(settings_api, "get_setting", lambda *args, **kwargs: "")
+    client.cookies.set(SESSION_COOKIE_NAME, "cookie-session-token")
+
+    response = client.post("/api/settings/integrations/workspace-prep/run-now")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "CSRF token missing or invalid"
+
+
+def test_session_token_header_bypasses_csrf_cookie_requirement_for_internal_client(client, monkeypatch):
+    monkeypatch.setattr(
+        settings_api,
+        "ensure_default_organization",
+        lambda db: SimpleNamespace(id=1, name="Default Organization", slug="default"),
+    )
+    monkeypatch.setattr(settings_api, "queue_workspace_prep_for_opportunities", lambda *args, **kwargs: {"queued_count": 1, "candidate_count": 1})
+    monkeypatch.setattr(settings_api, "get_setting", lambda *args, **kwargs: "")
+    client.cookies.set(SESSION_COOKIE_NAME, "cookie-session-token")
+
+    response = client.post(
+        "/api/settings/integrations/workspace-prep/run-now",
+        headers={"X-Session-Token": "header-session-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_prep_status"]["queued_count"] == 1
+
+
+def test_cookie_session_with_matching_csrf_token_allows_unsafe_request(client, monkeypatch):
+    monkeypatch.setattr(
+        settings_api,
+        "ensure_default_organization",
+        lambda db: SimpleNamespace(id=1, name="Default Organization", slug="default"),
+    )
+    monkeypatch.setattr(settings_api, "queue_workspace_prep_for_opportunities", lambda *args, **kwargs: {"queued_count": 2, "candidate_count": 2})
+    monkeypatch.setattr(settings_api, "get_setting", lambda *args, **kwargs: "")
+    client.cookies.set(SESSION_COOKIE_NAME, "cookie-session-token")
+    client.cookies.set(CSRF_COOKIE_NAME, "csrf-value")
+
+    response = client.post(
+        "/api/settings/integrations/workspace-prep/run-now",
+        headers={"X-CSRF-Token": "csrf-value"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_prep_status"]["queued_count"] == 2
+
+
+def test_opportunity_ingest_records_import_run(client, monkeypatch):
+    started = {}
+    completed = {}
+
+    monkeypatch.setattr(
+        opportunities_api,
+        "start_import_run",
+        lambda db, **kwargs: started.setdefault("run", SimpleNamespace(id=91, **kwargs)),
+    )
+    monkeypatch.setattr(
+        opportunities_api,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(
+        opportunities_api,
+        "ingest_raw_opportunities",
+        lambda db, raw_records, organization_id=None: IngestResult(inserted=1, updated=0, skipped=0, errors=[]),
+    )
+
+    response = client.post("/api/opportunities/ingest", json=[])
+
+    assert response.status_code == 200
+    assert started["run"].source == "API_INGEST"
+    assert started["run"].organization_id == 1
+    assert completed["payload"]["status"] == "completed"
+    assert completed["payload"]["inserted_count"] == 1
+
+
+def test_company_profile_ingest_records_import_run(monkeypatch):
+    started = {}
+    completed = {}
+    profile = SimpleNamespace(id=4, organization_id=1, auto_ingest_enabled=True)
+    fake_db = SimpleNamespace(add=lambda *args, **kwargs: None, commit=lambda: None, refresh=lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(
+        company_profile_ingest_service,
+        "start_import_run",
+        lambda *args, **kwargs: started.setdefault("run", SimpleNamespace(id=83, **kwargs)),
+    )
+    monkeypatch.setattr(
+        company_profile_ingest_service,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(
+        company_profile_ingest_service,
+        "build_company_ingest_plan",
+        lambda profile_arg: {
+            "auto_ingest_limit": 5,
+            "dibbs": {"fsc_codes": [], "per_code_limit": 5, "pdf_download_limit": 5},
+            "sam": {"queries": [], "naics_codes": [], "keywords": [], "agencies": [], "states": [], "per_naics_limit": 5},
+        },
+    )
+    monkeypatch.setattr(company_profile_ingest_service, "_build_effective_plan", lambda plan, quick: {**plan, "search_mode": "quick" if quick else "full"})
+    monkeypatch.setattr(company_profile_ingest_service, "_ingest_many", lambda *args, **kwargs: {"inserted": 1, "updated": 0, "skipped": 0, "errors": [], "diagnostics": {"raw_rows": 1}, "dibbs_opportunity_ids": []})
+    monkeypatch.setattr(company_profile_ingest_service, "_dedupe_raw_opportunities", lambda rows: rows)
+    monkeypatch.setattr(company_profile_ingest_service, "get_effective_sam_api_key", lambda *args, **kwargs: None)
+
+    result = company_profile_ingest_service.run_company_profile_ingest(
+        fake_db,
+        profile,
+        quick=True,
+        update_last_run=False,
+        user_id=7,
+    )
+
+    assert result["results"]["dibbs"]["inserted"] == 1
+    assert started["run"].source == "COMPANY_PROFILE"
+    assert completed["payload"]["status"] == "completed"
+    assert completed["payload"]["inserted_count"] == 2
+
+
+def test_dibbs_enrichment_records_import_run(client, monkeypatch):
+    started = {}
+    completed = {}
+    monkeypatch.setattr(
+        dibbs_enrich_api,
+        "start_import_run",
+        lambda *args, **kwargs: started.setdefault("run", SimpleNamespace(id=81, **kwargs)),
+    )
+    monkeypatch.setattr(
+        dibbs_enrich_api,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(
+        dibbs_enrich_api,
+        "enrich_dibbs_batch",
+        lambda **kwargs: {"requested_limit": 3, "enriched": 2, "failed": 1, "results": []},
+    )
+
+    response = client.post("/api/dibbs/enrich", json={"limit": 3})
+
+    assert response.status_code == 200
+    assert started["run"].source == "DIBBS_ENRICHMENT"
+    assert completed["payload"]["status"] == "partial_success"
+    assert completed["payload"]["updated_count"] == 2
+
+
+def test_provider_sam_website_enrichment_records_import_run(client, monkeypatch):
+    started = {}
+    completed = {}
+    monkeypatch.setattr(
+        providers_api,
+        "start_import_run",
+        lambda *args, **kwargs: started.setdefault("run", SimpleNamespace(id=82, **kwargs)),
+    )
+    monkeypatch.setattr(
+        providers_api,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(
+        providers_api,
+        "enrich_provider_websites_from_sam",
+        lambda *args, **kwargs: {"provider_count": 5, "created": 1, "updated": 2, "skipped": 2, "errors": []},
+    )
+
+    response = client.post("/api/providers/enrich/sam-websites", params={"limit": 5})
+
+    assert response.status_code == 200
+    assert started["run"].source == "PROVIDER_SAM_WEBSITE_ENRICHMENT"
+    assert completed["payload"]["status"] == "completed"
+    assert completed["payload"]["updated_count"] == 2
+
+
+def test_vendor_sync_records_import_run(client, monkeypatch):
+    started = {}
+    completed = {}
+
+    monkeypatch.setattr(
+        vendors_api,
+        "start_import_run",
+        lambda *args, **kwargs: started.setdefault("run", SimpleNamespace(id=71, **kwargs)),
+    )
+    monkeypatch.setattr(
+        vendors_api,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(vendors_api, "ensure_parsed", lambda db, opp: {"cage_codes": ["1ABC2"], "text_source": {"kind": "pdf"}})
+    monkeypatch.setattr(vendors_api, "sync_vendor_leads_from_parsed", lambda db, opp: {"created": 1, "updated": 0, "approved_source_count": 1})
+    monkeypatch.setattr(vendors_api, "seed_vendor_leads_from_providers", lambda *args, **kwargs: {"created": 2, "updated": 1})
+
+    class FakeOpportunityQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return SimpleNamespace(id=12, organization_id=1)
+
+    class FakeDB:
+        def query(self, model):
+            return FakeOpportunityQuery()
+
+    def override_get_db():
+        yield FakeDB()
+
+    client.app.dependency_overrides[vendors_api.get_db] = override_get_db
+    try:
+        response = client.post("/api/vendors/leads/sync", json={"opportunity_id": 12})
+    finally:
+        client.app.dependency_overrides.pop(vendors_api.get_db, None)
+
+    assert response.status_code == 200
+    assert started["run"].source == "WORKSPACE_VENDOR_SYNC"
+    assert completed["payload"]["status"] == "completed"
+    assert completed["payload"]["inserted_count"] == 3
+
+
+def test_workspace_nsn_refresh_records_import_run(client, monkeypatch):
+    started = {}
+    completed = {}
+
+    monkeypatch.setattr(
+        workspace_api,
+        "start_import_run",
+        lambda *args, **kwargs: started.setdefault("run", SimpleNamespace(id=72, **kwargs)),
+    )
+    monkeypatch.setattr(
+        workspace_api,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(workspace_api, "_get_opp_scoped", lambda db, opp_id, organization_id=None: SimpleNamespace(id=opp_id, organization_id=organization_id))
+    monkeypatch.setattr(workspace_api, "run_nsn_intelligence", lambda *args, **kwargs: {"status": "completed", "created": 2, "updated": 1, "reference_count": 5})
+    monkeypatch.setattr(workspace_api, "generate_submission_package", lambda *args, **kwargs: SimpleNamespace(id=1))
+
+    response = client.post("/api/workspace/intelligence/nsn/run", json={"opportunity_id": 14, "seed_awardees": True})
+
+    assert response.status_code == 200
+    assert started["run"].source == "NSN_INTELLIGENCE"
+    assert completed["payload"]["status"] == "completed"
+    assert completed["payload"]["row_count"] == 5
+
+
+def test_workspace_send_artifact_requires_explicit_approval():
+    artifact = SimpleNamespace(
+        id=41,
+        opportunity_id=12,
+        organization_id=1,
+        content_json={"to": "vendor@example.com", "subject": "Quote", "body": "Please quote"},
+    )
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return artifact
+
+    class FakeDB:
+        def query(self, model):
+            return FakeQuery()
+
+    with pytest.raises(workspace_api.HTTPException) as exc:
+        workspace_api.send_artifact_email(
+            41,
+            payload={"recipient": "vendor@example.com"},
+            db=FakeDB(),
+            current_org=SimpleNamespace(id=1),
+            current_user=SimpleNamespace(id=7),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "External email send requires explicit approval"
+
+
+def test_workspace_promote_vendor_requires_explicit_approval():
+    with pytest.raises(workspace_api.HTTPException) as exc:
+        workspace_api.promote_workspace_vendor(
+            {"opportunity_id": 12, "vendor_lead_id": 9},
+            db=SimpleNamespace(),
+            current_org=SimpleNamespace(id=1),
+            current_user=SimpleNamespace(id=7),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Promoting a vendor into quote-request flow requires explicit approval"
+
+
+def test_workspace_outreach_log_sent_requires_explicit_approval():
+    artifact = SimpleNamespace(id=88, opportunity_id=12, organization_id=1, content_json={})
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return artifact
+
+    class FakeDB:
+        def query(self, model):
+            return FakeQuery()
+
+    with pytest.raises(workspace_api.HTTPException) as exc:
+        workspace_api.log_artifact_outreach(
+            88,
+            {"action": "sent"},
+            db=FakeDB(),
+            current_org=SimpleNamespace(id=1),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Marking outreach as sent requires explicit approval"
+
+
+def test_file_download_failure_hides_internal_exception(client, monkeypatch):
+    file_record = SimpleNamespace(id=91, file_path="s3://nagacon/private.pdf", filename="private.pdf")
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return file_record
+
+    monkeypatch.setattr(files_api, "_scoped_file_query", lambda db, org_id: FakeQuery())
+    monkeypatch.setattr(
+        files_api,
+        "build_storage_download_response",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("secret path leaked")),
+    )
+
+    response = client.get("/api/files/download/91")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "File download unavailable"
+
+
+def test_file_parse_failure_hides_internal_exception(client, monkeypatch):
+    file_record = SimpleNamespace(
+        id=92,
+        opportunity_id=12,
+        file_path="C:/tmp/private.pdf",
+        filename="private.pdf",
+    )
+
+    class FakeQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return file_record
+
+    monkeypatch.setattr(files_api, "_scoped_file_query", lambda db, org_id: FakeQuery())
+    monkeypatch.setattr(files_api, "file_exists", lambda ref: True)
+    monkeypatch.setattr(
+        files_api,
+        "process_opportunity_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("sensitive parser failure")),
+    )
+
+    response = client.post("/api/files/parse/92")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Parse failed"
+
+
+def test_get_file_or_404_claims_legacy_file_for_scoped_opportunity(monkeypatch):
+    file_record = SimpleNamespace(id=101, organization_id=None, opportunity_id=55)
+    commits = []
+
+    class FakeFileQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return file_record
+
+    class FakeDB:
+        def query(self, model):
+            return FakeFileQuery()
+
+        def add(self, item):
+            return None
+
+        def commit(self):
+            commits.append(True)
+
+    monkeypatch.setattr(
+        files_api,
+        "_scoped_opportunity_query",
+        lambda db, opportunity_id, org_id: SimpleNamespace(first=lambda: SimpleNamespace(id=55, organization_id=org_id)),
+    )
+
+    result = files_api._get_file_or_404(FakeDB(), 101, 1)
+
+    assert result is file_record
+    assert file_record.organization_id == 1
+    assert commits == [True]
+
+
+def test_get_file_or_404_rejects_unscoped_legacy_file(monkeypatch):
+    file_record = SimpleNamespace(id=102, organization_id=None, opportunity_id=66)
+
+    class FakeFileQuery:
+        def filter(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return file_record
+
+    class FakeDB:
+        def query(self, model):
+            return FakeFileQuery()
+
+    monkeypatch.setattr(
+        files_api,
+        "_scoped_opportunity_query",
+        lambda db, opportunity_id, org_id: SimpleNamespace(first=lambda: None),
+    )
+
+    with pytest.raises(files_api.HTTPException) as exc:
+        files_api._get_file_or_404(FakeDB(), 102, 1)
+
+    assert exc.value.status_code == 404
+
+
+def test_validate_startup_config_allows_dev_defaults(monkeypatch):
+    monkeypatch.setattr(settings, "APP_ENV", "dev", raising=False)
+    monkeypatch.setattr(settings, "DEBUG", True, raising=False)
+    monkeypatch.setattr(settings, "DEV_AUTH_FALLBACK_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "SIGNUP_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SECURE", False, raising=False)
+    monkeypatch.setattr(settings, "SESSION_SECRET", "replace-with-a-long-random-secret", raising=False)
+
+    main_app.validate_startup_config()
+
+
+def test_validate_startup_config_rejects_unsafe_private_alpha(monkeypatch):
+    monkeypatch.setattr(settings, "APP_ENV", "private-alpha", raising=False)
+    monkeypatch.setattr(settings, "DEBUG", True, raising=False)
+    monkeypatch.setattr(settings, "DEV_AUTH_FALLBACK_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "SIGNUP_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "DEFAULT_ADMIN_BOOTSTRAP_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SECURE", False, raising=False)
+    monkeypatch.setattr(settings, "SESSION_SECRET", "replace-with-a-long-random-secret", raising=False)
+
+    with pytest.raises(RuntimeError) as exc:
+        main_app.validate_startup_config()
+
+    message = str(exc.value)
+    assert "DEBUG must be false" in message
+    assert "DEV_AUTH_FALLBACK_ENABLED must be false" in message
+    assert "SIGNUP_ENABLED must be false" in message
+    assert "SESSION_COOKIE_SECURE must be true" in message
+    assert "SESSION_SECRET must be a non-default secret" in message
+
+
+def test_validate_startup_config_accepts_hardened_private_alpha(monkeypatch):
+    monkeypatch.setattr(settings, "APP_ENV", "private-alpha", raising=False)
+    monkeypatch.setattr(settings, "DEBUG", False, raising=False)
+    monkeypatch.setattr(settings, "DEV_AUTH_FALLBACK_ENABLED", False, raising=False)
+    monkeypatch.setattr(settings, "SIGNUP_ENABLED", False, raising=False)
+    monkeypatch.setattr(settings, "DEFAULT_ADMIN_BOOTSTRAP_ENABLED", False, raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SECURE", True, raising=False)
+    monkeypatch.setattr(settings, "SESSION_SECRET", "this-is-a-realistic-private-alpha-session-secret", raising=False)
+
+    main_app.validate_startup_config()
+
+
+def test_login_sets_cookie_session_defaults(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_api,
+        "authenticate_user",
+        lambda db, identifier, password: SimpleNamespace(
+            id=5,
+            email="owner@example.com",
+            full_name="Owner Example",
+            role="OWNER",
+            is_active=True,
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api,
+        "start_user_session",
+        lambda db, user: ("session-token-abcdefghijklmnopqrstuvwxyz", datetime.utcnow()),
+    )
+    monkeypatch.setattr(settings, "APP_ENV", "dev", raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SECURE", False, raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SAMESITE", "lax", raising=False)
+
+    response = client.post("/api/auth/login", json={"identifier": "owner@example.com", "password": "password123"})
+
+    assert response.status_code == 200
+    set_cookie = "\n".join(response.headers.get_list("set-cookie"))
+    assert "nagacon_session=" in set_cookie
+    assert "nagacon_csrf=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
+    assert "Secure" not in set_cookie
+
+
+def test_login_sets_secure_cookies_in_private_alpha(client, monkeypatch):
+    monkeypatch.setattr(
+        auth_api,
+        "authenticate_user",
+        lambda db, identifier, password: SimpleNamespace(
+            id=6,
+            email="owner@example.com",
+            full_name="Owner Example",
+            role="OWNER",
+            is_active=True,
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api,
+        "start_user_session",
+        lambda db, user: ("session-token-abcdefghijklmnopqrstuvwxyz", datetime.utcnow()),
+    )
+    monkeypatch.setattr(settings, "APP_ENV", "private-alpha", raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SECURE", True, raising=False)
+    monkeypatch.setattr(settings, "SESSION_COOKIE_SAMESITE", "none", raising=False)
+
+    response = client.post("/api/auth/login", json={"identifier": "owner@example.com", "password": "password123"})
+
+    assert response.status_code == 200
+    set_cookie = "\n".join(response.headers.get_list("set-cookie"))
+    assert "SameSite=none" in set_cookie
+    assert "Secure" in set_cookie
 
 
 def test_opportunities_search_returns_paginated_payload(client, monkeypatch):

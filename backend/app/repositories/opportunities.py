@@ -11,6 +11,7 @@ from app.schemas.opportunity import OpportunityCreate, OpportunityUpdate
 from app.utils.exceptions import DuplicateRecordError
 from app.utils.opportunity_lifecycle import ARCHIVE_CUTOFF_DAYS
 from app.utils.set_asides import normalize_set_aside, set_aside_display_label
+from app.utils.utc import utcnow
 
 
 class OpportunityRepository:
@@ -169,7 +170,7 @@ class OpportunityRepository:
         if due_window:
             from datetime import datetime, timedelta
 
-            now = datetime.utcnow()
+            now = utcnow()
             archive_cutoff = now - timedelta(days=ARCHIVE_CUTOFF_DAYS)
             if due_window == "7d":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at >= now, Opportunity.due_at <= now + timedelta(days=7))
@@ -306,7 +307,7 @@ class OpportunityRepository:
         total = base_query.count()
         open_first = case(
             (Opportunity.due_at.is_(None), 1),
-            (Opportunity.due_at < datetime.utcnow(), 2),
+            (Opportunity.due_at < utcnow(), 2),
             else_=0,
         )
         sort_map = {

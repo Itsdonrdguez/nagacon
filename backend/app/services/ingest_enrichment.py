@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models.opportunity import Opportunity
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.part_finder import find_part_for_opportunity
 from app.services.part_vendor_leads import (
     create_email_drafts_for_part_finder_quotes,
@@ -13,6 +14,7 @@ from app.services.part_vendor_leads import (
     seed_vendor_leads_from_part_finder_result,
 )
 from app.services.workspace_service import create_artifact
+from app.utils.utc import utcnow_iso
 
 
 def enrich_dibbs_opportunities_after_ingest(
@@ -89,40 +91,65 @@ def run_part_finder_enrichment_for_opportunity(
     opp = _get_opportunity(db, opportunity_id, organization_id=organization_id)
     if not opp:
         raise ValueError("Opportunity not found")
-    result = find_part_for_opportunity(
+    run = start_import_run(
         db,
-        opportunity_id,
+        source="PART_FINDER",
+        run_kind="workspace_part_finder_enrichment",
+        request_payload={
+            "opportunity_id": opportunity_id,
+            "force_wbparts_refresh": force_wbparts_refresh,
+        },
         organization_id=organization_id,
-        force_wbparts_refresh=force_wbparts_refresh,
     )
-    artifact = _persist_part_finder_artifact(db, opportunity_id, result)
-    vendor_leads = seed_vendor_leads_from_part_finder_result(
-        db,
-        opp,
-        result,
-        organization_id=organization_id,
-    ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "candidate_count": 0}
-    quote_seed = seed_quotes_from_part_finder_leads(
-        db,
-        opp,
-        organization_id=organization_id,
-    ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "seedable_count": 0}
-    email_drafts = create_email_drafts_for_part_finder_quotes(
-        db,
-        opp,
-        quote_seed,
-    ) if result.get("status") == "ok" else {"created": 0, "skipped": 0, "errors": []}
-    return {
-        "opportunity_id": opportunity_id,
-        "status": result.get("status"),
-        "nsn": (result.get("part") or {}).get("nsn"),
-        "quantity": (result.get("part") or {}).get("quantity"),
-        "item_name": (result.get("part") or {}).get("item_name"),
-        "artifact_id": getattr(artifact, "id", None),
-        "vendor_leads": vendor_leads,
-        "quote_seed": quote_seed,
-        "email_drafts": email_drafts,
-    }
+    try:
+        result = find_part_for_opportunity(
+            db,
+            opportunity_id,
+            organization_id=organization_id,
+            force_wbparts_refresh=force_wbparts_refresh,
+        )
+        artifact = _persist_part_finder_artifact(db, opportunity_id, result)
+        vendor_leads = seed_vendor_leads_from_part_finder_result(
+            db,
+            opp,
+            result,
+            organization_id=organization_id,
+        ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "candidate_count": 0, "skipped": 0}
+        quote_seed = seed_quotes_from_part_finder_leads(
+            db,
+            opp,
+            organization_id=organization_id,
+        ) if result.get("status") == "ok" else {"created": 0, "updated": 0, "seedable_count": 0, "skipped": 0}
+        email_drafts = create_email_drafts_for_part_finder_quotes(
+            db,
+            opp,
+            quote_seed,
+        ) if result.get("status") == "ok" else {"created": 0, "skipped": 0, "errors": []}
+        payload = {
+            "opportunity_id": opportunity_id,
+            "status": result.get("status"),
+            "nsn": (result.get("part") or {}).get("nsn"),
+            "quantity": (result.get("part") or {}).get("quantity"),
+            "item_name": (result.get("part") or {}).get("item_name"),
+            "artifact_id": getattr(artifact, "id", None),
+            "vendor_leads": vendor_leads,
+            "quote_seed": quote_seed,
+            "email_drafts": email_drafts,
+        }
+        complete_import_run(
+            db,
+            run,
+            status="completed" if result.get("status") == "ok" else str(result.get("status") or "completed"),
+            result_payload=payload,
+            row_count=int(vendor_leads.get("candidate_count") or quote_seed.get("seedable_count") or 0),
+            inserted_count=int(vendor_leads.get("created") or 0) + int(quote_seed.get("created") or 0) + int(email_drafts.get("created") or 0),
+            updated_count=int(vendor_leads.get("updated") or 0) + int(quote_seed.get("updated") or 0),
+            skipped_count=int(vendor_leads.get("skipped") or 0) + int(quote_seed.get("skipped") or 0) + int(email_drafts.get("skipped") or 0),
+        )
+        return payload
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
 
 
 def _get_opportunity(db: Session, opportunity_id: int, *, organization_id: int | None = None) -> Opportunity | None:
@@ -151,7 +178,7 @@ def _persist_part_finder_artifact(db: Session, opportunity_id: int, result: dict
                     "evidence": result.get("evidence") or {},
                     "confidence": result.get("confidence") or {},
                     "next_actions": result.get("next_actions") or [],
-                    "generated_at": datetime.utcnow().isoformat(),
+                    "generated_at": utcnow_iso(),
                     "source": "dibbs_ingest_auto_enrichment",
                 }
             }

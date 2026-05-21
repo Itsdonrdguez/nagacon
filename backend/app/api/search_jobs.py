@@ -4,7 +4,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_organization, get_current_user, get_db
-from app.services.search_jobs import get_search_job, recover_stale_jobs_now, start_search_job
+from app.services.search_jobs import SearchJobLookupUnavailable, get_search_job, recover_stale_jobs_now, start_search_job
 from app.services.work_queue import workspace_intake_backpressure_snapshot
 
 router = APIRouter(prefix="/api/search-jobs", tags=["search-jobs"])
@@ -39,7 +39,10 @@ def create_search_job(
 
 @router.get("/{job_id}")
 def read_search_job(job_id: str, current_org=Depends(get_current_organization), current_user=Depends(get_current_user)):
-    job = get_search_job(job_id)
+    try:
+        job = get_search_job(job_id)
+    except SearchJobLookupUnavailable:
+        raise HTTPException(status_code=503, detail="Search job status temporarily unavailable")
     if not job:
         raise HTTPException(status_code=404, detail="Search job not found")
     job_org = (job.get("result") or {}).get("organization_id") or (job.get("payload") or {}).get("organization_id")

@@ -3,11 +3,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.ingest_enrichment import run_part_finder_enrichment_for_opportunity
 from app.services.part_finder import find_part_for_nsn, find_part_for_opportunity, find_parts_batch
 
-router = APIRouter(prefix="/api/parts", tags=["part-finder"])
+router = APIRouter(
+    prefix="/api/parts",
+    tags=["part-finder"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 @router.get("/opportunity/{opportunity_id}")

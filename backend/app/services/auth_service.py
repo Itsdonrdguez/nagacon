@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.organization import User
 from app.services.org_service import ensure_default_organization
 
@@ -17,8 +18,13 @@ DEFAULT_USER_ROLE = "OWNER"
 DEFAULT_USER_USERNAME = "admin"
 DEFAULT_USER_PASSWORD = "admin"
 SESSION_COOKIE_NAME = "nagacon_session"
+CSRF_COOKIE_NAME = "nagacon_csrf"
 SESSION_TTL_DAYS = 30
 PBKDF2_ITERATIONS = 240000
+
+
+def _default_admin_bootstrap_enabled() -> bool:
+    return bool(getattr(settings, "DEFAULT_ADMIN_BOOTSTRAP_ENABLED", True))
 
 
 def _utcnow() -> datetime:
@@ -71,6 +77,8 @@ def hash_session_token(token: str) -> str:
 
 
 def ensure_default_user(db: Session) -> User | None:
+    if not _default_admin_bootstrap_enabled():
+        return None
     org = ensure_default_organization(db)
     try:
         user = db.query(User).filter(User.email.in_([DEFAULT_USER_EMAIL, "owner@nagacon.local"])).first()
@@ -197,7 +205,7 @@ def authenticate_user(db: Session, *, identifier: str, password: str) -> User | 
         if not user and "@" not in normalized:
             local_part = f"{normalized}@nagacon.local"
             user = db.query(User).filter(User.email.in_([local_part, f"{normalized}@gmail.com"])).first()
-        if not user and normalized == DEFAULT_USER_USERNAME:
+        if not user and normalized == DEFAULT_USER_USERNAME and _default_admin_bootstrap_enabled():
             user = ensure_default_user(db)
         if not user or not getattr(user, "is_active", True):
             return None

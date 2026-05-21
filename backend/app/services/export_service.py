@@ -4,7 +4,6 @@ import csv
 import io
 import json
 import zipfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,7 @@ from app.models.workspace import WorkspaceArtifact
 from app.models.vendor import VendorQuote
 from app.models.opportunity_file import OpportunityFile
 from app.services.storage import local_temp_path
+from app.utils.utc import utcnow_iso
 
 
 def _safe_filename(s: str) -> str:
@@ -31,8 +31,11 @@ def _artifact_by_type(arts: list[WorkspaceArtifact], artifact_type: str) -> Work
     return None
 
 
-def build_bid_package_zip(db: Session, opportunity_id: int) -> tuple[str, bytes]:
-    opp = db.query(Opportunity).filter(Opportunity.id == opportunity_id).first()
+def build_bid_package_zip(db: Session, opportunity_id: int, *, organization_id: int | None = None) -> tuple[str, bytes]:
+    opp_query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
+    if organization_id is not None:
+        opp_query = opp_query.filter(Opportunity.organization_id == organization_id)
+    opp = opp_query.first()
     if not opp:
         raise ValueError("Opportunity not found")
 
@@ -48,21 +51,17 @@ def build_bid_package_zip(db: Session, opportunity_id: int) -> tuple[str, bytes]
     checklist = _artifact_by_type(arts, "CHECKLIST")
     email = _artifact_by_type(arts, "EMAIL_DRAFT")
 
-    vqs = (
-        db.query(VendorQuote)
-        .filter(VendorQuote.opportunity_id == opportunity_id)
-        .order_by(VendorQuote.company_name.asc().nullslast(), VendorQuote.cage.asc())
-        .all()
-    )
+    vq_query = db.query(VendorQuote).filter(VendorQuote.opportunity_id == opportunity_id)
+    if organization_id is not None:
+        vq_query = vq_query.filter(VendorQuote.organization_id == organization_id)
+    vqs = vq_query.order_by(VendorQuote.company_name.asc().nullslast(), VendorQuote.cage.asc()).all()
 
-    files = (
-        db.query(OpportunityFile)
-        .filter(OpportunityFile.opportunity_id == opportunity_id)
-        .order_by(OpportunityFile.id.asc())
-        .all()
-    )
+    files_query = db.query(OpportunityFile).filter(OpportunityFile.opportunity_id == opportunity_id)
+    if organization_id is not None:
+        files_query = files_query.filter(OpportunityFile.organization_id == organization_id)
+    files = files_query.order_by(OpportunityFile.id.asc()).all()
 
-    now = datetime.utcnow().isoformat()
+    now = utcnow_iso()
 
     opportunity_obj: dict[str, Any] = {
         "id": opp.id,

@@ -18,6 +18,7 @@ from app.services.workspace_service import (
     generate_submission_package,
     get_best_processed_document,
 )
+from app.utils.utc import utcnow_iso
 
 
 def _safe_text(value: Any) -> str:
@@ -510,7 +511,7 @@ def process_opportunity_file(db: Session, file_id: int, force: bool = False) -> 
     pipeline.update(
         {
             "status": "processing",
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": utcnow_iso(),
             "error_message": None,
             "stages": {
                 "extract_agent": "running",
@@ -552,6 +553,10 @@ def process_opportunity_file(db: Session, file_id: int, force: bool = False) -> 
         risk_flags: list[str] = []
         if not extracted_text:
             risk_flags.append("Document text extraction did not produce usable text.")
+        if parsed.get("page_limit_applied"):
+            risk_flags.append("Document parsing stopped at the configured page limit.")
+        if parsed.get("error"):
+            risk_flags.append(str(parsed.get("error")))
         if not fields.get("solicitation_number"):
             risk_flags.append("Solicitation number could not be confirmed from the document.")
         if not fields.get("return_by"):
@@ -569,6 +574,9 @@ def process_opportunity_file(db: Session, file_id: int, force: bool = False) -> 
         metadata.update(
             {
                 "parser": parsed.get("parser"),
+                "parser_error": parsed.get("error"),
+                "page_count": parsed.get("page_count"),
+                "page_limit_applied": bool(parsed.get("page_limit_applied")),
                 "document_type": document_type,
                 "source_basis": "pdf_document_extraction",
                 "extracted_fields": fields,
@@ -597,7 +605,7 @@ def process_opportunity_file(db: Session, file_id: int, force: bool = False) -> 
             "status": "completed",
             "document_type": document_type,
             "review_required": review_required,
-            "processed_at": datetime.utcnow().isoformat(),
+            "processed_at": utcnow_iso(),
             "started_at": pipeline.get("started_at"),
             "error_message": None,
             "stages": {
@@ -623,7 +631,7 @@ def process_opportunity_file(db: Session, file_id: int, force: bool = False) -> 
             "status": "failed",
             "document_type": None,
             "review_required": True,
-            "processed_at": datetime.utcnow().isoformat(),
+            "processed_at": utcnow_iso(),
             "started_at": pipeline.get("started_at"),
             "error_message": str(exc),
             "stages": {
@@ -746,7 +754,7 @@ def _build_compliance_artifact_content(db: Session, opp: Opportunity) -> dict[st
         "review_flags": review_flags,
         "vendor_request_items": vendor_request_items,
         "risks": risk_flags or (["Document extraction may be incomplete for scanned or image-based PDFs."] if files else ["No files have been downloaded for compliance review yet."]),
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
 
 

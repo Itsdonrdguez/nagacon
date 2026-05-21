@@ -15,6 +15,7 @@ from app.schemas.provider import (
     ProviderRowOut,
     ProviderUpdate,
 )
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.providers.pdf_cage_extractor import (
     backfill_dibbs_provider_item_nomenclature,
     enrich_provider_websites_from_sam,
@@ -148,12 +149,38 @@ def enrich_sam_websites(
     current_org=Depends(get_current_organization),
     current_user=Depends(get_current_user),
 ):
-    return enrich_provider_websites_from_sam(
+    org_id = getattr(current_org, "id", None)
+    user_id = getattr(current_user, "id", None)
+    run = start_import_run(
         db,
-        organization_id=getattr(current_org, "id", None),
-        user_id=getattr(current_user, "id", None),
-        limit=limit,
+        source="PROVIDER_SAM_WEBSITE_ENRICHMENT",
+        run_kind="provider_sam_website_enrichment",
+        request_payload={"limit": limit},
+        organization_id=org_id,
+        user_id=user_id,
     )
+    try:
+        result = enrich_provider_websites_from_sam(
+            db,
+            organization_id=org_id,
+            user_id=user_id,
+            limit=limit,
+        )
+        complete_import_run(
+            db,
+            run,
+            status="completed" if not (result.get("errors") or []) else "partial_success",
+            result_payload=result,
+            row_count=int(result.get("provider_count") or 0),
+            inserted_count=int(result.get("created") or 0),
+            updated_count=int(result.get("updated") or 0),
+            skipped_count=int(result.get("skipped") or 0),
+            error_message=" | ".join(str(item) for item in (result.get("errors") or [])[:5]) or None,
+        )
+        return result
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
 
 
 @router.post("/discover-contacts")

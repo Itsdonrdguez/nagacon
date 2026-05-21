@@ -10,6 +10,7 @@ from app.models.workspace import WorkspaceArtifact
 from app.services.closed_solicitation_processing import process_closed_solicitation_file, process_closed_solicitation_files_for_opportunity
 from app.services.storage import delete_reference, delete_reference_tree, storage_root
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
+from app.utils.utc import utcnow_iso, utcnow
 from sqlalchemy.orm import Session, object_session
 from pathlib import Path
 
@@ -121,7 +122,7 @@ def mark_opportunity_files_processing_complete(
         retention.update(
             {
                 "downstream_complete": bool(completed),
-                "last_checked_at": datetime.utcnow().isoformat(),
+                "last_checked_at": utcnow_iso(),
                 "source": source,
             }
         )
@@ -145,7 +146,7 @@ def prune_eligible_files_for_system(
         db.query(OpportunityFile)
         .join(Opportunity, Opportunity.id == OpportunityFile.opportunity_id)
         .filter(Opportunity.due_at.is_not(None))
-        .filter(Opportunity.due_at < datetime.utcnow() - timedelta(days=30))
+        .filter(Opportunity.due_at < utcnow() - timedelta(days=30))
         .order_by(Opportunity.due_at.asc().nullslast(), OpportunityFile.id.asc())
         .limit(max(min(limit, 1000), 1))
         .all()

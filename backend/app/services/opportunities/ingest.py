@@ -9,8 +9,13 @@ from app.repositories.opportunities import OpportunityRepository
 from app.utils.exceptions import NormalizationError, DuplicateRecordError
 
 
-def ingest_raw_opportunities(db: Session, raw_records: List[RawOpportunity]) -> IngestResult:
-    repo = OpportunityRepository(db)
+def ingest_raw_opportunities(
+    db: Session,
+    raw_records: List[RawOpportunity],
+    *,
+    organization_id: int | None = None,
+) -> IngestResult:
+    repo = OpportunityRepository(db, organization_id=organization_id)
     result = IngestResult()
 
     for raw in raw_records:

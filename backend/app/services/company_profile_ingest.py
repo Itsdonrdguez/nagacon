@@ -8,11 +8,13 @@ from sqlalchemy.orm import Session
 from app.models.company_profile import CompanyProfile
 from app.schemas.opportunity import RawOpportunity
 from app.services.dibbs.fetch_guard import guarded_fetch_dibbs_opportunities
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
 from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
 from app.services.provider_settings_service import get_effective_sam_api_key
 from app.services.scrapers.sam_scraper import SamScraperError, fetch_sam_opportunities
+from app.utils.utc import utcnow
 
 DEFAULT_DIBBS_FSC_CODES = [
     "6520",
@@ -237,6 +239,18 @@ def run_company_profile_ingest(
     progress_callback=None,
     user_id: int | None = None,
 ) -> dict[str, Any]:
+    import_run = start_import_run(
+        db,
+        source="COMPANY_PROFILE",
+        run_kind="company_profile_ingest",
+        request_payload={
+            "quick": bool(quick),
+            "update_last_run": bool(update_last_run),
+            "profile_id": getattr(profile, "id", None) if profile is not None else None,
+        },
+        organization_id=getattr(profile, "organization_id", None) if profile is not None else None,
+        user_id=user_id,
+    )
     plan = build_company_ingest_plan(profile)
     plan = _build_effective_plan(plan, quick=quick)
     limit = int(plan["auto_ingest_limit"] or 25)
@@ -338,26 +352,48 @@ def run_company_profile_ingest(
         "states": plan["sam"]["states"],
     }
 
-    if profile is not None and update_last_run:
-        profile.last_auto_ingest_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        db.add(profile)
-        db.commit()
-        db.refresh(profile)
+    try:
+        if profile is not None and update_last_run:
+            profile.last_auto_ingest_at = utcnow()
+            db.add(profile)
+            db.commit()
+            db.refresh(profile)
 
-    return {
-        "search_mode": plan.get("search_mode") or "full",
-        "plan": plan,
-        "results": {
-            "dibbs": dibbs_ingest,
-            "sam": sam_ingest,
-        },
-    }
+        result = {
+            "search_mode": plan.get("search_mode") or "full",
+            "plan": plan,
+            "results": {
+                "dibbs": dibbs_ingest,
+                "sam": sam_ingest,
+            },
+        }
+        dibbs_result = result["results"]["dibbs"]
+        sam_result = result["results"]["sam"]
+        dibbs_errors = list(dibbs_result.get("errors") or [])
+        sam_errors = list(sam_result.get("errors") or [])
+        all_errors = [str(item) for item in (dibbs_errors + sam_errors) if str(item or "").strip()]
+        complete_import_run(
+            db,
+            import_run,
+            status="partial_success" if all_errors else "completed",
+            result_payload=result,
+            row_count=int((dibbs_result.get("diagnostics") or {}).get("raw_rows") or 0)
+            + int((sam_result.get("diagnostics") or {}).get("raw_rows") or 0),
+            inserted_count=int(dibbs_result.get("inserted") or 0) + int(sam_result.get("inserted") or 0),
+            updated_count=int(dibbs_result.get("updated") or 0) + int(sam_result.get("updated") or 0),
+            skipped_count=int(dibbs_result.get("skipped") or 0) + int(sam_result.get("skipped") or 0),
+            error_message=" | ".join(all_errors[:5]) if all_errors else None,
+        )
+        return result
+    except Exception as exc:
+        complete_import_run(db, import_run, status="failed", error_message=str(exc))
+        raise
 
 
 def company_profile_due_for_auto_ingest(profile: CompanyProfile | None, now: datetime | None = None) -> bool:
     if not profile or not getattr(profile, "auto_ingest_enabled", False):
         return False
-    current_time = now or datetime.utcnow()
+    current_time = now or utcnow()
     interval_hours = int(getattr(profile, "auto_ingest_interval_hours", None) or 24)
     last_run = getattr(profile, "last_auto_ingest_at", None)
     if not last_run:

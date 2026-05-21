@@ -5,12 +5,17 @@ from datetime import datetime
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.opportunity import Opportunity
 from app.services.dibbs.detail_enrichment_playwright import enrich_dibbs_batch
 from app.services.dibbs.approved_source_leads import seed_vendor_leads_from_dibbs_approved_sources
+from app.services.import_run_service import complete_import_run, start_import_run
 
-router = APIRouter(prefix="/api/dibbs", tags=["dibbs"])
+router = APIRouter(
+    prefix="/api/dibbs",
+    tags=["dibbs"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _parse_dibbs_date(value: str | None):
@@ -25,36 +30,91 @@ def _parse_dibbs_date(value: str | None):
     return None
 
 
+def _run_dibbs_enrichment(
+    payload: dict,
+    db: Session,
+    *,
+    organization_id: int | None,
+    user_id: int | None,
+    source_label: str,
+):
+    run = start_import_run(
+        db,
+        source=source_label,
+        run_kind="dibbs_enrichment",
+        request_payload=payload,
+        organization_id=organization_id,
+        user_id=user_id,
+    )
+    try:
+        result = enrich_dibbs_batch(
+            db=db,
+            limit=int(payload.get("limit", 10)),
+            source=str(payload.get("source", "DIBBS")),
+            debug=bool(payload.get("debug", False)),
+            auto_seed_approved_sources=bool(payload.get("auto_seed_approved_sources", True)),
+        )
+        complete_import_run(
+            db,
+            run,
+            status="completed" if not int(result.get("failed") or 0) else "partial_success",
+            result_payload=result,
+            row_count=int(result.get("requested_limit") or 0),
+            updated_count=int(result.get("enriched") or 0),
+            skipped_count=int(result.get("failed") or 0),
+        )
+        return result
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
+
+
 @router.post("/enrich")
-def enrich(payload: dict = Body(default={}), db: Session = Depends(get_db)):
-    return enrich_dibbs_batch(
-        db=db,
-        limit=int(payload.get("limit", 10)),
-        source=str(payload.get("source", "DIBBS")),
-        debug=bool(payload.get("debug", False)),
-        auto_seed_approved_sources=bool(payload.get("auto_seed_approved_sources", True)),
+def enrich(
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    return _run_dibbs_enrichment(
+        payload,
+        db,
+        organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
+        source_label="DIBBS_ENRICHMENT",
     )
 
 
 @router.post("/enrich-playwright")
-def enrich_playwright(payload: dict = Body(default={}), db: Session = Depends(get_db)):
-    return enrich_dibbs_batch(
-        db=db,
-        limit=int(payload.get("limit", 10)),
-        source=str(payload.get("source", "DIBBS")),
-        debug=bool(payload.get("debug", False)),
-        auto_seed_approved_sources=bool(payload.get("auto_seed_approved_sources", True)),
+def enrich_playwright(
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    return _run_dibbs_enrichment(
+        payload,
+        db,
+        organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
+        source_label="DIBBS_ENRICHMENT_PLAYWRIGHT",
     )
 
 
 @router.post("/pipeline")
-def pipeline(payload: dict = Body(default={}), db: Session = Depends(get_db)):
-    return enrich_dibbs_batch(
-        db=db,
-        limit=int(payload.get("limit", 10)),
-        source=str(payload.get("source", "DIBBS")),
-        debug=bool(payload.get("debug", False)),
-        auto_seed_approved_sources=True,
+def pipeline(
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    merged_payload = {**dict(payload or {}), "auto_seed_approved_sources": True}
+    return _run_dibbs_enrichment(
+        merged_payload,
+        db,
+        organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
+        source_label="DIBBS_PIPELINE",
     )
 
 

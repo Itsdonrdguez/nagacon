@@ -22,6 +22,7 @@ from app.services.search_jobs import start_search_job
 from app.services.work_queue import queue_daily_work, workspace_intake_backpressure_snapshot
 from app.services.org_service import ensure_default_organization
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
+from app.utils.utc import utcnow
 
 
 def _closed_workspace_prep_enabled() -> bool:
@@ -344,7 +345,7 @@ def queue_workspace_prep_for_opportunities(
             "status": "disabled",
         }
 
-    now = datetime.utcnow()
+    now = utcnow()
     attempted_at = datetime.now(timezone.utc).isoformat()
     candidates = _workspace_prep_candidates(db, now=now, organization_id=organization_id)
     opp_ids = [opp.id for opp in candidates]
@@ -434,7 +435,7 @@ def queue_recently_closed_workspace_prep(db) -> dict[str, int]:
     if not _closed_workspace_prep_enabled():
         return {"queued": 0, "candidates": 0, "skipped_existing": 0, "skipped_backpressure": 0}
 
-    now = datetime.utcnow()
+    now = utcnow()
     candidates = _recently_closed_candidates(db, now=now)
     opp_ids = [opp.id for opp in candidates]
     document_counts = _count_by_opportunity(db, OpportunityFile, opp_ids)

@@ -1,12 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.dibbs_adapter import pull_dibbs_by_fsc
 from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
 from app.services.opportunity_store import upsert_opportunity
 
-router = APIRouter(prefix="/api/dibbs", tags=["dibbs"])
+router = APIRouter(
+    prefix="/api/dibbs",
+    tags=["dibbs"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _as_bool(value, default: bool = False) -> bool:

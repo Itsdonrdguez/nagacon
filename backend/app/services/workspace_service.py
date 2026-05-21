@@ -18,6 +18,7 @@ from app.services.bid_submission_service import get_submission
 from app.services.rfq_parser import get_best_opportunity_text, parse_dibbs_sources
 from app.services.vendor_email_automation import _build_quote_request_body, _format_display_date
 from app.services.vendor_service import sync_vendor_leads_from_parsed
+from app.utils.utc import utcnow_iso
 from app.utils.solicitation_status import derive_solicitation_status
 
 
@@ -241,7 +242,7 @@ def create_artifact(
     content_json["_meta"].setdefault("artifact_status", "ACTIVE")
     content_json.setdefault("_history", [])
     content_json.setdefault("_outreach_log", [])
-    content_json["_meta"].setdefault("created_at", datetime.utcnow().isoformat())
+    content_json["_meta"].setdefault("created_at", utcnow_iso())
     skip_history = artifact_type.upper() in {"WORKSPACE_SUMMARY_SNAPSHOT", "WBPARTS_REFERENCE"}
 
     if replace_existing:
@@ -262,7 +263,7 @@ def create_artifact(
                     {
                         "title": existing.title,
                         "content_json": {k: v for k, v in current_content.items() if k != "_history"},
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": utcnow_iso(),
                         "action": "auto_refresh" if artifact_type in {"COMPLIANCE_BRIEF", "EMAIL_DRAFT"} else "updated",
                     }
                 )
@@ -1366,7 +1367,7 @@ def generate_submission_package(db: Session, opp: Opportunity) -> WorkspaceArtif
             "recommended_next_actions": list(analysis_json.get("recommended_next_actions") or recommendation_json.get("next_actions") or []),
             "recommendation": recommendation_json,
         },
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     sol = opp.solicitation_number or str(opp.id)
     return create_artifact(db, opp.id, "SUBMISSION_PACKAGE", f"Submission Package - {sol}", content_json=content, replace_existing=True)

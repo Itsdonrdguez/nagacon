@@ -5,6 +5,7 @@ from app.schemas.opportunity import RawOpportunity
 from app.models.provider import Provider
 from app.models.vendor import VendorLead, VendorQuote
 from app.models.workspace import WorkspaceArtifact
+from app.services import ingest_enrichment
 from app.services import part_vendor_leads
 from app.services.part_vendor_leads import (
     _build_part_finder_candidates,
@@ -271,6 +272,61 @@ def test_part_finder_quote_seed_creates_email_draft(monkeypatch):
     assert artifacts[0].content_json["vendor_quote_id"] == 100
     assert artifacts[0].content_json["generated_from"] == "part_finder_quote_auto_outreach"
     assert artifacts[0].content_json["_meta"]["artifact_subtype"] == "PART_FINDER_QUOTE_EMAIL"
+
+
+def test_run_part_finder_enrichment_records_import_run(monkeypatch):
+    started = {}
+    completed = {}
+
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "start_import_run",
+        lambda *args, **kwargs: started.setdefault("run", SimpleNamespace(id=901, **kwargs)),
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "_get_opportunity",
+        lambda db, opportunity_id, organization_id=None: SimpleNamespace(id=opportunity_id, organization_id=organization_id),
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "find_part_for_opportunity",
+        lambda *args, **kwargs: {"status": "ok", "part": {"nsn": "6515-01-646-2617", "quantity": "8", "item_name": "TOURNIQUET"}},
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "_persist_part_finder_artifact",
+        lambda db, opportunity_id, result: SimpleNamespace(id=77),
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "seed_vendor_leads_from_part_finder_result",
+        lambda *args, **kwargs: {"created": 2, "updated": 1, "candidate_count": 4, "skipped": 0},
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "seed_quotes_from_part_finder_leads",
+        lambda *args, **kwargs: {"created": 1, "updated": 1, "seedable_count": 3, "skipped": 0},
+    )
+    monkeypatch.setattr(
+        ingest_enrichment,
+        "create_email_drafts_for_part_finder_quotes",
+        lambda *args, **kwargs: {"created": 1, "skipped": 1, "errors": []},
+    )
+
+    payload = ingest_enrichment.run_part_finder_enrichment_for_opportunity(object(), 77, organization_id=4)
+
+    assert payload["artifact_id"] == 77
+    assert started["run"].source == "PART_FINDER"
+    assert started["run"].organization_id == 4
+    assert completed["payload"]["status"] == "completed"
+    assert completed["payload"]["inserted_count"] == 4
+    assert completed["payload"]["updated_count"] == 2
 
 
 def test_outreach_artifact_sent_updates_linked_quote_status():

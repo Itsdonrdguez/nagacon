@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.utils.utc import utcnow
+
 
 def _clean(value: Any) -> str | None:
     if isinstance(value, dict):
@@ -16,7 +18,7 @@ def _clean(value: Any) -> str | None:
 def _days_until(value: datetime | None, now: datetime | None = None) -> int | None:
     if not value:
         return None
-    current = now or datetime.utcnow()
+    current = now or utcnow()
     return (value.date() - current.date()).days
 
 
@@ -267,7 +269,7 @@ def build_readiness_assessment(
     has_submission: bool = False,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    current = now or datetime.utcnow()
+    current = now or utcnow()
     due_at = getattr(opp, "due_at", None)
     days_until_due = _days_until(due_at, current)
     is_closed = days_until_due is not None and days_until_due < 0

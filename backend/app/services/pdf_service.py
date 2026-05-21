@@ -18,6 +18,11 @@ from app.core.config import settings
 from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.services.app_settings_service import get_setting
+from app.services.document_security import (
+    is_allowed_download_content_type,
+    malware_scan_metadata,
+    validate_file_size_bytes,
+)
 from app.services.document_pipeline import process_opportunity_documents
 from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
 from app.services.storage import delete_reference, ensure_dir, file_exists, storage_root, store_bytes, store_text
@@ -337,6 +342,9 @@ def _save_downloaded_file(
     file_type: str,
 ) -> tuple[int, str]:
     filename = _safe_filename(filename)
+    valid_size, size_error = validate_file_size_bytes(len(data or b""))
+    if not valid_size:
+        raise ValueError(size_error)
     matching_records = _matching_file_records(db, opp.id, filename, source_url)
     existing = None
     if matching_records:
@@ -351,10 +359,12 @@ def _save_downloaded_file(
         return 0, filename
     fp = out_dir / filename
     stored_ref = store_bytes(fp, data, content_type="application/pdf" if filename.lower().endswith(".pdf") else None)
+    security_metadata = {"_security": malware_scan_metadata(file_path=stored_ref, filename=filename)}
     if existing is not None:
         existing.file_type = file_type
         existing.source_url = source_url
         existing.file_path = stored_ref
+        existing.parsed_metadata = {**(getattr(existing, "parsed_metadata", None) or {}), **security_metadata}
         db.add(existing)
     else:
         db.add(
@@ -365,6 +375,7 @@ def _save_downloaded_file(
                 filename=filename,
                 source_url=source_url,
                 file_path=stored_ref,
+                parsed_metadata=security_metadata,
                 created_at=datetime.utcnow(),
             )
         )
@@ -383,6 +394,9 @@ def _save_text_file_record(
     parsed_metadata: dict[str, Any] | None = None,
 ) -> tuple[int, str]:
     filename = _safe_filename(filename)
+    valid_size, size_error = validate_file_size_bytes(len((text or "").encode("utf-8")))
+    if not valid_size:
+        raise ValueError(size_error)
     matching_records = _matching_file_records(db, opp.id, filename, source_url)
     existing = None
     if matching_records:
@@ -401,13 +415,17 @@ def _save_text_file_record(
 
     fp = out_dir / filename
     stored_ref = store_text(fp, text, encoding="utf-8")
+    security_metadata = {"_security": malware_scan_metadata(file_path=stored_ref, filename=filename)}
     if existing is not None:
         existing.file_type = file_type
         existing.source_url = source_url
         existing.file_path = stored_ref
         existing.extracted_text = text
-        if parsed_metadata:
-            existing.parsed_metadata = {**(getattr(existing, "parsed_metadata", None) or {}), **parsed_metadata}
+        existing.parsed_metadata = {
+            **(getattr(existing, "parsed_metadata", None) or {}),
+            **(parsed_metadata or {}),
+            **security_metadata,
+        }
         db.add(existing)
     else:
         db.add(
@@ -419,7 +437,7 @@ def _save_text_file_record(
                 source_url=source_url,
                 file_path=stored_ref,
                 extracted_text=text,
-                parsed_metadata=parsed_metadata or None,
+                parsed_metadata={**(parsed_metadata or {}), **security_metadata} or None,
                 created_at=datetime.utcnow(),
             )
         )
@@ -918,6 +936,9 @@ def download_pdfs_for_opportunity(
             if not _looks_like_downloadable_file(final_url, result.get("content_type")):
                 errors.append(f"{candidate['url']} -> not_a_downloadable_file")
                 continue
+            if not is_allowed_download_content_type(result.get("content_type"), final_url):
+                errors.append(f"{candidate['url']} -> disallowed_content_type")
+                continue
 
             filename = (
                 _content_disposition_filename(result.get("content_disposition"))
@@ -1024,6 +1045,9 @@ def download_pdfs_for_opportunity(
                         )
                         official_pdf_error = "dibbs_maintenance"
                     errors.append(f"{candidate['url']} -> not_a_pdf")
+                    continue
+                if not is_allowed_download_content_type(result.get("content_type"), candidate.get("url")):
+                    errors.append(f"{candidate['url']} -> disallowed_content_type")
                     continue
 
                 filename = (

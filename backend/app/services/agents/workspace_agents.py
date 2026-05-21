@@ -25,6 +25,7 @@ from app.services.sam_capability_match import build_capability_match
 from app.services.solicitation_memory import build_solicitation_memory
 from app.services.workspace_service import build_research_profile, create_artifact, ensure_parsed, extract_solicitation_poc
 from app.utils.solicitation_status import derive_solicitation_status
+from app.utils.utc import utcnow_iso
 
 
 AGENT_REGISTRY: dict[str, dict[str, Any]] = {
@@ -771,7 +772,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity, *, user_id: int | No
         ],
         "recommended_next_actions": recommendation_snapshot.get("next_actions") or profile.get("recommended_actions", []),
         "recommendation_snapshot": recommendation_snapshot,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     fallback_output["gaps"] = [item for item in fallback_output["gaps"] if item]
     context = {
@@ -819,7 +820,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity, *, user_id: int | No
     output["outcome_patterns"] = output.get("outcome_patterns") or solicitation_memory.get("outcome_patterns") or []
     output["response_patterns"] = output.get("response_patterns") or solicitation_memory.get("response_patterns") or []
     output["agency_patterns"] = output.get("agency_patterns") or solicitation_memory.get("agency_patterns") or []
-    output["generated_at"] = output.get("generated_at") or datetime.utcnow().isoformat()
+    output["generated_at"] = output.get("generated_at") or utcnow_iso()
     output["model_name"] = model_name
     output.update(provider_meta)
     upsert_recommendation_analysis(db, opp.id, recommendation_snapshot, ai_summary=output.get("executive_assessment"))
@@ -918,7 +919,7 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity, *, user_id: in
         "risks": [
             "Document extraction may be incomplete for scanned or image-based PDFs." if files else "No files have been downloaded for compliance review yet."
         ] + review_flags,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     fallback_output["submission_requirements"] = list(dict.fromkeys([item for item in fallback_output["submission_requirements"] if item]))
     fallback_output["required_actions"] = list(dict.fromkeys([item for item in fallback_output["required_actions"] if item]))
@@ -948,7 +949,7 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity, *, user_id: in
         user_context=context,
         fallback_output=fallback_output,
     )
-    output["generated_at"] = output.get("generated_at") or datetime.utcnow().isoformat()
+    output["generated_at"] = output.get("generated_at") or utcnow_iso()
     output["requirement_matrix"] = output.get("requirement_matrix") or requirement_matrix
     output["model_name"] = model_name
     output.update(provider_meta)
@@ -1084,7 +1085,7 @@ def _run_vendor_research_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
         "market_findings": market_findings,
         "recommended_targets": recommended_targets,
         "query_debug": research.get("query_debug") or [],
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     artifact = create_artifact(
         db,
@@ -1106,7 +1107,7 @@ def _run_capability_matcher_agent(db: Session, opp: Opportunity) -> dict[str, An
         "signals": capability_match.get("signals") or [],
         "gaps": capability_match.get("gaps") or [],
         "matched_fields": capability_match.get("matched_fields") or {},
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     artifact = create_artifact(
         db,
@@ -1238,7 +1239,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity, *, user_id: int | N
             "document_signals": document_signals,
         },
         "solicitation_poc": poc,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     context = {
         "opportunity": _agent_input_payload(opp),
@@ -1264,7 +1265,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity, *, user_id: int | N
         user_context=context,
         fallback_output=fallback_output,
     )
-    output["generated_at"] = output.get("generated_at") or datetime.utcnow().isoformat()
+    output["generated_at"] = output.get("generated_at") or utcnow_iso()
     output["model_name"] = model_name
     output.update(provider_meta)
     artifact = create_artifact(
@@ -1316,7 +1317,7 @@ def _run_proposal_workspace_agent(db: Session, opp: Opportunity) -> dict[str, An
             "award_amount": float(submission.award_amount) if submission and submission.award_amount is not None else None,
             "winning_vendor_name": getattr(submission, "winning_vendor_name", None),
         },
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     artifact = create_artifact(
         db,

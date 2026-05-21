@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from app.utils.enums import OpportunityStatus
 from app.utils.opportunity_lifecycle import ARCHIVE_CUTOFF_DAYS, derive_opportunity_lifecycle
 from app.utils.solicitation_status import derive_solicitation_status
 from app.utils.title_normalizer import normalize_source_title
+from app.utils.utc import utcnow
 
 
 class RawOpportunity(BaseModel):
@@ -146,7 +147,7 @@ class OpportunityRead(OpportunityBase):
     def days_since_close(self) -> int | None:
         if not self.due_at or self.solicitation_status != "CLOSED":
             return None
-        return max((datetime.utcnow() - self.due_at).days, 0)
+        return max((utcnow() - self.due_at).days, 0)
 
     @computed_field
     @property
@@ -243,7 +244,7 @@ class OpportunityRead(OpportunityBase):
             return [str(item) for item in sam_intelligence.get("risk_flags") if str(item).strip()]
         return []
 
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True)
 
 
 class IngestResult(BaseModel):

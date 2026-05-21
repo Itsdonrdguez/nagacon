@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
 from pathlib import Path
 import tempfile
 
@@ -15,6 +14,7 @@ from app.models.vendor import VendorLead, VendorQuote
 from app.services.app_settings_service import get_setting, upsert_setting
 from app.services.org_service import ensure_default_organization
 from app.services.storage import ensure_dir, storage_root
+from app.utils.utc import utcnow_iso
 
 DEFAULT_FILENAME = "nagacon_master_catalog.csv"
 
@@ -168,7 +168,7 @@ def _persist_export_status(
     organization_id: int | None,
     result: dict[str, str | int | bool | None],
 ) -> None:
-    now = datetime.utcnow().isoformat()
+    now = utcnow_iso()
     upsert_setting(db, "master_catalog_export_last_attempted_at", now, organization_id=organization_id)
     upsert_setting(db, "master_catalog_export_last_status", str(result.get("status") or "UNKNOWN"), organization_id=organization_id)
     upsert_setting(db, "master_catalog_export_last_reason", str(result.get("reason") or ""), organization_id=organization_id)

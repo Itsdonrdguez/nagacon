@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -11,6 +9,7 @@ from app.models.opportunity import Opportunity
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
 from app.schemas.vendor import FollowUpRequest, VendorLeadOut, VendorLeadUpsertRequest, VendorQuoteOut, SeedRequest, UpsertRequest
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.vendor_service import (
     build_quote_follow_up_summary,
     list_quotes,
@@ -22,9 +21,14 @@ from app.services.vendor_service import (
 )
 from app.services.providers.pdf_cage_extractor import seed_vendor_leads_from_providers
 from app.services.workspace_service import ensure_parsed
+from app.utils.utc import utcnow
 
 
-router = APIRouter(prefix="/api/vendors", tags=["vendors"])
+router = APIRouter(
+    prefix="/api/vendors",
+    tags=["vendors"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _source_label(lead: VendorLead, provider_item: ProviderItem | None = None) -> str:
@@ -47,12 +51,20 @@ def _source_label(lead: VendorLead, provider_item: ProviderItem | None = None) -
     return "Vendor Lead"
 
 
-def _serialize_leads_with_provider_context(db: Session, leads: list[VendorLead]) -> list[dict]:
+def _serialize_leads_with_provider_context(db: Session, leads: list[VendorLead], organization_id: int | None = None) -> list[dict]:
     cages = sorted({(lead.cage or "").upper() for lead in leads if lead.cage})
     providers_by_cage: dict[str, Provider] = {}
     items_by_provider_id: dict[int, list[ProviderItem]] = {}
     if cages:
-        providers = db.query(Provider).filter(Provider.cage.in_(cages)).all()
+        provider_query = db.query(Provider).filter(Provider.cage.in_(cages))
+        if organization_id is not None:
+            provider_query = provider_query.filter(
+                or_(
+                    Provider.organization_id == organization_id,
+                    Provider.organization_id.is_(None),
+                )
+            )
+        providers = provider_query.all()
         providers_by_cage = {(provider.cage or "").upper(): provider for provider in providers if provider.cage}
         provider_ids = [provider.id for provider in providers]
         if provider_ids:
@@ -143,7 +155,7 @@ def _serialize_quote(quote) -> dict:
     follow_up_label = None
     if status == "REQUESTED":
         if next_follow_up_at:
-            follow_up_due = next_follow_up_at <= datetime.utcnow()
+            follow_up_due = next_follow_up_at <= utcnow()
             follow_up_status = "DUE" if follow_up_due else "SCHEDULED"
             follow_up_label = (
                 "Follow up now"
@@ -230,7 +242,7 @@ def get_leads(
         query = query.filter(VendorLead.status != "SUPPRESSED")
 
     leads = query.order_by(VendorLead.id.desc()).all()
-    return _serialize_leads_with_provider_context(db, leads)
+    return _serialize_leads_with_provider_context(db, leads, organization_id=org_id)
 
 
 @router.post("/leads/sync")
@@ -247,19 +259,40 @@ def sync_leads(
     opp = opp.first()
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-    parsed = ensure_parsed(db, opp)
-    out = sync_vendor_leads_from_parsed(db, opp)
-    provider_sync = seed_vendor_leads_from_providers(
+    run = start_import_run(
         db,
-        opp,
-        parsed=parsed,
+        source="WORKSPACE_VENDOR_SYNC",
+        run_kind="vendor_sync",
+        request_payload={"opportunity_id": req.opportunity_id},
         organization_id=org_id,
         user_id=getattr(current_user, "id", None),
     )
-    out["cage_count"] = len(parsed.get("cage_codes") or [])
-    out["text_source"] = parsed.get("text_source") or {}
-    out["provider_sync"] = provider_sync
-    return out
+    try:
+        parsed = ensure_parsed(db, opp)
+        out = sync_vendor_leads_from_parsed(db, opp)
+        provider_sync = seed_vendor_leads_from_providers(
+            db,
+            opp,
+            parsed=parsed,
+            organization_id=org_id,
+            user_id=getattr(current_user, "id", None),
+        )
+        out["cage_count"] = len(parsed.get("cage_codes") or [])
+        out["text_source"] = parsed.get("text_source") or {}
+        out["provider_sync"] = provider_sync
+        complete_import_run(
+            db,
+            run,
+            status="completed",
+            result_payload=out,
+            row_count=int(out.get("approved_source_count") or 0),
+            inserted_count=int(out.get("created") or 0) + int((provider_sync or {}).get("created") or 0),
+            updated_count=int(out.get("updated") or 0) + int((provider_sync or {}).get("updated") or 0),
+        )
+        return out
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
 
 
 @router.post("/leads/upsert", response_model=VendorLeadOut)
@@ -304,25 +337,55 @@ def seed_quotes(
     opp = opp.first()
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-    parsed = ensure_parsed(db, opp)
-    provider_sync = seed_vendor_leads_from_providers(
+    run = start_import_run(
         db,
-        opp,
-        parsed=parsed,
+        source="WORKSPACE_QUOTE_SEED",
+        run_kind="quote_seed",
+        request_payload={"opportunity_id": req.opportunity_id},
         organization_id=org_id,
         user_id=getattr(current_user, "id", None),
     )
-    out = seed_quotes_from_parsed(db, opp)
-    out["provider_sync"] = provider_sync
-    out["text_source"] = parsed.get("text_source") or {}
-    return out
+    try:
+        parsed = ensure_parsed(db, opp)
+        provider_sync = seed_vendor_leads_from_providers(
+            db,
+            opp,
+            parsed=parsed,
+            organization_id=org_id,
+            user_id=getattr(current_user, "id", None),
+        )
+        out = seed_quotes_from_parsed(db, opp)
+        out["provider_sync"] = provider_sync
+        out["text_source"] = parsed.get("text_source") or {}
+        complete_import_run(
+            db,
+            run,
+            status="completed",
+            result_payload=out,
+            row_count=int(out.get("lead_count") or 0),
+            inserted_count=int(out.get("created") or 0) + int((provider_sync or {}).get("created") or 0),
+            updated_count=int(out.get("lead_updated") or 0) + int((provider_sync or {}).get("updated") or 0),
+            skipped_count=max(int(out.get("lead_count") or 0) - int(out.get("created") or 0), 0),
+        )
+        return out
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
 
 
 @router.post("/quotes/upsert", response_model=VendorQuoteOut)
-def upsert(req: UpsertRequest, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def upsert(req: UpsertRequest, db: Session = Depends(get_db), current_org=Depends(get_current_organization), current_user=Depends(get_current_user)):
     patch = req.model_dump(exclude={"opportunity_id", "cage", "part_number"}, exclude_none=True)
     try:
-        rec = upsert_quote(db, req.opportunity_id, req.cage, req.part_number, patch, organization_id=getattr(current_org, "id", None))
+        rec = upsert_quote(
+            db,
+            req.opportunity_id,
+            req.cage,
+            req.part_number,
+            patch,
+            organization_id=getattr(current_org, "id", None),
+            user_id=getattr(current_user, "id", None),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return _serialize_quote(rec)
@@ -334,6 +397,7 @@ def log_quote_follow_up(
     req: FollowUpRequest,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     try:
         mark_quote_followed_up(
@@ -342,6 +406,7 @@ def log_quote_follow_up(
             quote_id,
             organization_id=getattr(current_org, "id", None),
             notes=req.notes,
+            user_id=getattr(current_user, "id", None),
         )
         rec = next(
             quote for quote in list_quotes(db, req.opportunity_id, organization_id=getattr(current_org, "id", None))

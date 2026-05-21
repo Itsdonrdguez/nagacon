@@ -19,6 +19,7 @@ from app.models.workspace import WorkspaceArtifact, WorkspaceTask
 from app.services.opportunity_brief import build_contract_brief, build_readiness_assessment
 from app.services.search_jobs import record_search_job, start_search_job
 from app.utils.opportunity_lifecycle import is_archived_opportunity
+from app.utils.utc import utcnow
 
 
 HIGH = "HIGH"
@@ -411,7 +412,7 @@ def build_daily_work_queue(
     limit: int = 200,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    current_time = now or datetime.utcnow()
+    current_time = now or utcnow()
     active_job_rows = _active_queueable_job_rows(db, organization_id, user_id=user_id)
     active_queueable_jobs = _active_queueable_jobs_from_rows(active_job_rows)
     recent_completed_jobs = _recent_completed_queueable_jobs(db, organization_id, user_id=user_id, now=current_time)

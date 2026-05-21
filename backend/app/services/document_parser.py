@@ -1,8 +1,11 @@
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 import json
 import re
+
+from app.services.document_security import document_max_bytes, document_page_limit, document_parser_timeout_seconds, validate_file_size_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +52,7 @@ def _read_text_like_file(file_path: str) -> dict | None:
     }
 
 
-def parse_opportunity_file(file_path: str) -> dict:
-    '''
-    Safe document parsing wrapper.
-    Attempts to extract text from files but fails gracefully so the API never crashes.
-    '''
-
+def _parse_file_now(file_path: str) -> dict:
     extracted_text = ""
 
     text_result = _read_text_like_file(file_path)
@@ -62,33 +60,45 @@ def parse_opportunity_file(file_path: str) -> dict:
         return text_result
 
     try:
-        # Try PyMuPDF first
         import fitz
+
         doc = fitz.open(file_path)
-        pages = []
-        for page in doc:
-            pages.append(page.get_text())
-        extracted_text = "\n".join(pages)
-        doc.close()
-        return {
-            "parser": "pymupdf",
-            "text": extracted_text
-        }
+        try:
+            page_total = int(getattr(doc, "page_count", 0) or 0)
+            page_limit = document_page_limit()
+            pages = []
+            for index, page in enumerate(doc):
+                if index >= page_limit:
+                    break
+                pages.append(page.get_text())
+            extracted_text = "\n".join(pages)
+            return {
+                "parser": "pymupdf",
+                "text": extracted_text,
+                "page_count": page_total,
+                "page_limit_applied": page_total > page_limit,
+            }
+        finally:
+            doc.close()
 
     except Exception as pymupdf_error:
         logger.warning(f"PyMuPDF parsing failed: {pymupdf_error}")
 
     try:
-        # Fallback to pypdf
         from pypdf import PdfReader
+
         reader = PdfReader(file_path)
         pages = []
-        for page in reader.pages:
+        page_total = len(reader.pages)
+        page_limit = document_page_limit()
+        for page in reader.pages[:page_limit]:
             pages.append(page.extract_text() or "")
         extracted_text = "\n".join(pages)
         return {
             "parser": "pypdf",
-            "text": extracted_text
+            "text": extracted_text,
+            "page_count": page_total,
+            "page_limit_applied": page_total > page_limit,
         }
 
     except Exception as pypdf_error:
@@ -99,3 +109,24 @@ def parse_opportunity_file(file_path: str) -> dict:
         "text": "",
         "error": "No parser succeeded"
     }
+
+
+def parse_opportunity_file(file_path: str) -> dict:
+    '''
+    Safe document parsing wrapper.
+    Attempts to extract text from files but fails gracefully so the API never crashes.
+    '''
+    path = Path(file_path)
+    if not path.exists():
+        return {"parser": "none", "text": "", "error": "File not found"}
+
+    valid_size, size_error = validate_file_size_bytes(path.stat().st_size)
+    if not valid_size:
+        return {"parser": "none", "text": "", "error": size_error}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_parse_file_now, file_path)
+        try:
+            return future.result(timeout=document_parser_timeout_seconds())
+        except FutureTimeoutError:
+            return {"parser": "none", "text": "", "error": "Document parsing timed out"}

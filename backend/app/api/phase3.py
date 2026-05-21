@@ -3,13 +3,17 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.opportunity import Opportunity
 from app.models.vendor import VendorLead
 from app.schemas.quote import QuoteCreate, QuoteOut
 from app.services.quotes.calculations import create_quote_with_calc
 
-router = APIRouter(prefix="/api/phase3", tags=["phase3"])
+router = APIRouter(
+    prefix="/api/phase3",
+    tags=["phase3"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 @router.post("/opportunities/{opportunity_id}/suggested-quote", response_model=QuoteOut)

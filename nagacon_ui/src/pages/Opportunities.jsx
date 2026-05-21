@@ -7,6 +7,7 @@ import {
   EmptyState,
   Badge,
   Card,
+  StatCard,
   Input,
   Button,
   MultiSelect,
@@ -296,6 +297,24 @@ export default function Opportunities() {
 
   const startRecord = total === 0 ? 0 : (page - 1) * pageSize + 1
   const endRecord = Math.min(page * pageSize, total)
+  const summaryStats = useMemo(() => {
+    const now = new Date()
+    const dueSoonCount = sortedData.filter((opp) => {
+      if (!opp.due_at || opp.solicitation_status === 'CLOSED') return false
+      const due = new Date(opp.due_at)
+      const days = Math.ceil((due - now) / (1000 * 60 * 60 * 24))
+      return days >= 0 && days <= 7
+    }).length
+    const workspaceReadyCount = sortedData.filter((opp) => opp.has_workspace).length
+    const closedIntelligenceCount = sortedData.filter((opp) => opp.solicitation_status === 'CLOSED' || opp.opportunity_lifecycle === 'ARCHIVED').length
+    const needsResearchCount = sortedData.filter((opp) => !opp.has_workspace && opp.opportunity_lifecycle !== 'ARCHIVED').length
+    return [
+      { label: 'Needs Research', value: needsResearchCount, subtitle: 'No workspace footprint yet' },
+      { label: 'Workspace Ready', value: workspaceReadyCount, subtitle: 'Prep evidence already exists' },
+      { label: 'Due Soon', value: dueSoonCount, subtitle: 'Closing within 7 days' },
+      { label: 'Closed Intelligence', value: closedIntelligenceCount, subtitle: 'Source for pricing and vendor learning' },
+    ]
+  }, [sortedData])
   const exportOpportunitiesUrl = useMemo(() => {
     const params = new URLSearchParams()
     if (submittedSearch) params.set('q', submittedSearch)
@@ -347,16 +366,22 @@ export default function Opportunities() {
     <div className="page">
       <div className="page-header">
         <div>
-          <div className="page-kicker">Market Feed</div>
+          <div className="page-kicker">Operator Intake</div>
           <h1 className="page-title">Opportunities</h1>
-          <div className="page-subtitle">Active solicitations stay bid-focused. Closed solicitations stay searchable for sourcing, pricing, and NSN intelligence.</div>
+          <div className="page-subtitle">Triage new work, move prepared solicitations into workspace processing, and keep closed records available for intelligence and pricing reuse.</div>
         </div>
         <a className="btn btn-secondary btn-sm" href={exportOpportunitiesUrl} target="_blank" rel="noreferrer">
           Export Opportunities CSV
         </a>
       </div>
 
-      <Card title="Search Opportunities" className="opportunity-search-card">
+      <div className="stats-grid">
+        {summaryStats.map((stat) => (
+          <StatCard key={stat.label} label={stat.label} value={stat.value} subtitle={stat.subtitle} />
+        ))}
+      </div>
+
+      <Card title="Find and Triage" className="opportunity-search-card">
         <div className="panel-subtitle">
           Use keyword search for broad matching, then narrow with exact FSC or NAICS filters when you want a cleaner result set.
         </div>
@@ -528,7 +553,7 @@ export default function Opportunities() {
         ) : null}
         <div className="opportunity-bulk-toolbar">
           <div>
-            <div className="row-title">Workspace prep</div>
+            <div className="row-title">Safe workspace processing</div>
             <div className="row-subtitle">
               Select opportunities on this page and queue full workspace preparation, including documents, Part Finder, vendor leads, and workspace artifacts.
             </div>
@@ -547,7 +572,7 @@ export default function Opportunities() {
               disabled={!hasSelection}
               loading={bulkPrepareMutation.isPending}
             >
-              Prepare Selected
+              Prepare Selected Workspaces
             </Button>
           </div>
         </div>

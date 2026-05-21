@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from app.core.config import settings
+from app.services.auth_service import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME
 
 from app.api.dibbs import router as dibbs_router
 from app.api.bid_submissions import router as submissions_router
@@ -55,6 +56,42 @@ LOCAL_CORS_ORIGINS = [
     "http://127.0.0.1:5174",
     "http://localhost:5174",
 ]
+
+PROTECTED_APP_ENVS = {"prod", "production", "private-alpha", "private_alpha"}
+UNSAFE_HTTP_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+CSRF_HEADER_NAME = "X-CSRF-Token"
+
+
+def _is_protected_env() -> bool:
+    return str(getattr(settings, "APP_ENV", "dev") or "dev").strip().lower() in PROTECTED_APP_ENVS
+
+
+def validate_startup_config() -> None:
+    if not _is_protected_env():
+        return
+
+    errors: list[str] = []
+    session_secret = str(getattr(settings, "SESSION_SECRET", "") or "").strip()
+    if bool(getattr(settings, "DEBUG", False)):
+        errors.append("DEBUG must be false")
+    if bool(getattr(settings, "DEV_AUTH_FALLBACK_ENABLED", True)):
+        errors.append("DEV_AUTH_FALLBACK_ENABLED must be false")
+    if bool(getattr(settings, "SIGNUP_ENABLED", True)):
+        errors.append("SIGNUP_ENABLED must be false")
+    if not bool(getattr(settings, "SESSION_COOKIE_SECURE", False)):
+        errors.append("SESSION_COOKIE_SECURE must be true")
+    if not session_secret or session_secret.lower() in {
+        "replace-with-a-long-random-secret",
+        "changeme",
+        "secret",
+        "dev-secret",
+    } or len(session_secret) < 24:
+        errors.append("SESSION_SECRET must be a non-default secret with at least 24 characters")
+    if bool(getattr(settings, "DEFAULT_ADMIN_BOOTSTRAP_ENABLED", True)):
+        errors.append("default development password bootstrap must be disabled before protected deployment")
+
+    if errors:
+        raise RuntimeError("Unsafe protected deployment configuration: " + "; ".join(errors))
 
 
 def _cors_origins() -> list[str]:
@@ -142,6 +179,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    validate_startup_config()
     app = FastAPI(
         title="NagaCon",
         description=(
@@ -160,6 +198,23 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def csrf_guard(request: Request, call_next):
+        if request.method.upper() in UNSAFE_HTTP_METHODS:
+            path = request.url.path or ""
+            if not path.startswith("/api/integrations") and not path.startswith("/api/auth/"):
+                session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
+                session_header = request.headers.get("X-Session-Token")
+                if session_cookie and not session_header:
+                    csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME)
+                    csrf_header = request.headers.get(CSRF_HEADER_NAME)
+                    if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+                        return JSONResponse(
+                            status_code=403,
+                            content={"detail": "CSRF token missing or invalid"},
+                        )
+        return await call_next(request)
+
     for router in CORE_ROUTERS + RESEARCH_AND_VENDOR_ROUTERS + SUPPORT_ROUTERS + LEGACY_COMPAT_ROUTERS:
         app.include_router(router)
     app.include_router(integrations_router)
@@ -170,10 +225,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error", "error": str(exc)},
-        )
+        content = {"detail": "Internal server error"}
+        if bool(getattr(settings, "DEBUG", False)):
+            content["error"] = str(exc)
+        return JSONResponse(status_code=500, content=content)
 
     return app
 

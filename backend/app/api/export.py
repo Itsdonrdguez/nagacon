@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.data_exchange import (
     export_opportunities_csv,
     export_providers_csv,
@@ -24,9 +24,18 @@ def _parse_code_list(value: str | None) -> list[str]:
 
 
 @router.get("/bid_package")
-def export_bid_package(opportunity_id: int, db: Session = Depends(get_db)):
+def export_bid_package(
+    opportunity_id: int,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     try:
-        filename, data = build_bid_package_zip(db, opportunity_id)
+        filename, data = build_bid_package_zip(
+            db,
+            opportunity_id,
+            organization_id=getattr(current_org, "id", None),
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

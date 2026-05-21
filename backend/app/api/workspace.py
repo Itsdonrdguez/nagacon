@@ -30,6 +30,7 @@ from app.services.opportunity_intake_pipeline import run_opportunity_intake_pipe
 from app.services.sam_capability_match import build_capability_match
 from app.services.research.usaspending_research_service import search_usaspending_for_opportunity, seed_usaspending_vendors_into_leads
 from app.services.intelligence.nsn_intelligence_service import get_nsn_intelligence, run_nsn_intelligence
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.providers.pdf_cage_extractor import extract_providers_from_opportunity_pdfs, seed_vendor_leads_from_providers
 from app.services.nsn_catalog.publog_reference_service import search_publog_reference
 from app.services.solicitation_memory import build_solicitation_memory
@@ -37,12 +38,18 @@ from app.services.vendor_service import promote_vendor_lead_to_quote_request, sy
 from app.services.vendor_email_automation import generate_quote_request_email
 from app.services.vendor_email_automation import send_email_message
 from app.services.vendors.discovery import discover_vendors_for_opportunity
+from app.services.workflow_audit import record_workflow_event
 from app.services.workspace_service import build_normalized_facts, build_research_profile, build_sam_past_performance_map, create_artifact, ensure_parsed, generate_checklist, generate_compliance_matrix, generate_contracting_officer_email, generate_quote_email, generate_research_brief, generate_submission_package, generate_vendor_shortlist, get_best_processed_document_data, seed_proposal_tasks
 from app.utils.opportunity_lifecycle import derive_opportunity_lifecycle
 from app.utils.solicitation_status import derive_solicitation_status
 from app.utils.title_normalizer import build_summary_text
+from app.utils.utc import utcnow_iso
 
-router = APIRouter(prefix="/api/workspace", tags=["workspace"])
+router = APIRouter(
+    prefix="/api/workspace",
+    tags=["workspace"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _has_legacy_requirement_phrasing(items: list[str]) -> bool:
@@ -885,7 +892,7 @@ def workspace_summary(opp_id: int, db: Session = Depends(get_db), current_org=De
             content_json={
                 **response_payload,
                 "snapshot_marker": snapshot_marker,
-                "cached_at": datetime.utcnow().isoformat(),
+                "cached_at": utcnow_iso(),
             },
             replace_existing=True,
         )
@@ -1224,9 +1231,31 @@ def workspace_usaspending_vendors(opp_id: int, db: Session = Depends(get_db), cu
 def workspace_seed_usaspending_vendors(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     opp_id = payload.get("opportunity_id")
     seed_mode = payload.get("seed_mode") or "product_only"
-    opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
-    research = search_usaspending_for_opportunity(opp, db=db)
-    return seed_usaspending_vendors_into_leads(db=db, opp=opp, research_result=research, seed_mode=seed_mode)
+    org_id = getattr(current_org, "id", None)
+    opp = _get_opp_scoped(db, opp_id, organization_id=org_id)
+    run = start_import_run(
+        db,
+        source="USASPENDING",
+        run_kind="workspace_vendor_seed",
+        request_payload={"opportunity_id": opp_id, "seed_mode": seed_mode},
+        organization_id=org_id,
+    )
+    try:
+        research = search_usaspending_for_opportunity(opp, db=db)
+        result = seed_usaspending_vendors_into_leads(db=db, opp=opp, research_result=research, seed_mode=seed_mode)
+        complete_import_run(
+            db,
+            run,
+            status="completed",
+            result_payload=result,
+            inserted_count=int(result.get("created") or result.get("inserted") or 0),
+            updated_count=int(result.get("updated") or 0),
+            row_count=int(result.get("vendor_count") or result.get("row_count") or 0),
+        )
+        return result
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
 
 
 @router.get("/intelligence/nsn")
@@ -1239,12 +1268,30 @@ def workspace_get_nsn_intelligence(opp_id: int, db: Session = Depends(get_db), c
 def workspace_run_nsn_intelligence(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     opp_id = payload.get("opportunity_id")
     seed_awardees = bool(payload.get("seed_awardees", True))
-    opp = _get_opp_scoped(db, opp_id, organization_id=getattr(current_org, "id", None))
+    org_id = getattr(current_org, "id", None)
+    opp = _get_opp_scoped(db, opp_id, organization_id=org_id)
+    run = start_import_run(
+        db,
+        source="NSN_INTELLIGENCE",
+        run_kind="workspace_nsn_refresh",
+        request_payload={"opportunity_id": opp_id, "seed_awardees": seed_awardees},
+        organization_id=org_id,
+    )
     try:
         summary = run_nsn_intelligence(db, opp, seed_awardees=seed_awardees, create_summary_artifact=True)
         generate_submission_package(db, opp)
+        complete_import_run(
+            db,
+            run,
+            status=summary.get("status") or "completed",
+            result_payload=summary,
+            inserted_count=int(summary.get("created") or 0),
+            updated_count=int(summary.get("updated") or 0),
+            row_count=int(summary.get("reference_count") or summary.get("row_count") or 0),
+        )
         return summary
     except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
         raise HTTPException(status_code=500, detail=f"NSN intelligence failed: {exc}")
 
 
@@ -1310,7 +1357,7 @@ def generate_targeted_email(payload: dict, db: Session = Depends(get_db), curren
             "_outreach_log": [
                 {
                     "action": "draft_created",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": utcnow_iso(),
                     "recipient": vendor_email or draft.get("to"),
                     "vendor_name": vendor_name or draft.get("company_name"),
                 }
@@ -1325,10 +1372,19 @@ def generate_targeted_email(payload: dict, db: Session = Depends(get_db), curren
 
 
 @router.post("/vendors/promote")
-def promote_workspace_vendor(payload: dict, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def promote_workspace_vendor(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     opp_id = payload.get("opportunity_id")
     lead_id = payload.get("vendor_lead_id")
     org_id = getattr(current_org, "id", None)
+    approved = bool(payload.get("approved"))
+    approval_notes = payload.get("approval_notes")
+    if not approved:
+        raise HTTPException(status_code=400, detail="Promoting a vendor into quote-request flow requires explicit approval")
     opp = _get_opp_scoped(db, opp_id, organization_id=org_id)
     promoted = promote_vendor_lead_to_quote_request(db, opp.id, lead_id, organization_id=org_id)
 
@@ -1340,6 +1396,23 @@ def promote_workspace_vendor(payload: dict, db: Session = Depends(get_db), curre
         notes=f"Request quote from {promoted.get('company_name') or promoted.get('cage') or 'vendor lead'}",
     )
     db.add(task)
+    record_workflow_event(
+        db,
+        opportunity_id=opp.id,
+        action="vendor_promoted_to_quote_request",
+        entity_type="vendor_lead",
+        entity_id=int(lead_id or 0) or None,
+        organization_id=org_id,
+        user_id=getattr(current_user, "id", None),
+        notes=approval_notes or task.notes,
+        metadata={
+            "quote_status": promoted.get("status"),
+            "company_name": promoted.get("company_name"),
+            "cage": promoted.get("cage"),
+            "approved": approved,
+        },
+        commit=False,
+    )
     db.commit()
     db.refresh(task)
 
@@ -1421,7 +1494,7 @@ def update_artifact(artifact_id: int, payload: ArtifactUpdate, db: Session = Dep
     current_snapshot = {
         "title": rec.title,
         "content_json": {k: v for k, v in current_content.items() if k not in {"_history"}},
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow_iso(),
         "action": "updated",
     }
     patch = payload.model_dump(exclude_unset=True)
@@ -1500,7 +1573,7 @@ def restore_artifact_version(artifact_id: int, payload: dict, db: Session = Depe
     current_snapshot = {
         "title": rec.title,
         "content_json": {k: v for k, v in content.items() if k not in {"_history"}},
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow_iso(),
         "action": "restore_checkpoint",
     }
     versions.append(current_snapshot)
@@ -1531,9 +1604,13 @@ def log_artifact_outreach(artifact_id: int, payload: dict, db: Session = Depends
     action = payload.get("action") or "logged"
     recipient = payload.get("recipient") or content.get("target_vendor_email") or content.get("to")
     vendor_name = payload.get("vendor_name") or content.get("target_vendor_name") or content.get("company_name")
+    approved = bool(payload.get("approved"))
+    approval_notes = payload.get("approval_notes")
+    if action.lower() == "sent" and not approved:
+        raise HTTPException(status_code=400, detail="Marking outreach as sent requires explicit approval")
     entry = {
         "action": action,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow_iso(),
         "recipient": recipient,
         "vendor_name": vendor_name,
         "notes": payload.get("notes"),
@@ -1548,6 +1625,22 @@ def log_artifact_outreach(artifact_id: int, payload: dict, db: Session = Depends
     rec.content_json = content
     db.add(rec)
     quote_status_sync = sync_quote_status_from_outreach_artifact(db, rec, action, organization_id=org_id)
+    if action.lower() == "sent":
+        record_workflow_event(
+            db,
+            opportunity_id=rec.opportunity_id,
+            action="outreach_marked_sent",
+            entity_type="workspace_artifact",
+            entity_id=rec.id,
+            organization_id=org_id,
+            notes=approval_notes,
+            metadata={
+                "recipient": recipient,
+                "vendor_name": vendor_name,
+                "approved": approved,
+            },
+            commit=False,
+        )
     db.commit()
     db.refresh(rec)
 
@@ -1559,7 +1652,13 @@ def log_artifact_outreach(artifact_id: int, payload: dict, db: Session = Depends
 
 
 @router.post("/artifacts/{artifact_id}/send")
-def send_artifact_email(artifact_id: int, payload: dict | None = None, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+def send_artifact_email(
+    artifact_id: int,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
     org_id = getattr(current_org, "id", None)
     rec = db.query(WorkspaceArtifact).filter(WorkspaceArtifact.id == artifact_id)
     if org_id is not None:
@@ -1573,9 +1672,13 @@ def send_artifact_email(artifact_id: int, payload: dict | None = None, db: Sessi
     subject = (payload or {}).get("subject") or content.get("subject")
     body = (payload or {}).get("body") or content.get("body")
     vendor_name = (payload or {}).get("vendor_name") or content.get("target_vendor_name") or content.get("company_name")
+    approved = bool((payload or {}).get("approved"))
+    approval_notes = (payload or {}).get("approval_notes")
 
     if not recipient or not subject or not body:
         raise HTTPException(status_code=400, detail="Email artifact is missing recipient, subject, or body")
+    if not approved:
+        raise HTTPException(status_code=400, detail="External email send requires explicit approval")
 
     try:
         send_result = send_email_message(recipient, subject, body)
@@ -1587,7 +1690,7 @@ def send_artifact_email(artifact_id: int, payload: dict | None = None, db: Sessi
     log = list(content.get("_outreach_log") or [])
     log.append({
         "action": "sent",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow_iso(),
         "recipient": recipient,
         "vendor_name": vendor_name,
         "notes": "smtp_send",
@@ -1597,6 +1700,23 @@ def send_artifact_email(artifact_id: int, payload: dict | None = None, db: Sessi
     content["_meta"]["artifact_status"] = "SENT"
     rec.content_json = content
     db.add(rec)
+    record_workflow_event(
+        db,
+        opportunity_id=rec.opportunity_id,
+        action="external_email_sent",
+        entity_type="workspace_artifact",
+        entity_id=rec.id,
+        organization_id=org_id,
+        user_id=getattr(current_user, "id", None),
+        notes=approval_notes,
+        metadata={
+            "recipient": recipient,
+            "subject": subject,
+            "vendor_name": vendor_name,
+            "approved": approved,
+        },
+        commit=False,
+    )
     quote_status_sync = sync_quote_status_from_outreach_artifact(db, rec, "sent", organization_id=org_id)
     db.commit()
     db.refresh(rec)

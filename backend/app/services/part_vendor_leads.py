@@ -12,6 +12,7 @@ from app.models.vendor import VendorLead, VendorQuote
 from app.models.workspace import WorkspaceArtifact
 from app.services.vendor_email_automation import generate_quote_request_email
 from app.services.workspace_service import create_artifact
+from app.utils.utc import utcnow, utcnow_iso
 
 DEFAULT_QUOTE_STATUS = "NOT_REQUESTED"
 
@@ -120,7 +121,7 @@ def seed_quotes_from_part_finder_leads(
                 notes=notes,
             )
             if touched:
-                quote.updated_at = datetime.utcnow()
+                quote.updated_at = utcnow()
                 updated += 1
         else:
             quote = VendorQuote(
@@ -145,7 +146,7 @@ def seed_quotes_from_part_finder_leads(
 
         if lead.status != "SEEDED_TO_QUOTES":
             lead.status = "SEEDED_TO_QUOTES"
-            lead.updated_at = datetime.utcnow()
+            lead.updated_at = utcnow()
         seeded.append(
             {
                 "lead_id": lead.id,
@@ -225,7 +226,7 @@ def create_email_drafts_for_part_finder_quotes(
                     "_outreach_log": [
                         {
                             "action": "draft_created",
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": utcnow_iso(),
                             "recipient": draft.get("to") or quote.email,
                             "vendor_name": draft.get("company_name") or quote.company_name,
                             "source": "part_finder_quote_auto_outreach",
@@ -519,7 +520,7 @@ def _update_lead(rec: VendorLead, candidate: dict[str, Any], *, organization_id:
         rec.raw_text = raw_text
         touched = True
     if touched:
-        rec.updated_at = datetime.utcnow()
+        rec.updated_at = utcnow()
     return touched
 
 

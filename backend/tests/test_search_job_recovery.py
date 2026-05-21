@@ -111,3 +111,56 @@ def test_recover_queued_jobs_for_thread_runner_skips_jobs_already_in_memory(monk
     assert submitted == []
     with search_jobs._lock:
         search_jobs._jobs.clear()
+
+
+def test_run_job_records_import_run_for_background_processing(monkeypatch):
+    started = {}
+    completed = {}
+
+    class DummyGate:
+        def acquire(self):
+            return True
+
+        def release(self):
+            return True
+
+    class FakeDB:
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(search_jobs, "SessionLocal", lambda: FakeDB())
+    monkeypatch.setattr(search_jobs, "_active_execution_gate", lambda: DummyGate())
+    monkeypatch.setattr(search_jobs, "_background_execution_gate", lambda: DummyGate())
+    monkeypatch.setattr(search_jobs, "_background_execution_limit", lambda: 0)
+    monkeypatch.setattr(search_jobs, "_update_job", lambda *args, **kwargs: None)
+    monkeypatch.setattr(search_jobs, "_maybe_refresh_master_catalog_export", lambda *args, **kwargs: None)
+    monkeypatch.setattr(search_jobs, "write_worker_traceback_report", lambda **kwargs: "report.json")
+    monkeypatch.setattr(
+        search_jobs,
+        "run_provider_backfill",
+        lambda db, **kwargs: {"status": "ok", "row_count": 4, "updated_count": 2, "skipped_count": 1},
+    )
+    monkeypatch.setattr(
+        search_jobs,
+        "start_import_run",
+        lambda db, **kwargs: started.setdefault("run", SimpleNamespace(id=55, **kwargs)),
+    )
+    monkeypatch.setattr(
+        search_jobs,
+        "complete_import_run",
+        lambda db, rec, **kwargs: completed.setdefault("payload", {"run_id": rec.id, **kwargs}),
+    )
+
+    search_jobs._run_job(
+        "job-import-1",
+        "provider_backfill",
+        {"organization_id": 1, "user_id": 7, "limit": 25},
+    )
+
+    assert started["run"].source == "PROVIDER_BACKFILL"
+    assert completed["payload"]["status"] == "success"
+    assert completed["payload"]["row_count"] == 4
+    assert completed["payload"]["updated_count"] == 2

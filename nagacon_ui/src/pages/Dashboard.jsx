@@ -27,6 +27,20 @@ const WORK_TYPE_LABELS = {
   DIBBS_RFQ_PACKAGE_MISSING: 'Download RFQ package',
 }
 
+const APPROVAL_TYPES = new Set([
+  'READY_TO_SUBMIT',
+  'MISSING_SUBMISSION_PACKAGE',
+  'SAM_SUBMISSION_PACKAGE_MISSING',
+])
+
+const BLOCKER_TYPES = new Set([
+  'MISSING_VENDOR_LEADS',
+  'MISSING_PART_FINDER',
+  'DIBBS_RFQ_PACKAGE_MISSING',
+  'SAM_COMPLIANCE_MATRIX_MISSING',
+  'SAM_CHECKLIST_MISSING',
+])
+
 const formatDueDate = (dueAt) => {
   if (!dueAt) return '-'
 
@@ -125,9 +139,13 @@ export default function Dashboard() {
   const company = companyQuery.data || null
   const workQueue = workQueueQuery.data || {}
   const priorityActions = groupPriorityActions(workQueue.items || []).slice(0, 3)
+  const approvalItems = groupPriorityActions((workQueue.items || []).filter((item) => APPROVAL_TYPES.has(item.type))).slice(0, 4)
+  const blockerItems = groupPriorityActions((workQueue.items || []).filter((item) => BLOCKER_TYPES.has(item.type))).slice(0, 4)
 
   const samCount = opps.filter((opp) => opp.source === 'SAM').length
   const dibbsCount = opps.filter((opp) => opp.source === 'DIBBS').length
+  const knownNsnMatches = opps.filter((opp) => opp.source === 'DIBBS' && String(opp.solicitation_number || '').includes('-')).length
+  const activeSolicitations = opps.filter((opp) => opp.solicitation_status !== 'CLOSED').length
 
   const dueSoon = opps
     .filter((opp) => {
@@ -201,13 +219,13 @@ export default function Dashboard() {
     <div className="page">
       <div className="page-header">
         <div>
-          <div className="page-kicker">Command Center</div>
-          <h1 className="page-title">Dashboard</h1>
-          <div className="page-subtitle">Track opportunity flow, due-date pressure, and company readiness from one clean overview.</div>
+          <div className="page-kicker">Mission Control</div>
+          <h1 className="page-title">Mission Control</h1>
+          <div className="page-subtitle">Start from what to bid, what is blocked, what needs approval, and what action should happen next.</div>
         </div>
       </div>
 
-      <Card title="Start Work">
+      <Card title="Next Actions">
         <div className="workspace-action-column">
           <div className="company-form-actions">
             <Link className="btn btn-sm" to="/work-queue">Go to Today Queue</Link>
@@ -250,13 +268,13 @@ export default function Dashboard() {
       </Card>
 
       <div className="stats-grid">
-        <StatCard label="Total Opportunities" value={opps.length} subtitle={`${samCount} SAM | ${dibbsCount} DIBBS`} />
-        <StatCard label="Due Soon (7d)" value={dueSoon.length} subtitle={dueSoon.length > 0 ? 'Attention required' : 'No urgent deadlines'} />
-        <StatCard label="Active Workspaces" value={opps.length} subtitle="Workspace-ready opportunities" />
-        <StatCard label="Set-Asides Available" value={Object.keys(bySetAside).length} subtitle="Opportunity coverage" />
+        <StatCard label="Active Solicitations" value={activeSolicitations} subtitle={`${samCount} SAM | ${dibbsCount} DIBBS`} />
+        <StatCard label="Due-Date Pressure" value={dueSoon.length} subtitle={dueSoon.length > 0 ? 'Attention required' : 'No urgent deadlines'} />
+        <StatCard label="Known NSN Matches" value={knownNsnMatches} subtitle={knownNsnMatches > 0 ? 'Catalog-style DIBBS items spotted' : 'No obvious NSN matches in view'} />
+        <StatCard label="Needs Approval" value={approvalItems.length} subtitle={approvalItems.length > 0 ? 'Human review before external action' : 'No approval queue right now'} />
       </div>
 
-      <Card title="Company Profile">
+      <Card title="Company Criteria">
         {companyQuery.isLoading ? (
           <LoadingState label="Loading company profile..." />
         ) : company ? (
@@ -323,7 +341,7 @@ export default function Dashboard() {
       </Card>
 
       {dueSoon.length > 0 ? (
-        <Card title="Due Soon">
+        <Card title="Due-Date Pressure">
           <div className="due-soon-list">
             {dueSoon.slice(0, 5).map((opp) => {
               const daysLeft = Math.ceil((new Date(opp.due_at) - new Date()) / (1000 * 60 * 60 * 24))
@@ -346,7 +364,54 @@ export default function Dashboard() {
       ) : null}
 
       <div className="dashboard-charts-grid">
-        <Card title="Opportunities by Source">
+        <Card title="Needs Human Approval">
+          {approvalItems.length > 0 ? (
+            <div className="simple-list">
+              {approvalItems.map((item) => (
+                <div key={`approval-${item.id}`} className="simple-list-row">
+                  <div className="list-item-content">
+                    <div className="row-title">{item.opportunity?.title || item.title}</div>
+                    <div className="row-meta">
+                      <Badge label={item.priority || 'LOW'} variant={item.priority === 'HIGH' ? 'error' : item.priority === 'MEDIUM' ? 'warning' : 'info'} />
+                      <span className="agency-inline">{item.opportunity?.solicitation_number || 'Solicitation unavailable'}</span>
+                    </div>
+                    <div className="row-subtitle">{WORK_TYPE_LABELS[item.type] || item.action_label || 'Review next action'}</div>
+                  </div>
+                  <Link className="action-btn-small" to={item.action_url || `/workspace/${item.opportunity?.id || ''}`}>Review</Link>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState title="No approval queue" subtitle="External action is not blocked on approval right now." />
+          )}
+        </Card>
+
+        <Card title="Research Blockers">
+          {blockerItems.length > 0 ? (
+            <div className="simple-list">
+              {blockerItems.map((item) => (
+                <div key={`blocker-${item.id}`} className="simple-list-row">
+                  <div className="list-item-content">
+                    <div className="row-title">{item.opportunity?.title || item.title}</div>
+                    <div className="row-meta">
+                      <Badge label={item.priority || 'LOW'} variant={item.priority === 'HIGH' ? 'error' : item.priority === 'MEDIUM' ? 'warning' : 'info'} />
+                      <span className="agency-inline">{item.opportunity?.source || 'Source unavailable'}</span>
+                      <span className="agency-inline">{item.opportunity?.solicitation_number || 'Solicitation unavailable'}</span>
+                    </div>
+                    <div className="row-subtitle">{WORK_TYPE_LABELS[item.type] || item.action_label || 'Research needed'}</div>
+                  </div>
+                  <Link className="action-btn-small" to={item.action_url || `/workspace/${item.opportunity?.id || ''}`}>Unblock</Link>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState title="No major blockers" subtitle="Current workspaces are not showing the usual sourcing and compliance blockers." />
+          )}
+        </Card>
+      </div>
+
+      <div className="dashboard-charts-grid">
+      <Card title="Intake Mix">
           <div className="chart-frame">
             <ResponsiveContainer>
               <PieChart>
@@ -363,7 +428,7 @@ export default function Dashboard() {
           </div>
         </Card>
 
-        <Card title="Due Date Distribution">
+      <Card title="Closing Pressure">
           <div className="chart-frame">
             <ResponsiveContainer>
               <BarChart data={dueDateData}>
@@ -378,7 +443,7 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      <Card title="Set-Aside Distribution">
+      <Card title="Set-Aside Mix">
         {setAsideData.length > 0 ? (
           <div className="set-aside-grid">
             {setAsideData.map((item) => (
@@ -399,7 +464,7 @@ export default function Dashboard() {
         )}
       </Card>
 
-      <Card title="Recent Open Opportunities">
+      <Card title="Open Solicitations">
         {recentOpenQuery.isLoading ? (
           <LoadingState label="Loading recent opportunities..." />
         ) : recentOpenOpps.length > 0 ? (

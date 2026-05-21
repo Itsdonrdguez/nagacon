@@ -7,15 +7,21 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.pipeline_item import PipelineItem
 from app.models.opportunity_file import OpportunityFile
+from app.models.search_job import SearchJob
 from app.models.vendor import VendorLead
 from app.models.workspace import WorkspaceArtifact
 from app.repositories.opportunities import OpportunityRepository
 from app.schemas.opportunity import IngestResult, OpportunityCreate, OpportunityRead, OpportunityUpdate, RawOpportunity
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.search_jobs import start_search_job
 from app.services.opportunities.ingest import ingest_raw_opportunities
 from app.services.work_queue import workspace_intake_backpressure_snapshot
 
-router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
+router = APIRouter(
+    prefix="/api/opportunities",
+    tags=["opportunities"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _parse_code_list(value: str | None) -> list[str]:
@@ -31,12 +37,21 @@ def _opportunity_repo(db: Session, organization_id: int | None):
         return OpportunityRepository(db)
 
 
-def _count_related_by_opportunity(db: Session, model, opp_ids: list[int], organization_id: int | None):
+def _count_related_by_opportunity(
+    db: Session,
+    model,
+    opp_ids: list[int],
+    organization_id: int | None,
+    **extra_filters,
+):
     if not opp_ids:
         return {}
     query = db.query(model.opportunity_id, func.count(model.id)).filter(model.opportunity_id.in_(opp_ids))
     if organization_id is not None and hasattr(model, "organization_id"):
         query = query.filter(model.organization_id == organization_id)
+    for field_name, expected_value in extra_filters.items():
+        if hasattr(model, field_name):
+            query = query.filter(getattr(model, field_name) == expected_value)
     return {int(opp_id): int(count) for opp_id, count in query.group_by(model.opportunity_id).all()}
 
 
@@ -319,5 +334,45 @@ def update_opportunity(opportunity_id: int, payload: OpportunityUpdate, db: Sess
 
 
 @router.post("/ingest", response_model=IngestResult)
-def ingest_opportunities(raw_records: list[RawOpportunity], db: Session = Depends(get_db)):
-    return ingest_raw_opportunities(db, raw_records)
+def ingest_opportunities(
+    raw_records: list[RawOpportunity],
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    org_id = getattr(current_org, "id", None)
+    user_id = getattr(current_user, "id", None)
+    run = start_import_run(
+        db,
+        source="API_INGEST",
+        run_kind="opportunity_ingest",
+        request_payload={"record_count": len(raw_records)},
+        organization_id=org_id,
+        user_id=user_id,
+    )
+    try:
+        result = ingest_raw_opportunities(db, raw_records, organization_id=org_id)
+        complete_import_run(
+            db,
+            run,
+            status="completed_with_errors" if result.errors else "completed",
+            result_payload=result.model_dump(),
+            row_count=len(raw_records),
+            inserted_count=result.inserted,
+            updated_count=result.updated,
+            skipped_count=result.skipped,
+            duplicate_count=0,
+            error_message=" | ".join(result.errors[:5]) if result.errors else None,
+        )
+        return result
+    except Exception as exc:
+        db.rollback()
+        complete_import_run(
+            db,
+            run,
+            status="failed",
+            result_payload=None,
+            row_count=len(raw_records),
+            error_message=str(exc),
+        )
+        raise

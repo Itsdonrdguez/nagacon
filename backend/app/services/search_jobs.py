@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy.exc import OperationalError
+
 from app.api.scrapers import run_multi_source_search
 from app.core.config import settings
 from app.core.db import SessionLocal
@@ -16,6 +18,7 @@ from app.repositories.company import CompanyRepository
 from app.services.awardee_enrichment import enrich_awardees_for_opportunity
 from app.services.company_profile_ingest import run_company_profile_ingest
 from app.services.dibbs.pdf_bulk_export import export_dibbs_pdfs_for_fscs
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.master_catalog_export import write_master_catalog_export
 from app.services.nsn_catalog.build import build_nsn_intelligence
 from app.services.nsn_catalog.publog_sync import sync_publog_package
@@ -30,6 +33,10 @@ _active_run_gate: threading.BoundedSemaphore | None = None
 _active_run_gate_limit: int | None = None
 _background_run_gate: threading.BoundedSemaphore | None = None
 _background_run_gate_limit: int | None = None
+
+
+class SearchJobLookupUnavailable(RuntimeError):
+    pass
 
 QUEUE_LANE = "queue"
 VENDOR_LANE = "vendor"
@@ -331,6 +338,34 @@ def _append_progress(job_id: str, event: dict[str, Any]) -> None:
         _persist_job(snapshot)
 
 
+def _job_import_source(kind: str) -> str:
+    mapping = {
+        "profile": "COMPANY_PROFILE",
+        "manual": "MULTI_SOURCE_MANUAL",
+        "dibbs_pdf_bulk_download": "DIBBS_PDF_EXPORT",
+        "workspace_intake": "WORKSPACE",
+        "nsn_build": "NSN_INTELLIGENCE",
+        "publog_sync": "PUBLOG",
+        "awardee_enrichment": "AWARDEE_ENRICHMENT",
+        "provider_backfill": "PROVIDER_BACKFILL",
+    }
+    return mapping.get(kind, kind.upper())
+
+
+def _result_counter(result: dict[str, Any] | None, *keys: str) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    for key in keys:
+        value = result.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except Exception:
+            continue
+    return None
+
+
 def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
     is_user_priority = _is_user_priority_job(payload)
     gate = _active_execution_gate()
@@ -339,7 +374,16 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
         background_gate.acquire()
     gate.acquire()
     db = SessionLocal()
+    import_run = None
     try:
+        import_run = start_import_run(
+            db,
+            source=_job_import_source(kind),
+            run_kind=kind,
+            request_payload=payload,
+            organization_id=payload.get("organization_id"),
+            user_id=payload.get("user_id"),
+        )
         _update_job(
             job_id,
             status="running",
@@ -458,6 +502,19 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
         export_status = _maybe_refresh_master_catalog_export(db, kind, payload)
         if isinstance(result, dict) and export_status:
             result["_master_catalog_export"] = export_status
+        if import_run is not None:
+            complete_import_run(
+                db,
+                import_run,
+                status=final_status,
+                result_payload=result if isinstance(result, dict) else {"result": result},
+                row_count=_result_counter(result, "row_count", "processed_count", "total", "target_count"),
+                inserted_count=_result_counter(result, "inserted_count", "imported", "queued_count"),
+                updated_count=_result_counter(result, "updated_count", "updated"),
+                skipped_count=_result_counter(result, "skipped_count", "skipped"),
+                duplicate_count=_result_counter(result, "duplicate_count", "duplicates"),
+                error_message=" | ".join((result_summary.get("errors") or [])[:5]) if result_summary.get("has_errors") else None,
+            )
         _update_job(
             job_id,
             status=final_status,
@@ -469,6 +526,15 @@ def _run_job(job_id: str, kind: str, payload: dict[str, Any]) -> None:
             ),
         )
     except Exception as exc:
+        db.rollback()
+        if import_run is not None:
+            complete_import_run(
+                db,
+                import_run,
+                status="failed",
+                result_payload=None,
+                error_message=str(exc),
+            )
         traceback_text = traceback.format_exc()
         report_path = write_worker_traceback_report(
             job_id=job_id,
@@ -772,6 +838,8 @@ def get_search_job(job_id: str) -> dict[str, Any] | None:
     try:
         row = db.get(SearchJob, job_id)
         return _db_snapshot(row) if row else None
+    except OperationalError as exc:
+        raise SearchJobLookupUnavailable("search job status lookup is temporarily unavailable") from exc
     finally:
         db.close()
 

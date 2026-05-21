@@ -16,6 +16,7 @@ from app.services.nsn_catalog.publog_reference_service import (
 from app.services.nsn_catalog.publog_sync import get_publog_package_status, sync_publog_package
 from app.services.nsn_catalog.provider_seeding import seed_providers_from_nsn_catalog
 from app.services.nsn_catalog.refresh import refresh_nsn_intelligence
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.search_jobs import start_search_job
 
 
@@ -37,7 +38,14 @@ def sync_publog(
     current_org=Depends(get_current_organization),
 ):
     payload = dict(payload or {})
-    return sync_publog_package(
+    run = start_import_run(
+        db,
+        source="PUBLOG",
+        run_kind="sync",
+        request_payload=payload,
+        organization_id=getattr(current_org, "id", None),
+    )
+    result = sync_publog_package(
         db,
         zip_path=payload.get("zip_path"),
         publog_dir=payload.get("publog_dir"),
@@ -48,6 +56,17 @@ def sync_publog(
         force=bool(payload.get("force", False)),
         compute_hash=bool(payload.get("compute_hash", False)),
     )
+    complete_import_run(
+        db,
+        run,
+        status="completed" if str(result.get("status") or "").lower() not in {"failed", "error"} else "failed",
+        result_payload=result,
+        row_count=int(result.get("rows_imported") or result.get("rows_seen") or 0) if result.get("rows_imported") is not None or result.get("rows_seen") is not None else None,
+        inserted_count=int(result.get("rows_imported") or 0) if result.get("rows_imported") is not None else None,
+        skipped_count=int(result.get("duplicates") or 0) if result.get("duplicates") is not None else None,
+        error_message=result.get("error"),
+    )
+    return result
 
 
 @router.post("/publog/sync-job")

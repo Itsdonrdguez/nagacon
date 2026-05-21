@@ -38,6 +38,20 @@ def _short_error(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {exc}"
 
 
+def _rollback_if_active(db: Session) -> None:
+    try:
+        get_transaction = getattr(db, "get_transaction", None)
+        if callable(get_transaction):
+            transaction = get_transaction()
+            if transaction is None or not getattr(transaction, "is_active", False):
+                return
+        elif hasattr(db, "in_transaction") and not db.in_transaction():
+            return
+        db.rollback()
+    except Exception:
+        pass
+
+
 def _run_step(db: Session, steps: list[dict[str, Any]], name: str, fn):
     started = datetime.now(timezone.utc).isoformat()
     try:
@@ -45,10 +59,7 @@ def _run_step(db: Session, steps: list[dict[str, Any]], name: str, fn):
         steps.append({"name": name, "status": "success", "started_at": started, "output": output})
         return output
     except Exception as exc:
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        _rollback_if_active(db)
         steps.append({"name": name, "status": "failed", "started_at": started, "error": _short_error(exc)})
         return None
 
@@ -85,7 +96,7 @@ def _create_pipeline_run(db: Session, opp_id: int) -> tuple[AgentRunRepository |
         )
         return repo, run.id
     except Exception:
-        db.rollback()
+        _rollback_if_active(db)
         return None, None
 
 
@@ -126,7 +137,7 @@ def _finish_pipeline_run(
             ),
         )
     except Exception:
-        db.rollback()
+        _rollback_if_active(db)
 
 
 def run_opportunity_intake_pipeline(

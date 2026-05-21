@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -21,9 +22,16 @@ from app.services.search_jobs import start_search_job
 from app.services.storage import delete_reference, download_response as build_storage_download_response, file_exists, local_temp_path
 from app.services.work_queue import workspace_intake_backpressure_snapshot
 from app.services.workspace_service import generate_submission_package
+from app.utils.utc import utcnow_iso
+
+logger = logging.getLogger(__name__)
 
 
-router = APIRouter(prefix="/api/files", tags=["files"])
+router = APIRouter(
+    prefix="/api/files",
+    tags=["files"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _scoped_opportunity_query(db: Session, opportunity_id: int, org_id: int | None):
@@ -48,6 +56,28 @@ def _scoped_file_query(db: Session, org_id: int | None):
             )
         )
     return query
+
+
+def _get_file_or_404(db: Session, file_id: int, org_id: int | None) -> OpportunityFile:
+    file_record = db.query(OpportunityFile).filter(OpportunityFile.id == file_id).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    file_org_id = getattr(file_record, "organization_id", None)
+    if org_id is None:
+        return file_record
+    if file_org_id == org_id:
+        return file_record
+    opp_id = getattr(file_record, "opportunity_id", None)
+    if file_org_id is None and opp_id is not None:
+        opp = _scoped_opportunity_query(db, opp_id, org_id).first()
+        if opp:
+            file_record.organization_id = org_id
+            db.add(file_record)
+            _safe_commit = getattr(db, "commit", None)
+            if callable(_safe_commit):
+                _safe_commit()
+            return file_record
+    raise HTTPException(status_code=404, detail="File not found")
 
 
 def _file_out(file_record: OpportunityFile) -> OpportunityFileOut:
@@ -212,7 +242,7 @@ def prune_files(
         metadata["_retention"] = {
             "status": "pruned",
             "reason": retention.reason,
-            "pruned_at": datetime.utcnow().isoformat(),
+            "pruned_at": utcnow_iso(),
             "original_file_path": original_ref,
             "deleted_from_storage": bool(deleted),
         }
@@ -246,9 +276,7 @@ def prune_files(
 @router.get("/{file_id}/insights", response_model=OpportunityFileInsightsOut)
 def get_file_insights(file_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     org_id = getattr(current_org, "id", None)
-    file_record = _scoped_file_query(db, org_id).filter(OpportunityFile.id == file_id).first()
-    if not file_record:
-        raise HTTPException(status_code=404, detail="File not found")
+    file_record = _get_file_or_404(db, file_id, org_id)
     return _file_insights_out(file_record)
 
 
@@ -298,8 +326,9 @@ def download_pdfs(
             always_snapshot=always_snapshot,
             prefer_dibbs_solicitation_detail=prefer_dibbs_solicitation_detail,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("PDF download failed for opportunity %s", opportunity_id)
+        raise HTTPException(status_code=500, detail="Document download failed")
     processing = None
     provider_vendor_sync = None
     nsn_intelligence = None
@@ -370,17 +399,16 @@ def download_pdfs(
 @router.get("/download/{file_id}")
 def download_file(file_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
     org_id = getattr(current_org, "id", None)
-    f = _scoped_file_query(db, org_id).filter(OpportunityFile.id == file_id).first()
-    if not f:
-        raise HTTPException(status_code=404, detail="File not found")
+    f = _get_file_or_404(db, file_id, org_id)
     if not f.file_path:
         raise HTTPException(status_code=404, detail="File path is empty")
     try:
         return build_storage_download_response(f.file_path, filename=f.filename)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="File missing from configured storage")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"File download unavailable: {exc}")
+    except Exception:
+        logger.exception("File download unavailable for file %s", file_id)
+        raise HTTPException(status_code=502, detail="File download unavailable")
 
 
 @router.post("/parse/{file_id}")
@@ -391,9 +419,7 @@ def parse_file(
     current_user=Depends(get_current_user),
 ):
     org_id = getattr(current_org, "id", None)
-    f = _scoped_file_query(db, org_id).filter(OpportunityFile.id == file_id).first()
-    if not f:
-        raise HTTPException(status_code=404, detail="File not found")
+    f = _get_file_or_404(db, file_id, org_id)
     if not f.file_path:
         raise HTTPException(status_code=404, detail="File path is empty")
     if not file_exists(f.file_path):
@@ -445,5 +471,6 @@ def parse_file(
             "processing": result,
             "provider_vendor_sync": provider_vendor_sync,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Parse failed: {e}")
+    except Exception:
+        logger.exception("File parse failed for file %s", file_id)
+        raise HTTPException(status_code=500, detail="Parse failed")

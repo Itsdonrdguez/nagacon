@@ -10,7 +10,11 @@ from app.services.master_catalog_export import write_master_catalog_export
 from app.services.org_service import ensure_default_organization
 from app.services.provider_settings_service import get_provider_settings
 
-router = APIRouter(prefix="/api/settings", tags=["settings"])
+router = APIRouter(
+    prefix="/api/settings",
+    tags=["settings"],
+    dependencies=[Depends(get_current_user)],
+)
 SECRET_MASK = "********"
 
 

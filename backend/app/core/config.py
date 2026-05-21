@@ -37,6 +37,9 @@ except Exception:
             APP_ENV = os.getenv("APP_ENV", "dev")
             APP_ROLE = os.getenv("APP_ROLE", "web")
             DEBUG = os.getenv("DEBUG", "true").lower() in {"1", "true", "yes", "on"}
+            DEV_AUTH_FALLBACK_ENABLED = os.getenv("DEV_AUTH_FALLBACK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+            SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+            DEFAULT_ADMIN_BOOTSTRAP_ENABLED = os.getenv("DEFAULT_ADMIN_BOOTSTRAP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
             FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
             CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
             CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "")
@@ -68,6 +71,10 @@ except Exception:
             SEARCH_JOB_QUEUE_MAX_CONCURRENCY = int(os.getenv("SEARCH_JOB_QUEUE_MAX_CONCURRENCY", "2"))
             SEARCH_JOB_VENDOR_MAX_CONCURRENCY = int(os.getenv("SEARCH_JOB_VENDOR_MAX_CONCURRENCY", "2"))
             SEARCH_JOB_STALE_SECONDS = int(os.getenv("SEARCH_JOB_STALE_SECONDS", "1800"))
+            DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "8"))
+            DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "4"))
+            DB_POOL_TIMEOUT_SECONDS = int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "10"))
+            DB_POOL_RECYCLE_SECONDS = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800"))
             WORKSPACE_INTAKE_MAX_PENDING = int(os.getenv("WORKSPACE_INTAKE_MAX_PENDING", "0"))
             WORKSPACE_INTAKE_AUTOMATION_BATCH_LIMIT = int(os.getenv("WORKSPACE_INTAKE_AUTOMATION_BATCH_LIMIT", "0"))
             LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() in {"1", "true", "yes", "on"}
@@ -75,6 +82,10 @@ except Exception:
             DIBBS_DEBUG = os.getenv("DIBBS_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
             STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
             STORAGE_LOCAL_ROOT = os.getenv("STORAGE_LOCAL_ROOT", "")
+            DOCUMENT_MAX_BYTES = int(os.getenv("DOCUMENT_MAX_BYTES", str(25 * 1024 * 1024)))
+            DOCUMENT_PARSER_PAGE_LIMIT = int(os.getenv("DOCUMENT_PARSER_PAGE_LIMIT", "200"))
+            DOCUMENT_PARSER_TIMEOUT_SECONDS = float(os.getenv("DOCUMENT_PARSER_TIMEOUT_SECONDS", "30"))
+            MALWARE_SCAN_PROVIDER = os.getenv("MALWARE_SCAN_PROVIDER", "")
             PUBLOG_DATA_DIR = os.getenv("PUBLOG_DATA_DIR", "")
             PUBLOG_DVD_ZIP = os.getenv("PUBLOG_DVD_ZIP", "")
             WBPARTS_ENABLED = os.getenv("WBPARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

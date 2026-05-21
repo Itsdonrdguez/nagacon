@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
+from app.models.pipeline_item import PipelineItem
+from app.models.opportunity_file import OpportunityFile
+from app.models.search_job import SearchJob
+from app.models.vendor import VendorLead
+from app.models.workspace import WorkspaceArtifact
 from app.repositories.opportunities import OpportunityRepository
 from app.schemas.opportunity import IngestResult, OpportunityCreate, OpportunityRead, OpportunityUpdate, RawOpportunity
+from app.services.import_run_service import complete_import_run, start_import_run
+from app.services.search_jobs import start_search_job
 from app.services.opportunities.ingest import ingest_raw_opportunities
+from app.services.work_queue import workspace_intake_backpressure_snapshot
 
-router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
+router = APIRouter(
+    prefix="/api/opportunities",
+    tags=["opportunities"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
+
+
+def _parse_code_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
 def _opportunity_repo(db: Session, organization_id: int | None):
@@ -16,6 +35,71 @@ def _opportunity_repo(db: Session, organization_id: int | None):
         return OpportunityRepository(db, organization_id=organization_id)
     except TypeError:
         return OpportunityRepository(db)
+
+
+def _count_related_by_opportunity(
+    db: Session,
+    model,
+    opp_ids: list[int],
+    organization_id: int | None,
+    **extra_filters,
+):
+    if not opp_ids:
+        return {}
+    query = db.query(model.opportunity_id, func.count(model.id)).filter(model.opportunity_id.in_(opp_ids))
+    if organization_id is not None and hasattr(model, "organization_id"):
+        query = query.filter(model.organization_id == organization_id)
+    for field_name, expected_value in extra_filters.items():
+        if hasattr(model, field_name):
+            query = query.filter(getattr(model, field_name) == expected_value)
+    return {int(opp_id): int(count) for opp_id, count in query.group_by(model.opportunity_id).all()}
+
+
+def _serialize_opportunities_with_pipeline(db: Session, items: list, organization_id: int | None):
+    opp_ids = [getattr(item, "id", None) for item in items if getattr(item, "id", None) is not None]
+    pipeline_lookup = {}
+    file_counts = {}
+    artifact_counts = {}
+    nsn_intelligence_counts = {}
+    lead_counts = {}
+    if opp_ids:
+        try:
+            query = db.query(PipelineItem).filter(PipelineItem.opportunity_id.in_(opp_ids))
+            if organization_id is not None:
+                query = query.filter(PipelineItem.organization_id == organization_id)
+            pipeline_lookup = {row.opportunity_id: row for row in query.all()}
+            file_counts = _count_related_by_opportunity(db, OpportunityFile, opp_ids, organization_id)
+            artifact_counts = _count_related_by_opportunity(db, WorkspaceArtifact, opp_ids, organization_id)
+            nsn_intelligence_counts = _count_related_by_opportunity(
+                db,
+                WorkspaceArtifact,
+                opp_ids,
+                organization_id,
+                artifact_type="NSN_INTELLIGENCE",
+            )
+            lead_counts = _count_related_by_opportunity(db, VendorLead, opp_ids, organization_id)
+        except Exception:
+            if hasattr(db, "rollback"):
+                db.rollback()
+
+    payload = []
+    for item in items:
+        serialized = OpportunityRead.model_validate(item).model_dump()
+        pipeline = pipeline_lookup.get(getattr(item, "id", None))
+        opp_id = getattr(item, "id", None)
+        serialized["has_workspace"] = bool(
+            pipeline
+            or file_counts.get(opp_id, 0) > 0
+            or artifact_counts.get(opp_id, 0) > 0
+            or lead_counts.get(opp_id, 0) > 0
+            or nsn_intelligence_counts.get(opp_id, 0) > 0
+        )
+        if pipeline:
+            serialized["decision_status"] = getattr(getattr(pipeline, "decision_status", None), "value", pipeline.decision_status)
+            serialized["pipeline_owner"] = getattr(pipeline, "owner", None)
+            serialized["target_submit_date"] = pipeline.target_submit_date.isoformat() if getattr(pipeline, "target_submit_date", None) else None
+        payload.append(serialized)
+    return payload
 
 
 @router.get("", response_model=list[OpportunityRead])
@@ -27,10 +111,15 @@ def list_opportunities(
     set_aside_type: str | None = None,
     due_window: str | None = None,
     nsn: str | None = None,
+    agency: str | None = None,
+    state: str | None = None,
+    naics_codes: str | None = None,
+    fsc_codes: str | None = None,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
 ):
-    return _opportunity_repo(db, getattr(current_org, "id", None)).list(
+    org_id = getattr(current_org, "id", None)
+    items = _opportunity_repo(db, org_id).list(
         limit=limit,
         offset=offset,
         q=q,
@@ -38,7 +127,12 @@ def list_opportunities(
         set_aside_type=set_aside_type,
         due_window=due_window,
         nsn=nsn,
+        agency=agency,
+        state=state,
+        naics_codes=_parse_code_list(naics_codes),
+        fsc_codes=_parse_code_list(fsc_codes),
     )
+    return _serialize_opportunities_with_pipeline(db, items, org_id)
 
 
 @router.get("/search")
@@ -50,12 +144,17 @@ def search_opportunities(
     set_aside_type: str | None = None,
     due_window: str | None = None,
     nsn: str | None = None,
+    agency: str | None = None,
+    state: str | None = None,
+    naics_codes: str | None = None,
+    fsc_codes: str | None = None,
     sort_by: str | None = None,
     sort_order: str = "asc",
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
 ):
-    items, total = _opportunity_repo(db, getattr(current_org, "id", None)).search(
+    org_id = getattr(current_org, "id", None)
+    items, total = _opportunity_repo(db, org_id).search(
         page=page,
         page_size=page_size,
         q=q,
@@ -63,23 +162,162 @@ def search_opportunities(
         set_aside_type=set_aside_type,
         due_window=due_window,
         nsn=nsn,
+        agency=agency,
+        state=state,
+        naics_codes=_parse_code_list(naics_codes),
+        fsc_codes=_parse_code_list(fsc_codes),
         sort_by=sort_by,
         sort_order=sort_order,
     )
     return {
-        "items": [OpportunityRead.model_validate(item).model_dump() for item in items],
+        "items": _serialize_opportunities_with_pipeline(db, items, org_id),
         "total": total,
         "page": page,
         "page_size": page_size,
     }
 
 
-@router.get("/{opportunity_id}", response_model=OpportunityRead)
-def get_opportunity(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
-    opp = _opportunity_repo(db, getattr(current_org, "id", None)).get(opportunity_id)
+@router.get("/filters")
+def opportunity_filter_options(db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+    return _opportunity_repo(db, getattr(current_org, "id", None)).filter_options()
+
+
+@router.post("/bulk/workspace-intake")
+def bulk_prepare_workspace(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    org_id = getattr(current_org, "id", None)
+    user_id = getattr(current_user, "id", None)
+    raw_ids = payload.get("opportunity_ids") or []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="opportunity_ids is required")
+
+    seen: set[int] = set()
+    opportunity_ids: list[int] = []
+    for raw_id in raw_ids[:100]:
+        try:
+            clean_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if clean_id in seen:
+            continue
+        seen.add(clean_id)
+        opportunity_ids.append(clean_id)
+
+    if not opportunity_ids:
+        raise HTTPException(status_code=400, detail="No valid opportunity ids were provided")
+
+    repo = _opportunity_repo(db, org_id)
+    opps = [repo.get(opportunity_id) for opportunity_id in opportunity_ids]
+    missing = [opportunity_ids[index] for index, opp in enumerate(opps) if not opp]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Opportunity not found: {missing[0]}")
+
+    active_jobs = (
+        db.query(SearchJob)
+        .filter(
+            SearchJob.kind == "workspace_intake",
+            SearchJob.status.in_(("queued", "running")),
+            SearchJob.organization_id == org_id if org_id is not None else SearchJob.organization_id.is_(None),
+        )
+        .all()
+    )
+    active_ids = {
+        int((job.payload or {}).get("opportunity_id"))
+        for job in active_jobs
+        if isinstance(job.payload, dict) and (job.payload or {}).get("opportunity_id") is not None
+    }
+
+    download_documents = bool(payload.get("download_documents", True))
+    run_usaspending = bool(payload.get("run_usaspending", True))
+    backpressure = workspace_intake_backpressure_snapshot(db, org_id)
+    queue_budget = len(opps)
+    available_slots = backpressure.get("available_slots")
+    if isinstance(available_slots, int) and available_slots > 0:
+        queue_budget = min(queue_budget, available_slots)
+
+    queued_jobs: list[dict[str, object]] = []
+    skipped_duplicates: list[int] = []
+    archived_skips: list[int] = []
+    backpressure_skips: list[int] = []
+    for opp in opps:
+        if getattr(opp, "opportunity_lifecycle", None) == "ARCHIVED":
+            archived_skips.append(int(opp.id))
+            continue
+        if int(opp.id) in active_ids:
+            skipped_duplicates.append(int(opp.id))
+            continue
+        if queue_budget <= 0:
+            backpressure_skips.append(int(opp.id))
+            continue
+        job = start_search_job(
+            "workspace_intake",
+            {
+                "opportunity_id": int(opp.id),
+                "organization_id": org_id,
+                "user_id": user_id,
+                "download_documents": download_documents,
+                "run_usaspending": run_usaspending,
+            },
+        )
+        queued_jobs.append(
+            {
+                "opportunity_id": int(opp.id),
+                "job_id": job.get("id"),
+                "status": job.get("status"),
+                "title": getattr(opp, "display_title", None) or getattr(opp, "title", None),
+            }
+        )
+        queue_budget = max(0, queue_budget - 1)
+
+    return {
+        "status": "ok",
+        "requested_count": len(opportunity_ids),
+        "queued_count": len(queued_jobs),
+        "queued_jobs": queued_jobs,
+        "skipped_duplicate_count": len(skipped_duplicates),
+        "skipped_duplicate_opportunity_ids": skipped_duplicates,
+        "skipped_backpressure_count": len(backpressure_skips),
+        "skipped_backpressure_opportunity_ids": backpressure_skips,
+        "archived_skip_count": len(archived_skips),
+        "archived_skip_opportunity_ids": archived_skips,
+        "workspace_intake_backpressure": backpressure,
+    }
+
+
+@router.post("/{opportunity_id}/awardee-enrichment-job")
+def start_awardee_enrichment_job(
+    opportunity_id: int,
+    force: bool = False,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    org_id = getattr(current_org, "id", None)
+    opp = _opportunity_repo(db, org_id).get(opportunity_id)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-    return opp
+    return start_search_job(
+        "awardee_enrichment",
+        {
+            "opportunity_id": opportunity_id,
+            "organization_id": org_id,
+            "user_id": getattr(current_user, "id", None),
+            "force": force,
+        },
+    )
+
+
+@router.get("/{opportunity_id}", response_model=OpportunityRead)
+def get_opportunity(opportunity_id: int, db: Session = Depends(get_db), current_org=Depends(get_current_organization)):
+    org_id = getattr(current_org, "id", None)
+    opp = _opportunity_repo(db, org_id).get(opportunity_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    return _serialize_opportunities_with_pipeline(db, [opp], org_id)[0]
 
 
 @router.post("", response_model=OpportunityRead)
@@ -96,5 +334,45 @@ def update_opportunity(opportunity_id: int, payload: OpportunityUpdate, db: Sess
 
 
 @router.post("/ingest", response_model=IngestResult)
-def ingest_opportunities(raw_records: list[RawOpportunity], db: Session = Depends(get_db)):
-    return ingest_raw_opportunities(db, raw_records)
+def ingest_opportunities(
+    raw_records: list[RawOpportunity],
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    org_id = getattr(current_org, "id", None)
+    user_id = getattr(current_user, "id", None)
+    run = start_import_run(
+        db,
+        source="API_INGEST",
+        run_kind="opportunity_ingest",
+        request_payload={"record_count": len(raw_records)},
+        organization_id=org_id,
+        user_id=user_id,
+    )
+    try:
+        result = ingest_raw_opportunities(db, raw_records, organization_id=org_id)
+        complete_import_run(
+            db,
+            run,
+            status="completed_with_errors" if result.errors else "completed",
+            result_payload=result.model_dump(),
+            row_count=len(raw_records),
+            inserted_count=result.inserted,
+            updated_count=result.updated,
+            skipped_count=result.skipped,
+            duplicate_count=0,
+            error_message=" | ".join(result.errors[:5]) if result.errors else None,
+        )
+        return result
+    except Exception as exc:
+        db.rollback()
+        complete_import_run(
+            db,
+            run,
+            status="failed",
+            result_payload=None,
+            row_count=len(raw_records),
+            error_message=str(exc),
+        )
+        raise

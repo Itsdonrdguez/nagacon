@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.core.deps import get_current_organization, get_current_user
 from app.services.vendors.usaspending import find_similar_awardees
 
-router = APIRouter(prefix="/api/vendors/usaspending", tags=["vendors", "usaspending"])
+router = APIRouter(
+    prefix="/api/vendors/usaspending",
+    tags=["vendors", "usaspending"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 class USAspendingVendorSearchRequest(BaseModel):

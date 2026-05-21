@@ -7,10 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.models.company_profile import CompanyProfile
 from app.schemas.opportunity import RawOpportunity
+from app.services.dibbs.fetch_guard import guarded_fetch_dibbs_opportunities
+from app.services.import_run_service import complete_import_run, start_import_run
+from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
+from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
 from app.services.provider_settings_service import get_effective_sam_api_key
-from app.services.scrapers.dibbs_scraper import fetch_dibbs_opportunities
 from app.services.scrapers.sam_scraper import SamScraperError, fetch_sam_opportunities
+from app.utils.utc import utcnow
 
 DEFAULT_DIBBS_FSC_CODES = [
     "6520",
@@ -155,31 +159,45 @@ def _dedupe_raw_opportunities(raw_opps: list[RawOpportunity]) -> list[RawOpportu
     return unique
 
 
-def _ingest_many(db: Session, raw_opps: list[RawOpportunity]) -> dict[str, Any]:
+def _ingest_many(
+    db: Session,
+    raw_opps: list[RawOpportunity],
+    *,
+    organization_id: int | None = None,
+    collect_dibbs_ids: bool = False,
+) -> dict[str, Any]:
     inserted = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
+    dibbs_opportunity_ids: list[int] = []
 
     for raw in raw_opps:
         try:
-            result = upsert_raw_opportunity(db, raw, force_refresh=True)
+            result = upsert_raw_opportunity(db, raw, force_refresh=True, organization_id=organization_id)
             if result == "inserted":
                 inserted += 1
             elif result == "updated":
                 updated += 1
             else:
                 skipped += 1
+            if collect_dibbs_ids and str(raw.source or "").upper() == "DIBBS":
+                opp = find_existing_opportunity(db, raw)
+                if opp and getattr(opp, "id", None):
+                    dibbs_opportunity_ids.append(opp.id)
         except Exception as exc:
             db.rollback()
             errors.append(str(exc))
 
-    return {
+    out = {
         "inserted": inserted,
         "updated": updated,
         "skipped": skipped,
         "errors": errors,
     }
+    if collect_dibbs_ids:
+        out["dibbs_opportunity_ids"] = dibbs_opportunity_ids
+    return out
 
 
 def _filter_sam_by_naics(raw_opps: list[RawOpportunity], allowed_naics: list[str]) -> list[RawOpportunity]:
@@ -219,7 +237,20 @@ def run_company_profile_ingest(
     quick: bool = False,
     update_last_run: bool = True,
     progress_callback=None,
+    user_id: int | None = None,
 ) -> dict[str, Any]:
+    import_run = start_import_run(
+        db,
+        source="COMPANY_PROFILE",
+        run_kind="company_profile_ingest",
+        request_payload={
+            "quick": bool(quick),
+            "update_last_run": bool(update_last_run),
+            "profile_id": getattr(profile, "id", None) if profile is not None else None,
+        },
+        organization_id=getattr(profile, "organization_id", None) if profile is not None else None,
+        user_id=user_id,
+    )
     plan = build_company_ingest_plan(profile)
     plan = _build_effective_plan(plan, quick=quick)
     limit = int(plan["auto_ingest_limit"] or 25)
@@ -246,7 +277,10 @@ def run_company_profile_ingest(
     dibbs_errors: list[str] = []
     for fsc_code in plan["dibbs"]["fsc_codes"]:
         try:
-            rows = fetch_dibbs_opportunities({"fsc": fsc_code, "limit": limit, "max_pages": 4}, max_pages=4)
+            rows = guarded_fetch_dibbs_opportunities(
+                {"fsc": fsc_code, "limit": limit, "max_pages": 4},
+                max_pages=4,
+            )
         except Exception as exc:
             rows = []
             dibbs_errors.append(f"FSC {fsc_code}: {exc}")
@@ -259,7 +293,17 @@ def run_company_profile_ingest(
         dibbs_results.append({"code": fsc_code, "raw_rows": len(rows)})
         dibbs_raw.extend(rows)
     dibbs_raw = _dedupe_raw_opportunities(dibbs_raw)
-    dibbs_ingest = _ingest_many(db, dibbs_raw)
+    organization_id = getattr(profile, "organization_id", None) if profile is not None else None
+    dibbs_ingest = _ingest_many(db, dibbs_raw, organization_id=organization_id, collect_dibbs_ids=True)
+    dibbs_ids = list(dibbs_ingest.pop("dibbs_opportunity_ids", []) or [])
+    if dibbs_ids:
+        dibbs_ingest["part_finder_enrichment"] = enrich_dibbs_opportunities_after_ingest(
+            db,
+            dibbs_ids,
+            organization_id=organization_id,
+            queue_nsn_build=False,
+            max_items=len(dibbs_ids),
+        )
     dibbs_ingest["errors"] = list(dict.fromkeys((dibbs_ingest.get("errors") or []) + dibbs_errors))
     dibbs_ingest["diagnostics"] = {
         "used_codes": plan["dibbs"]["fsc_codes"],
@@ -271,7 +315,7 @@ def run_company_profile_ingest(
     sam_raw: list[RawOpportunity] = []
     sam_results: list[dict[str, Any]] = []
     sam_errors: list[str] = []
-    sam_api_key = get_effective_sam_api_key(db)
+    sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
     for query in plan["sam"]["queries"]:
         try:
             effective_query = dict(query)
@@ -296,7 +340,7 @@ def run_company_profile_ingest(
             sam_results.append({"query": query, "raw_rows": 0, "naics_filtered_rows": 0, "error": str(exc)})
             sam_errors.append(str(exc))
     sam_raw = _dedupe_raw_opportunities(sam_raw)
-    sam_ingest = _ingest_many(db, sam_raw)
+    sam_ingest = _ingest_many(db, sam_raw, organization_id=organization_id)
     sam_ingest["errors"] = list(dict.fromkeys((sam_ingest.get("errors") or []) + sam_errors))
     sam_ingest["diagnostics"] = {
         "queries": sam_results,
@@ -308,26 +352,48 @@ def run_company_profile_ingest(
         "states": plan["sam"]["states"],
     }
 
-    if profile is not None and update_last_run:
-        profile.last_auto_ingest_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        db.add(profile)
-        db.commit()
-        db.refresh(profile)
+    try:
+        if profile is not None and update_last_run:
+            profile.last_auto_ingest_at = utcnow()
+            db.add(profile)
+            db.commit()
+            db.refresh(profile)
 
-    return {
-        "search_mode": plan.get("search_mode") or "full",
-        "plan": plan,
-        "results": {
-            "dibbs": dibbs_ingest,
-            "sam": sam_ingest,
-        },
-    }
+        result = {
+            "search_mode": plan.get("search_mode") or "full",
+            "plan": plan,
+            "results": {
+                "dibbs": dibbs_ingest,
+                "sam": sam_ingest,
+            },
+        }
+        dibbs_result = result["results"]["dibbs"]
+        sam_result = result["results"]["sam"]
+        dibbs_errors = list(dibbs_result.get("errors") or [])
+        sam_errors = list(sam_result.get("errors") or [])
+        all_errors = [str(item) for item in (dibbs_errors + sam_errors) if str(item or "").strip()]
+        complete_import_run(
+            db,
+            import_run,
+            status="partial_success" if all_errors else "completed",
+            result_payload=result,
+            row_count=int((dibbs_result.get("diagnostics") or {}).get("raw_rows") or 0)
+            + int((sam_result.get("diagnostics") or {}).get("raw_rows") or 0),
+            inserted_count=int(dibbs_result.get("inserted") or 0) + int(sam_result.get("inserted") or 0),
+            updated_count=int(dibbs_result.get("updated") or 0) + int(sam_result.get("updated") or 0),
+            skipped_count=int(dibbs_result.get("skipped") or 0) + int(sam_result.get("skipped") or 0),
+            error_message=" | ".join(all_errors[:5]) if all_errors else None,
+        )
+        return result
+    except Exception as exc:
+        complete_import_run(db, import_run, status="failed", error_message=str(exc))
+        raise
 
 
 def company_profile_due_for_auto_ingest(profile: CompanyProfile | None, now: datetime | None = None) -> bool:
     if not profile or not getattr(profile, "auto_ingest_enabled", False):
         return False
-    current_time = now or datetime.utcnow()
+    current_time = now or utcnow()
     interval_hours = int(getattr(profile, "auto_ingest_interval_hours", None) or 24)
     last_run = getattr(profile, "last_auto_ingest_at", None)
     if not last_run:

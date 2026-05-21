@@ -1,4 +1,0 @@
-Make sure backend/app/main.py includes the vendors router:
-
-from app.api.vendors import router as vendors_router
-app.include_router(vendors_router)

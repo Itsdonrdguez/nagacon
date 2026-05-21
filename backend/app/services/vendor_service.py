@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_
@@ -9,11 +9,14 @@ from sqlalchemy.orm import Session
 from app.models.opportunity import Opportunity
 from app.models.vendor import VendorLead, VendorQuote
 from app.services.rfq_parser import parse_dibbs_sources
+from app.services.workflow_audit import record_workflow_event
+from app.utils.utc import utcnow
 
 
 DEFAULT_STATUS = "NOT_REQUESTED"
 ALLOWED_STATUSES = {"NOT_REQUESTED", "REQUESTED", "RECEIVED", "NO_BID", "INVALID"}
 LEAD_ALLOWED_STATUSES = {"NEW", "REVIEW", "SHORTLISTED", "SEEDED_TO_QUOTES", "IGNORED"}
+FOLLOW_UP_BUSINESS_DAYS = 2
 
 
 def _clean(v: str | None) -> str | None:
@@ -21,6 +24,85 @@ def _clean(v: str | None) -> str | None:
         return None
     s = str(v).strip()
     return s or None
+
+
+def _clean_limited(v: str | None, max_len: int) -> str | None:
+    clean = _clean(v)
+    if not clean:
+        return None
+    return clean[:max_len].strip() or None
+
+
+def _compact_nsn(value: str | None) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _sanitize_part_number(part_number: str | None, *, nsn: str | None = None) -> str | None:
+    clean = _clean(part_number)
+    if not clean:
+        return None
+    compact = _compact_nsn(clean)
+    if len(compact) == 13 and nsn and compact == _compact_nsn(nsn):
+        return None
+    return clean
+
+
+def _sanitize_company_name(company_name: str | None, *, cage: str | None = None, part_number: str | None = None) -> str | None:
+    clean = _clean(company_name)
+    if not clean:
+        return None
+    if cage:
+        marker = clean.upper().find(str(cage).upper())
+        if marker > 2:
+            clean = clean[:marker].strip(" -|,;/")
+    if part_number:
+        marker = clean.upper().find(str(part_number).upper())
+        if marker > 2:
+            clean = clean[:marker].strip(" -|,;/")
+    clean = " ".join(clean.split())
+    return clean[:200].strip() or None
+
+
+def _find_existing_vendor_lead(
+    db: Session,
+    *,
+    opportunity_id: int,
+    organization_id: int | None,
+    cage: str | None,
+    company_name: str | None,
+    part_number: str | None,
+) -> VendorLead | None:
+    base_query = db.query(VendorLead).filter(VendorLead.opportunity_id == opportunity_id)
+    base_query = _scope_vendor_leads(base_query, organization_id)
+
+    if cage:
+        cage_query = base_query.filter(VendorLead.cage == cage)
+        if part_number:
+            found = cage_query.filter(VendorLead.part_number == part_number).first()
+            if found:
+                return found
+        else:
+            found = cage_query.filter(VendorLead.part_number.is_(None)).first()
+            if found:
+                return found
+        fallback = (
+            cage_query
+            .order_by(VendorLead.part_number.is_(None), VendorLead.confidence.desc().nullslast(), VendorLead.id.desc())
+            .first()
+        )
+        if fallback:
+            return fallback
+
+    company_query = base_query
+    if company_name:
+        company_query = company_query.filter(func.coalesce(VendorLead.company_name, "") == company_name)
+    else:
+        company_query = company_query.filter(VendorLead.company_name.is_(None))
+    if part_number:
+        company_query = company_query.filter(VendorLead.part_number == part_number)
+    else:
+        company_query = company_query.filter(VendorLead.part_number.is_(None))
+    return company_query.first()
 
 
 def _scope_vendor_leads(query, organization_id: int | None):
@@ -45,6 +127,67 @@ def _scope_vendor_quotes(query, organization_id: int | None):
     return query
 
 
+def add_business_days(start: datetime, business_days: int) -> datetime:
+    current = start
+    remaining = max(int(business_days or 0), 0)
+    while remaining > 0:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
+
+def _set_quote_requested_follow_up(rec: VendorQuote, now: datetime | None = None) -> None:
+    current_time = now or utcnow()
+    if not getattr(rec, "requested_at", None):
+        rec.requested_at = current_time
+    if not getattr(rec, "next_follow_up_at", None):
+        rec.next_follow_up_at = add_business_days(getattr(rec, "last_follow_up_at", None) or rec.requested_at or current_time, FOLLOW_UP_BUSINESS_DAYS)
+
+
+def _clear_quote_follow_up_if_terminal(rec: VendorQuote) -> None:
+    if str(getattr(rec, "status", "") or "").strip().upper() in {"RECEIVED", "NO_BID", "INVALID", "NOT_REQUESTED"}:
+        rec.next_follow_up_at = None
+
+
+def build_quote_follow_up_summary(quotes: list[Any], now: datetime | None = None) -> dict[str, Any]:
+    current_time = now or utcnow()
+    summary: dict[str, Any] = {
+        "total": len(quotes),
+        "requested": 0,
+        "due": 0,
+        "scheduled": 0,
+        "closed": 0,
+        "not_requested": 0,
+        "missing_schedule": 0,
+        "due_quote_ids": [],
+        "next_due_at": None,
+    }
+    next_due_at = None
+    for quote in quotes:
+        status = str(getattr(quote, "status", "") or "").strip().upper()
+        next_follow_up_at = getattr(quote, "next_follow_up_at", None)
+        if status == "REQUESTED":
+            summary["requested"] += 1
+            if next_follow_up_at and next_follow_up_at <= current_time:
+                summary["due"] += 1
+                summary["due_quote_ids"].append(getattr(quote, "id", None))
+            elif next_follow_up_at:
+                summary["scheduled"] += 1
+                if next_due_at is None or next_follow_up_at < next_due_at:
+                    next_due_at = next_follow_up_at
+            else:
+                summary["missing_schedule"] += 1
+        elif status in {"RECEIVED", "NO_BID", "INVALID"}:
+            summary["closed"] += 1
+        else:
+            summary["not_requested"] += 1
+
+    summary["due_quote_ids"] = [quote_id for quote_id in summary["due_quote_ids"] if quote_id is not None]
+    summary["next_due_at"] = next_due_at
+    return summary
+
+
 def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
     parsed = getattr(opp, "parsed_json", None) or {}
     if not parsed and getattr(opp, "raw_text", None):
@@ -58,27 +201,20 @@ def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, in
     updated = 0
 
     for s in sources:
-        company_name = _clean(s.get("company_name"))
-        cage = _clean(s.get("cage"))
-        part_number = _clean(s.get("part_number"))
+        cage = _clean_limited(s.get("cage"), 10)
+        part_number = _sanitize_part_number(s.get("part_number"), nsn=nsn)
+        company_name = _sanitize_company_name(s.get("company_name"), cage=cage, part_number=part_number)
         raw_text = _clean(s.get("raw_text"))
         confidence = 90 if cage and company_name else 80 if cage or company_name else 60 if part_number else 40
 
-        q = db.query(VendorLead).filter(VendorLead.opportunity_id == opp.id)
-        if cage:
-            q = q.filter(VendorLead.cage == cage)
-        else:
-            q = q.filter(VendorLead.cage.is_(None))
-        if company_name:
-            q = q.filter(func.coalesce(VendorLead.company_name, "") == company_name)
-        else:
-            q = q.filter(VendorLead.company_name.is_(None))
-        if part_number:
-            q = q.filter(VendorLead.part_number == part_number)
-        else:
-            q = q.filter(VendorLead.part_number.is_(None))
-
-        rec = q.first()
+        rec = _find_existing_vendor_lead(
+            db,
+            opportunity_id=opp.id,
+            organization_id=getattr(opp, "organization_id", None),
+            cage=cage,
+            company_name=company_name,
+            part_number=part_number,
+        )
         if rec:
             touched = False
             if rec.organization_id is None and getattr(opp, "organization_id", None) is not None:
@@ -103,7 +239,7 @@ def sync_vendor_leads_from_parsed(db: Session, opp: Opportunity) -> dict[str, in
                 rec.confidence = confidence
                 touched = True
             if touched:
-                rec.updated_at = datetime.utcnow()
+                rec.updated_at = utcnow()
                 updated += 1
             continue
 
@@ -161,7 +297,7 @@ def update_vendor_lead(db: Session, opportunity_id: int, lead_id: int, patch: di
     if rec.organization_id is None and organization_id is not None:
         rec.organization_id = organization_id
 
-    rec.updated_at = datetime.utcnow()
+    rec.updated_at = utcnow()
     db.commit()
     db.refresh(rec)
     return rec
@@ -186,7 +322,7 @@ def promote_vendor_lead_to_quote_request(db: Session, opportunity_id: int, lead_
         rec.status = "SHORTLISTED"
         touched = True
     if touched:
-        rec.updated_at = datetime.utcnow()
+        rec.updated_at = utcnow()
         db.add(rec)
         db.commit()
         db.refresh(rec)
@@ -235,10 +371,10 @@ def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
                 existing.company_name = company_name
                 touched = True
             if touched:
-                existing.updated_at = datetime.utcnow()
+                existing.updated_at = utcnow()
             if lead.status != "SEEDED_TO_QUOTES":
                 lead.status = "SEEDED_TO_QUOTES"
-                lead.updated_at = datetime.utcnow()
+                lead.updated_at = utcnow()
             continue
 
         db.add(VendorQuote(
@@ -250,7 +386,7 @@ def seed_quotes_from_parsed(db: Session, opp: Opportunity) -> dict[str, int]:
             status=DEFAULT_STATUS,
         ))
         lead.status = "SEEDED_TO_QUOTES"
-        lead.updated_at = datetime.utcnow()
+        lead.updated_at = utcnow()
         created += 1
 
     if created or shortlisted or lead_stats.get("created") or lead_stats.get("updated"):
@@ -276,7 +412,15 @@ def list_quotes(db: Session, opportunity_id: int, organization_id: int | None = 
     )
 
 
-def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str | None, patch: dict[str, Any], organization_id: int | None = None) -> VendorQuote:
+def upsert_quote(
+    db: Session,
+    opportunity_id: int,
+    cage: str,
+    part_number: str | None,
+    patch: dict[str, Any],
+    organization_id: int | None = None,
+    user_id: int | None = None,
+) -> VendorQuote:
     cage = cage.strip()
     if not cage:
         raise ValueError("cage required")
@@ -307,6 +451,7 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
         )
         db.add(rec)
         db.flush()
+    previous_status = str(getattr(rec, "status", DEFAULT_STATUS) or DEFAULT_STATUS).strip().upper()
 
     for k in ["company_name", "contact_name", "email", "phone", "notes"]:
         if k in patch:
@@ -320,10 +465,142 @@ def upsert_quote(db: Session, opportunity_id: int, cage: str, part_number: str |
     if "status" in patch and patch["status"]:
         st = str(patch["status"]).strip().upper()
         rec.status = st if st in ALLOWED_STATUSES else DEFAULT_STATUS
+        if rec.status == "REQUESTED" and not any([rec.email, rec.phone, rec.contact_name, rec.company_name]):
+            raise ValueError("quote request requires vendor contact information before status can be REQUESTED")
+        if rec.status == "RECEIVED" and rec.unit_price is None:
+            raise ValueError("received quotes require a unit_price")
+        if rec.status == "RECEIVED" and previous_status not in {"REQUESTED", "RECEIVED"} and not bool(patch.get("approved")):
+            raise ValueError("explicit approval is required before marking a quote as RECEIVED without a prior REQUESTED state")
+        if rec.status == "REQUESTED":
+            if not bool(patch.get("approved")):
+                raise ValueError("explicit approval is required before marking a quote request as REQUESTED")
+            _set_quote_requested_follow_up(rec)
+        else:
+            _clear_quote_follow_up_if_terminal(rec)
     if rec.organization_id is None and organization_id is not None:
         rec.organization_id = organization_id
 
-    rec.updated_at = datetime.utcnow()
+    rec.updated_at = utcnow()
     db.commit()
     db.refresh(rec)
+    if rec.status != previous_status:
+        record_workflow_event(
+            db,
+            opportunity_id=opportunity_id,
+            organization_id=organization_id or rec.organization_id,
+            user_id=user_id,
+            entity_type="vendor_quote",
+            entity_id=rec.id,
+            action="status_transition",
+            from_state=previous_status,
+            to_state=rec.status,
+            metadata={
+                "cage": rec.cage,
+                "part_number": rec.part_number,
+                "unit_price": float(rec.unit_price) if rec.unit_price is not None else None,
+                "approved": bool(patch.get("approved")),
+                "approval_notes": patch.get("approval_notes"),
+            },
+        )
     return rec
+
+
+def sync_quote_status_from_outreach_artifact(db: Session, artifact: Any, action: str | None, organization_id: int | None = None) -> dict[str, Any]:
+    normalized_action = str(action or "").strip().lower()
+    content = getattr(artifact, "content_json", None) or {}
+    quote_id = content.get("vendor_quote_id")
+    if normalized_action != "sent":
+        return {"updated": False, "reason": "action_not_sent"}
+    if not quote_id:
+        return {"updated": False, "reason": "missing_vendor_quote_id"}
+
+    query = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.id == quote_id)
+        .filter(VendorQuote.opportunity_id == getattr(artifact, "opportunity_id", None))
+    )
+    query = _scope_vendor_quotes(query, organization_id)
+    rec = query.first()
+    if not rec:
+        return {"updated": False, "reason": "quote_not_found", "vendor_quote_id": quote_id}
+
+    if rec.status and str(rec.status).strip().upper() != DEFAULT_STATUS:
+        return {
+            "updated": False,
+            "reason": "status_already_set",
+            "vendor_quote_id": rec.id,
+            "status": rec.status,
+        }
+
+    rec.status = "REQUESTED"
+    _set_quote_requested_follow_up(rec)
+    rec.updated_at = utcnow()
+    note = f"Outreach sent from workspace artifact {getattr(artifact, 'id', None)}."
+    existing_notes = str(rec.notes or "").strip()
+    if note not in existing_notes:
+        rec.notes = f"{existing_notes}\n{note}".strip() if existing_notes else note
+    db.add(rec)
+    return {
+        "updated": True,
+        "vendor_quote_id": rec.id,
+        "status": rec.status,
+    }
+
+
+def mark_quote_followed_up(
+    db: Session,
+    opportunity_id: int,
+    quote_id: int,
+    organization_id: int | None = None,
+    notes: str | None = None,
+    user_id: int | None = None,
+) -> dict[str, Any]:
+    query = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.opportunity_id == opportunity_id)
+        .filter(VendorQuote.id == quote_id)
+    )
+    query = _scope_vendor_quotes(query, organization_id)
+    rec = query.first()
+    if not rec:
+        raise ValueError("vendor quote not found")
+
+    if str(rec.status or "").strip().upper() != "REQUESTED":
+        raise ValueError("follow-up can only be logged for requested quotes")
+
+    now = utcnow()
+    if not rec.requested_at:
+        rec.requested_at = now
+    rec.last_follow_up_at = now
+    rec.next_follow_up_at = add_business_days(now, FOLLOW_UP_BUSINESS_DAYS)
+    rec.follow_up_count = int(rec.follow_up_count or 0) + 1
+    rec.updated_at = now
+
+    note = notes or f"Follow-up logged on {now.date().isoformat()}."
+    existing_notes = str(rec.notes or "").strip()
+    if note and note not in existing_notes:
+        rec.notes = f"{existing_notes}\n{note}".strip() if existing_notes else note
+
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    record_workflow_event(
+        db,
+        opportunity_id=opportunity_id,
+        organization_id=organization_id or rec.organization_id,
+        user_id=user_id,
+        entity_type="vendor_quote",
+        entity_id=rec.id,
+        action="follow_up_logged",
+        from_state=rec.status,
+        to_state=rec.status,
+        notes=notes,
+        metadata={"follow_up_count": rec.follow_up_count},
+    )
+    return {
+        "vendor_quote_id": rec.id,
+        "status": rec.status,
+        "follow_up_count": rec.follow_up_count,
+        "last_follow_up_at": rec.last_follow_up_at,
+        "next_follow_up_at": rec.next_follow_up_at,
+    }

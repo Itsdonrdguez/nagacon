@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from app.services.scrapers.dibbs_scraper import _derive_item_signals, _normalize_fsc, _normalize_nsn, fetch_dibbs_opportunities
 from app.services.scrapers import dibbs_scraper as dibbs_scraper_module
-from app.services.scrapers.sam_scraper import _build_query_params, _normalize_opp, fetch_sam_opportunities
+from app.services.scrapers.sam_scraper import SamScraperError, _build_query_params, _normalize_opp, fetch_sam_opportunities
 from app.services.scrapers import sam_scraper as sam_scraper_module
 from app.utils.title_normalizer import build_summary_text, normalize_title
 
@@ -87,6 +89,61 @@ def test_fetch_sam_opportunities_from_fixture_payload(monkeypatch):
     assert rows[0].fsc_code == "4820"
     assert rows[0].naics_code == "332911"
     assert rows[0].agency == "Army Contracting Command"
+
+
+def test_fetch_sam_opportunities_retries_transient_500_then_succeeds(monkeypatch):
+    fixture = json.loads((FIXTURES / "sam_search_response.json").read_text(encoding="utf-8"))
+    attempts = {"count": 0}
+
+    class FakeResponse:
+        def __init__(self, status_code=200, text=""):
+            self.status_code = status_code
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                from requests import HTTPError
+
+                raise HTTPError(response=self)
+            return None
+
+        def json(self):
+            return fixture
+
+    def fake_get(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return FakeResponse(500, '{"code":"101500","message":"Runtime Error"}')
+        return FakeResponse(200, "")
+
+    monkeypatch.setattr(sam_scraper_module.settings, "SAM_API_KEY", "fixture-key")
+    monkeypatch.setattr(sam_scraper_module.requests, "get", fake_get)
+    monkeypatch.setattr(sam_scraper_module.time, "sleep", lambda seconds: None)
+
+    rows = fetch_sam_opportunities({"ncode": "561730", "limit": 10})
+
+    assert attempts["count"] == 3
+    assert len(rows) == 1
+
+
+def test_fetch_sam_opportunities_raises_clean_error_after_repeated_500s(monkeypatch):
+    class FakeResponse:
+        status_code = 500
+        text = '{"code":"101500","message":"Runtime Error","description":"Error in Sender"}'
+
+        def raise_for_status(self):
+            from requests import HTTPError
+
+            raise HTTPError(response=self)
+
+    monkeypatch.setattr(sam_scraper_module.settings, "SAM_API_KEY", "fixture-key")
+    monkeypatch.setattr(sam_scraper_module.requests, "get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(sam_scraper_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(SamScraperError) as exc_info:
+        fetch_sam_opportunities({"ncode": "561730", "limit": 10})
+
+    assert "failed after retries with transient HTTP 500" in str(exc_info.value)
 
 
 def test_fetch_dibbs_opportunities_from_fixture_payload(monkeypatch):

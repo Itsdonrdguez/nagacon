@@ -24,10 +24,13 @@ def upsert_opportunity(db: Session, data: dict) -> Opportunity:
         existing.fsc = data.get("fsc", existing.fsc)
         existing.set_aside = data.get("set_aside", existing.set_aside)
         existing.raw_text = data.get("raw_text", existing.raw_text)
+        existing.raw_payload = data.get("raw_payload") or existing.raw_payload
+        existing.source_opportunity_id = data.get("source_opportunity_id") or existing.source_opportunity_id
         return existing
 
     opp = Opportunity(
         source=source,
+        source_opportunity_id=data.get("source_opportunity_id"),
         solicitation_number=sol,
         title=data.get("title") or "",
         agency=data.get("agency") or "DLA (DIBBS)",
@@ -38,6 +41,7 @@ def upsert_opportunity(db: Session, data: dict) -> Opportunity:
         fsc=data.get("fsc"),
         set_aside=data.get("set_aside"),
         raw_text=data.get("raw_text"),
+        raw_payload=data.get("raw_payload"),
         status="new",
     )
     db.add(opp)

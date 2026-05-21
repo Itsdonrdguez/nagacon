@@ -35,6 +35,16 @@ const EMPTY_FORM = {
   notes: '',
 }
 
+function money(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 'Not available'
+  return numeric.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
+}
+
+function providerLabel(provider) {
+  return provider?.display_name || provider?.canonical_name || provider?.company_name || 'Unresolved supplier'
+}
+
 function providerPayload(form) {
   return {
     company_name: form.company_name.trim(),
@@ -58,11 +68,15 @@ export default function Providers() {
   const queryClient = useQueryClient()
   const [filters, setFilters] = useState({ q: '', nsn: '', fsc: '', relationship_type: 'all', source: 'all' })
   const [submittedFilters, setSubmittedFilters] = useState(filters)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
   const [form, setForm] = useState(EMPTY_FORM)
   const [csvContent, setCsvContent] = useState('')
+  const [selectedProviderId, setSelectedProviderId] = useState(null)
+  const [backfillJobId, setBackfillJobId] = useState(null)
 
   const providersQuery = useQuery({
-    queryKey: ['providers', submittedFilters],
+    queryKey: ['providers', submittedFilters, page, pageSize],
     queryFn: async () => {
       const res = await api.get('/api/providers', {
         params: {
@@ -71,9 +85,30 @@ export default function Providers() {
           fsc: submittedFilters.fsc || undefined,
           relationship_type: submittedFilters.relationship_type === 'all' ? undefined : submittedFilters.relationship_type,
           source: submittedFilters.source === 'all' ? undefined : submittedFilters.source,
-          limit: 100,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
         },
       })
+      return res.data
+    },
+  })
+  const providerDetailQuery = useQuery({
+    queryKey: ['provider-detail', selectedProviderId],
+    enabled: Boolean(selectedProviderId),
+    queryFn: async () => {
+      const res = await api.get(`/api/providers/${selectedProviderId}`)
+      return res.data
+    },
+  })
+  const backfillJobQuery = useQuery({
+    queryKey: ['provider-backfill-job', backfillJobId],
+    enabled: Boolean(backfillJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${backfillJobId}`)
       return res.data
     },
   })
@@ -140,21 +175,41 @@ export default function Providers() {
       queryClient.invalidateQueries({ queryKey: ['providers'] })
     },
   })
+  const backfillMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/providers/backfill/job', null, {
+        params: { limit: 250, enrich_websites: true },
+      })
+      return res.data
+    },
+    onSuccess: (job) => {
+      setBackfillJobId(job.id)
+    },
+  })
 
   const rows = providersQuery.data?.items || []
   const total = providersQuery.data?.total || 0
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const pageStart = total === 0 ? 0 : (page - 1) * pageSize + 1
+  const pageEnd = total === 0 ? 0 : Math.min(page * pageSize, total)
+  const exportProvidersUrl = `${api.defaults.baseURL}/api/export/providers.csv`
+  const providerDetail = providerDetailQuery.data
 
   const sourceCounts = useMemo(() => {
     const counts = {}
     rows.forEach((row) => {
-      const key = row.source || 'No Source'
-      counts[key] = (counts[key] || 0) + 1
+      const sources = row.sources?.length ? row.sources : [row.source || 'No Source']
+      sources.forEach((source) => {
+        const key = source || 'No Source'
+        counts[key] = (counts[key] || 0) + 1
+      })
     })
     return counts
   }, [rows])
 
   const handleFilterSubmit = (event) => {
     event.preventDefault()
+    setPage(1)
     setSubmittedFilters({ ...filters })
   }
 
@@ -178,6 +233,9 @@ export default function Providers() {
           <h1 className="page-title">Providers</h1>
           <div className="page-subtitle">A reusable database of distributors, manufacturers, approved sources, and awardees tied to NSNs and FSCs.</div>
         </div>
+        <a className="btn btn-secondary btn-sm" href={exportProvidersUrl}>
+          Export Providers CSV
+        </a>
       </div>
 
       <Card title="Provider Search">
@@ -270,6 +328,35 @@ export default function Providers() {
               <Button variant="secondary" loading={contactDiscoveryMutation.isPending} onClick={() => contactDiscoveryMutation.mutate()}>
                 Discover Contacts
               </Button>
+              <Button variant="secondary" loading={backfillMutation.isPending} onClick={() => backfillMutation.mutate()}>
+                Run Provider Backfill
+              </Button>
+            </div>
+            <div className="simple-list">
+              <div className="simple-list-row">
+                <div className="row-title">Import CSV</div>
+                <div className="row-subtitle">Loads providers from a spreadsheet or pasted CSV. Best when you already have a clean list.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Seed From Vendor Leads</div>
+                <div className="row-subtitle">Turns vendor leads you already collected elsewhere in the app into reusable provider records.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Extract From DIBBS PDFs</div>
+                <div className="row-subtitle">Reads saved DIBBS solicitation PDFs and pulls out CAGEs, names, and item links.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Enrich SAM Websites</div>
+                <div className="row-subtitle">Fills in missing company websites from SAM. Usually not needed right after a full backfill run.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Discover Contacts</div>
+                <div className="row-subtitle">Looks for contact details on providers that already exist in your database.</div>
+              </div>
+              <div className="simple-list-row">
+                <div className="row-title">Run Provider Backfill</div>
+                <div className="row-subtitle">The broad cleanup pass. It resolves names, fills gaps, and pulls in missing provider details across the database.</div>
+              </div>
             </div>
             {importMutation.data ? (
               <div className="settings-summary-box">
@@ -311,6 +398,25 @@ export default function Providers() {
                 {(contactDiscoveryMutation.data.errors || []).slice(0, 3).map((error, index) => <div key={index} className="form-error">{error}</div>)}
               </div>
             ) : null}
+            {backfillJobQuery.data ? (
+              <div className="settings-summary-box">
+                <div className="row-title">Provider Backfill Job</div>
+                <div className="row-subtitle">
+                  {backfillJobQuery.data.status}
+                  {backfillJobQuery.data.progress?.current_label ? ` | ${backfillJobQuery.data.progress.current_label}` : ''}
+                  {backfillJobQuery.data.progress?.percent !== undefined ? ` | ${backfillJobQuery.data.progress.percent}%` : ''}
+                </div>
+                {backfillJobQuery.data.result ? (
+                  <div className="row-subtitle">
+                    Resolved {backfillJobQuery.data.result.identities_resolved || 0}
+                    {' | '}
+                    Award evidence inserted {backfillJobQuery.data.result.nsn_award_provider_seed?.inserted || 0}
+                    {' | '}
+                    Award history inserted {backfillJobQuery.data.result.award_history_provider_seed?.inserted || 0}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </Card>
       </div>
@@ -323,50 +429,260 @@ export default function Providers() {
         ) : (
           <>
             <div className="results-toolbar">
-              <div className="results-count">Showing {rows.length} of {total}</div>
+              <div className="results-count">Showing {pageStart}-{pageEnd} of {total}</div>
+              <div className="page-size-control">
+                <label className="input-label">Rows</label>
+                <select
+                  value={pageSize}
+                  onChange={(event) => {
+                    setPageSize(Number(event.target.value))
+                    setPage(1)
+                  }}
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
               <div className="badge-stack">
                 {Object.entries(sourceCounts).slice(0, 5).map(([source, count]) => (
                   <Badge key={source} label={`${source}: ${count}`} variant="info" />
                 ))}
               </div>
             </div>
-            <Table>
+            <Table className="providers-table">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>NSN / Item</TableHead>
-                  <TableHead>Type</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead>Website</TableHead>
-                  <TableHead>Status</TableHead>
+                  <TableHead className="providers-col-provider">Provider</TableHead>
+                  <TableHead className="providers-col-item">NSN / Item</TableHead>
+                  <TableHead className="providers-col-type">Type</TableHead>
+                  <TableHead className="providers-col-website">Website</TableHead>
+                  <TableHead className="providers-col-status">Status</TableHead>
+                  <TableHead className="providers-col-profile">Profile</TableHead>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {rows.map((row) => (
-                  <TableRow key={`${row.provider_id}-${row.provider_item_id || 'provider'}`}>
-                    <TableCell>
-                      <div className="row-title">{row.company_name}</div>
-                      <div className="row-subtitle">{row.cage ? `CAGE ${row.cage}` : 'CAGE not set'}{row.email ? ` | ${row.email}` : ''}</div>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((row) => (
+                    <TableRow key={row.provider_id}>
+                    <TableCell className="providers-cell-provider">
+                      <div className="row-title">{providerLabel(row)}</div>
+                      <div className="row-subtitle">
+                        {row.cage ? `CAGE ${row.cage}` : 'CAGE not set'}
+                        {row.email ? ` | ${row.email}` : ''}
+                        {row.item_count ? ` | ${row.item_count} item link${row.item_count === 1 ? '' : 's'}` : ''}
+                      </div>
                     </TableCell>
-                    <TableCell>
-                      <div className="row-title">{row.nomenclature || 'Item not specified'}</div>
-                      <div className="row-subtitle">{row.nsn || 'NSN not set'}{row.fsc ? ` | FSC ${row.fsc}` : ''}</div>
+                    <TableCell className="providers-cell-item">
+                      {(row.item_summaries || []).slice(0, 3).map((item) => (
+                        <div key={item.provider_item_id || `${item.nsn}-${item.nomenclature || item.relationship_type}`} className="provider-item-line">
+                          <div className="row-title">{item.nomenclature || item.nsn || 'Item not specified'}</div>
+                          <div className="row-subtitle">
+                            {item.nsn || 'NSN not set'}
+                            {item.fsc ? ` | FSC ${item.fsc}` : ''}
+                            {((item.sources?.length ? item.sources : [item.source]).filter(Boolean).join(', ')) ? ` | ${(item.sources?.length ? item.sources : [item.source]).filter(Boolean).join(', ')}` : ''}
+                          </div>
+                        </div>
+                      ))}
+                      {(row.item_summaries || []).length === 0 ? (
+                        <>
+                          <div className="row-title">{row.nomenclature || 'Item not specified'}</div>
+                          <div className="row-subtitle">{row.nsn || 'NSN not set'}{row.fsc ? ` | FSC ${row.fsc}` : ''}</div>
+                        </>
+                      ) : null}
+                      {(row.item_summaries || []).length > 3 ? (
+                        <div className="row-subtitle">+{row.item_summaries.length - 3} more item links</div>
+                      ) : null}
                     </TableCell>
-                    <TableCell><Badge label={row.relationship_type || 'Unknown'} variant="default" /></TableCell>
-                    <TableCell>{row.source || '-'}</TableCell>
-                    <TableCell>
+                    <TableCell className="providers-cell-type">
+                      <div className="badge-stack providers-type-stack">
+                        {(row.relationship_types?.length ? row.relationship_types : [row.relationship_type || 'Unknown']).slice(0, 4).map((type) => (
+                          <Badge key={type} label={type || 'Unknown'} variant="default" />
+                        ))}
+                        {(row.relationship_types || []).length > 4 ? <Badge label={`+${row.relationship_types.length - 4}`} variant="info" /> : null}
+                      </div>
+                    </TableCell>
+                    <TableCell className="providers-cell-website">
                       {row.website ? (
                         <a href={row.website} target="_blank" rel="noreferrer">Open</a>
                       ) : '-'}
                     </TableCell>
-                    <TableCell><StatusPill status={row.status || 'active'} /></TableCell>
+                    <TableCell className="providers-cell-status"><StatusPill status={row.status || 'active'} /></TableCell>
+                    <TableCell className="providers-cell-profile">
+                      <Button size="sm" variant="secondary" onClick={() => setSelectedProviderId(row.provider_id)}>
+                        View
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
+            <div className="pagination-bar">
+              <div className="row-subtitle">Page {page} of {totalPages}</div>
+              <Button variant="secondary" size="sm" disabled={page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>
+                Previous
+              </Button>
+              <Button variant="secondary" size="sm" disabled={page >= totalPages} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>
+                Next
+              </Button>
+            </div>
           </>
         )}
       </Card>
+
+      {selectedProviderId ? (
+        <Card title="Provider Profile">
+          {providerDetailQuery.isLoading ? (
+            <LoadingState label="Loading provider profile..." />
+          ) : providerDetailQuery.error ? (
+            <EmptyState
+              title="Provider profile unavailable"
+              subtitle={providerDetailQuery.error.message || 'Could not load provider profile.'}
+              action={<Button onClick={() => providerDetailQuery.refetch()}>Retry</Button>}
+            />
+          ) : providerDetail ? (
+            <div className="data-health-stack">
+              <div className="source-freshness-row">
+                <div>
+                  <div className="row-title">{providerLabel(providerDetail.provider)}</div>
+                  <div className="row-subtitle">
+                    {providerDetail.provider.cage ? `CAGE ${providerDetail.provider.cage}` : 'No CAGE'}
+                    {providerDetail.provider.website ? ` | ${providerDetail.provider.website}` : ''}
+                    {providerDetail.provider.email ? ` | ${providerDetail.provider.email}` : ''}
+                  </div>
+                  <div className="row-subtitle">
+                    {providerDetail.provider.canonical_name ? `Canonical ${providerDetail.provider.canonical_name}` : 'Canonical name not set'}
+                    {providerDetail.provider.identity_source ? ` | ${providerDetail.provider.identity_source}` : ''}
+                    {providerDetail.provider.identity_confidence ? ` | ${providerDetail.provider.identity_confidence}%` : ''}
+                  </div>
+                </div>
+                <Badge label={providerDetail.provider.status || 'active'} variant="info" />
+              </div>
+
+              <div className="data-health-metrics">
+                <div className="data-health-metric"><span>Item Links</span><strong>{providerDetail.summary?.item_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Award History</span><strong>{providerDetail.summary?.award_history_count || 0}</strong></div>
+                <div className="data-health-metric"><span>NSN Award Evidence</span><strong>{providerDetail.summary?.nsn_award_evidence_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Catalog References</span><strong>{providerDetail.summary?.catalog_reference_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Agencies</span><strong>{providerDetail.summary?.agency_count || 0}</strong></div>
+                <div className="data-health-metric"><span>Matched Names</span><strong>{providerDetail.summary?.matched_name_count || 0}</strong></div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">Identity</div>
+                  <div className="row-subtitle">Name variants used for matching</div>
+                  {(providerDetail.provider.name_variants || []).length ? (
+                    <div className="badge-stack">
+                      {providerDetail.provider.name_variants.map((value) => <Badge key={value} label={value} variant="info" />)}
+                    </div>
+                  ) : <div className="row-subtitle">No alternate names yet.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Award Rollup</div>
+                  <div className="row-subtitle">Award history {money(providerDetail.award_rollups?.total_award_amount)}</div>
+                  <div className="row-subtitle">NSN award evidence {money(providerDetail.award_rollups?.total_nsn_award_amount)}</div>
+                  <div className="row-subtitle">Latest award {providerDetail.award_rollups?.latest_award_date || 'Not available'}</div>
+                  <div className="row-subtitle">Latest NSN evidence {providerDetail.award_rollups?.latest_nsn_award_date || 'Not available'}</div>
+                </div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">Linked Items</div>
+                  {(providerDetail.items || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.items.slice(0, 8).map((item) => (
+                        <div className="simple-list-row" key={item.provider_item_id || `${item.nsn}-${item.relationship_type}`}>
+                          <div className="row-title">{item.nomenclature || item.nsn || 'Item'}</div>
+                          <div className="row-subtitle">{item.nsn || 'No NSN'}{item.fsc ? ` | FSC ${item.fsc}` : ''} | {item.relationship_type || 'Unknown'} | {item.source || 'Manual'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No linked items.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Award History</div>
+                  {(providerDetail.award_history || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.award_history.slice(0, 8).map((award, index) => (
+                        <div className="simple-list-row" key={`${award.award_id}-${index}`}>
+                          <div className="row-title">{award.nsn || award.award_id || 'Award'}</div>
+                          <div className="row-subtitle">
+                            {award.awarding_agency || 'Unknown agency'} | {award.award_date || 'No date'} | {money(award.award_amount)}
+                            {award.match_reasons?.length ? ` | matched by ${award.match_reasons.join(', ')}` : ''}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No award history linked yet.</div>}
+                </div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">NSN Award Evidence</div>
+                  {(providerDetail.nsn_award_evidence || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.nsn_award_evidence.slice(0, 8).map((award, index) => (
+                        <div className="simple-list-row" key={`${award.award_id}-${index}`}>
+                          <div className="row-title">{award.nsn || award.award_id || 'Evidence row'}</div>
+                          <div className="row-subtitle">{award.match_confidence || 'unknown'}{award.match_reasons?.length ? ` | ${award.match_reasons.slice(0, 2).join(', ')}` : ''}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No standalone NSN award evidence yet.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Catalog References</div>
+                  {(providerDetail.catalog_references || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.catalog_references.slice(0, 8).map((reference, index) => (
+                        <div className="simple-list-row" key={`${reference.nsn}-${reference.part_number}-${index}`}>
+                          <div className="row-title">{reference.part_number || reference.nsn || 'Reference'}</div>
+                          <div className="row-subtitle">{reference.nsn || 'No NSN'} | {reference.relationship_type || reference.reference_type || 'Reference'} | {reference.source_name || 'PUB LOG'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No catalog references linked yet.</div>}
+                </div>
+              </div>
+
+              <div className="provider-grid">
+                <div className="settings-summary-box">
+                  <div className="row-title">Top Agencies</div>
+                  {(providerDetail.award_rollups?.top_agencies || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.award_rollups.top_agencies.map((row) => (
+                        <div className="simple-list-row" key={row.name}>
+                          <div className="row-title">{row.name}</div>
+                          <div className="row-subtitle">{row.count} linked awards</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No agency rollup yet.</div>}
+                </div>
+
+                <div className="settings-summary-box">
+                  <div className="row-title">Linked NSNs</div>
+                  {(providerDetail.award_rollups?.top_nsns || []).length ? (
+                    <div className="simple-list">
+                      {providerDetail.award_rollups.top_nsns.map((row) => (
+                        <div className="simple-list-row" key={row.name}>
+                          <div className="row-title">{row.name}</div>
+                          <div className="row-subtitle">{row.count} award links</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="row-subtitle">No linked NSN rollup yet.</div>}
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </Card>
+      ) : null}
     </div>
   )
 }

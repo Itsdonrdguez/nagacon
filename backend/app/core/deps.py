@@ -1,9 +1,10 @@
 from types import SimpleNamespace
 
-from fastapi import Depends, Header
+from fastapi import Cookie, Depends, Header, HTTPException, status
 
 from app.core.db import SessionLocal
-from app.services.auth_service import get_or_create_user_by_email
+from app.core.config import settings
+from app.services.auth_service import SESSION_COOKIE_NAME, get_or_create_user_by_email, get_user_by_session_token
 from app.services.org_service import ensure_default_organization
 
 def get_db():
@@ -14,10 +15,21 @@ def get_db():
         db.close()
 
 
-def get_current_user(
+def _dev_auth_fallback_enabled() -> bool:
+    return bool(getattr(settings, "DEV_AUTH_FALLBACK_ENABLED", True))
+
+
+def get_optional_user(
     db=Depends(get_db),
     x_user_email: str | None = Header(default=None, alias="X-User-Email"),
+    x_session_token: str | None = Header(default=None, alias="X-Session-Token"),
+    session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ):
+    session_user = get_user_by_session_token(db, x_session_token or session_token)
+    if session_user:
+        return session_user
+    if not _dev_auth_fallback_enabled():
+        return None
     user = get_or_create_user_by_email(db, x_user_email)
     if user:
         return user
@@ -33,9 +45,17 @@ def get_current_user(
     )
 
 
-def get_current_organization(
+def get_current_user(
+    current_user=Depends(get_optional_user),
+):
+    if current_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    return current_user
+
+
+def get_optional_organization(
     db=Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_optional_user),
 ):
     org = ensure_default_organization(db)
     if current_user is not None and getattr(current_user, "organization_id", None) and org is not None:
@@ -51,3 +71,10 @@ def get_current_organization(
         slug="default",
         is_default=True,
     )
+
+
+def get_current_organization(
+    current_org=Depends(get_optional_organization),
+    current_user=Depends(get_current_user),
+):
+    return current_org

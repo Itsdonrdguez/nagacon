@@ -12,6 +12,7 @@ from alembic import context
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # adds backend/ to path
 
 from app.core.db import Base
+from app.core.db import normalize_database_url
 import app.models.opportunity  # ensures models are registered
 import app.models  # ensures all models are registered
 # -----------------------
@@ -20,6 +21,10 @@ import app.models  # ensures all models are registered
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+
+database_url = os.getenv("DATABASE_URL")
+if database_url:
+    config.set_main_option("sqlalchemy.url", normalize_database_url(database_url))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

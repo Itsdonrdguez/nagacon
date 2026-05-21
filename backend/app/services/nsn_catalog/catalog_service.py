@@ -81,6 +81,8 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
     nsn_awards = summarize_nsn_award_evidence(db, target.nsn)
     pricing = _price_summary(db, target)
     identity_confidence = _identity_confidence(master, references)
+    related_masters = _related_master_map(db, interchangeability)
+    alternate_graph = _alternate_graph(target, references, interchangeability, evidence, providers, vendor_recommendations, related_masters)
 
     return {
         "status": "ok",
@@ -118,9 +120,12 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
         ],
         "providers": providers,
         "vendor_recommendations": vendor_recommendations,
+        "cage_profiles": _cage_profiles(references, evidence),
         "award_history": awards,
         "nsn_award_evidence": nsn_awards,
         "pricing": pricing,
+        "alternate_graph": alternate_graph,
+        "source_freshness": _source_freshness(master, references, evidence, snapshot),
         "evidence": [
             _model_dict(row, [
                 "claim_type",
@@ -146,6 +151,90 @@ def get_nsn_catalog_summary(db: Session, value: str) -> dict[str, Any]:
         "snapshot": snapshot.summary_json if snapshot else None,
         "next_actions": _next_actions(master, references, providers, awards),
     }
+
+
+def _source_freshness(
+    master: NsnMaster | None,
+    references: list[NsnReference],
+    evidence: list[NsnEvidence],
+    snapshot: NsnIntelligenceSnapshot | None,
+) -> dict[str, Any]:
+    publog_versions = sorted(
+        {
+            value
+            for value in [getattr(master, "source_version", None), *[getattr(row, "source_version", None) for row in references]]
+            if value
+        }
+    )
+    latest_catalog_at = max(
+        [value for value in [getattr(master, "updated_at", None), *[getattr(row, "updated_at", None) for row in references]] if value],
+        default=None,
+    )
+    latest_evidence_at = max([getattr(row, "updated_at", None) for row in evidence if getattr(row, "updated_at", None)], default=None)
+    return {
+        "publog_source_version": publog_versions[-1] if publog_versions else None,
+        "catalog_updated_at": latest_catalog_at.isoformat() if latest_catalog_at else None,
+        "evidence_updated_at": latest_evidence_at.isoformat() if latest_evidence_at else None,
+        "latest_snapshot_generated_at": snapshot.generated_at.isoformat() if snapshot and snapshot.generated_at else None,
+        "source_labels": {
+            "catalog": "official_publog",
+            "awards": "usaspending_api",
+            "providers": "organization_scoped",
+        },
+    }
+
+
+def _cage_profiles(references: list[NsnReference], evidence: list[NsnEvidence]) -> list[dict[str, Any]]:
+    by_cage: dict[str, dict[str, Any]] = {}
+    for row in references:
+        cage = (row.cage or "").strip()
+        if not cage:
+            continue
+        profile = by_cage.setdefault(
+            cage,
+            {
+                "cage": cage,
+                "company_name": row.company_name,
+                "part_numbers": [],
+                "source": row.source_name,
+                "source_version": row.source_version,
+                "confidence": row.confidence,
+                "official_profile": None,
+            },
+        )
+        if row.company_name and not profile.get("company_name"):
+            profile["company_name"] = row.company_name
+        if row.part_number and row.part_number not in profile["part_numbers"]:
+            profile["part_numbers"].append(row.part_number)
+    for row in evidence:
+        if row.claim_type != "cage_profile" or not row.claim_value:
+            continue
+        profile = by_cage.setdefault(
+            row.claim_value,
+            {
+                "cage": row.claim_value,
+                "company_name": None,
+                "part_numbers": [],
+                "source": row.source_name,
+                "source_version": row.source_version,
+                "confidence": row.confidence,
+                "official_profile": None,
+            },
+        )
+        payload = row.raw_payload or {}
+        profile["official_profile"] = {
+            "company": payload.get("COMPANY"),
+            "status": payload.get("CAGE_STATUS"),
+            "type": payload.get("TYPE"),
+            "city": payload.get("CITY"),
+            "state": payload.get("STATE_PROVINCE"),
+            "country": payload.get("COUNTRY"),
+            "zip": payload.get("ZIP_POSTAL_ZONE"),
+            "cao": payload.get("CAO"),
+            "source": row.source_name,
+        }
+        profile["company_name"] = profile.get("company_name") or payload.get("COMPANY")
+    return sorted(by_cage.values(), key=lambda item: item.get("cage") or "")
 
 
 def _identity_payload(master: NsnMaster | None, target: NormalizedNsn) -> dict[str, Any]:
@@ -309,3 +398,104 @@ def _next_actions(
     if not actions:
         actions.append("Review evidence and confidence before using the vendor shortlist for bid outreach.")
     return actions
+
+
+def _alternate_graph(
+    target: NormalizedNsn,
+    references: list[NsnReference],
+    interchangeability: list[NsnInterchangeability],
+    evidence: list[NsnEvidence],
+    providers: list[dict[str, Any]],
+    vendor_recommendations: list[dict[str, Any]],
+    related_masters: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    part_numbers = []
+    cages = []
+    related_nodes = []
+    for row in references:
+        if row.part_number:
+            part_numbers.append({
+                "part_number": row.part_number,
+                "cage": row.cage,
+                "company_name": row.company_name,
+                "source": row.source_name,
+                "relationship_type": row.relationship_type,
+            })
+        if row.cage:
+            cages.append({
+                "cage": row.cage,
+                "company_name": row.company_name,
+                "source": row.source_name,
+            })
+    for row in interchangeability:
+        related_master = related_masters.get(row.related_compact_nsn or "", {})
+        related_nodes.append({
+            "node_type": "nsn" if not str(row.related_nsn or "").startswith("INC-") else "related_inc",
+            "related_value": row.related_nsn,
+            "related_compact": row.related_compact_nsn,
+            "related_item_name": related_master.get("item_name") or row.notes,
+            "related_fsc": related_master.get("fsc"),
+            "relationship_type": row.relationship_type,
+            "notes": row.notes,
+            "source": row.source_name,
+            "confidence": row.confidence,
+        })
+    for row in evidence:
+        if row.claim_type == "related_item_concept":
+            related_nodes.append({
+                "node_type": "related_item_concept",
+                "related_value": row.claim_value,
+                "related_compact": None,
+                "relationship_type": "related_item_concept",
+                "notes": row.evidence_text,
+                "source": row.source_name,
+                "confidence": row.confidence,
+            })
+    return {
+        "root_nsn": target.nsn,
+        "part_numbers": _dedupe_dicts(part_numbers, ["part_number", "cage", "source"]),
+        "cages": _dedupe_dicts(cages, ["cage", "source"]),
+        "related_nodes": _dedupe_dicts(related_nodes, ["related_value", "relationship_type", "source"]),
+        "actual_related_nsn_count": len([row for row in related_nodes if row.get("node_type") == "nsn"]),
+        "concept_only_count": len([row for row in related_nodes if row.get("node_type") != "nsn"]),
+        "provider_count": len(providers),
+        "vendor_candidate_count": len(vendor_recommendations),
+    }
+
+
+def _dedupe_dicts(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        token = "|".join(str(row.get(key) or "") for key in keys)
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(row)
+    return out
+
+
+def _related_master_map(db: Session, interchangeability: list[NsnInterchangeability]) -> dict[str, dict[str, Any]]:
+    related_compacts = sorted(
+        {
+            row.related_compact_nsn
+            for row in interchangeability
+            if row.related_compact_nsn and len(str(row.related_compact_nsn)) == 13
+        }
+    )
+    if not related_compacts:
+        return {}
+    rows = (
+        db.query(NsnMaster)
+        .filter(NsnMaster.compact_nsn.in_(related_compacts))
+        .all()
+    )
+    return {
+        row.compact_nsn: {
+            "nsn": row.nsn,
+            "compact_nsn": row.compact_nsn,
+            "item_name": row.item_name,
+            "fsc": row.fsc,
+        }
+        for row in rows
+    }

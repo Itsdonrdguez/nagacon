@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class OpportunityFileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     opportunity_id: int
     file_type: str
@@ -17,12 +19,14 @@ class OpportunityFileOut(BaseModel):
     processing_status: str | None = None
     document_type: str | None = None
     review_required: bool = False
-
-    class Config:
-        from_attributes = True
-
+    storage_class: str | None = None
+    retention_status: str | None = None
+    retention_reason: str | None = None
+    prune_eligible: bool = False
 
 class OpportunityFileInsightsOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     opportunity_id: int
     file_type: str
@@ -37,6 +41,7 @@ class OpportunityFileInsightsOut(BaseModel):
     processing_status: str | None = None
     document_type: str | None = None
     review_required: bool = False
-
-    class Config:
-        from_attributes = True
+    storage_class: str | None = None
+    retention_status: str | None = None
+    retention_reason: str | None = None
+    prune_eligible: bool = False

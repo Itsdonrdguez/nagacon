@@ -2,10 +2,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.services.nsn_catalog.normalizer import normalize_nsn
+from app.services.nsn_catalog.catalog_service import _alternate_graph
+from app.services.nsn_catalog.publog_decomp import _resolve_related_nsn_candidates
 from app.services.nsn_catalog.publog_importer import parse_publog_csv, parse_publog_row
 from app.services.nsn_catalog.provider_seeding import (
     catalog_reference_confidence,
     catalog_reference_role,
+    provider_payload_from_award_evidence,
     provider_payload_from_reference,
 )
 from app.services.nsn_catalog.vendor_recommendations import build_vendor_recommendations
@@ -84,6 +87,26 @@ def test_parse_publog_csv_handles_interchangeability_headers():
     assert rows[0].order_of_use == "1"
 
 
+def test_resolve_related_nsn_candidates_maps_related_inc_to_actual_nsns():
+    rows = _resolve_related_nsn_candidates(
+        "6515016462617",
+        [{"RELATED_INC": "35972", "ITEM_NAME": "TEST KIT,THEOPHYLLINE DETERMINAT"}],
+        {
+            "35972": [
+                {"FSC": "6550", "NIIN": "014856112", "INC": "35972", "ITEM_NAME": "TEST KIT,THEOPHYLLINE DETERMINAT"},
+                {"FSC": "6550", "NIIN": "014858613", "INC": "35972", "ITEM_NAME": "TEST KIT,THEOPHYLLINE DETERMINAT"},
+            ]
+        },
+    )
+
+    assert [row["related_nsn"] for row in rows] == [
+        "6550-01-485-6112",
+        "6550-01-485-8613",
+    ]
+    assert all(row["relationship_type"] == "related_item_concept_nsn" for row in rows)
+    assert all(row["related_inc"] == "35972" for row in rows)
+
+
 def test_provider_payload_from_catalog_reference_labels_oem_candidate():
     reference = SimpleNamespace(
         nsn="4110-01-534-2682",
@@ -110,6 +133,35 @@ def test_provider_payload_from_catalog_reference_labels_oem_candidate():
     assert payload.item.source == "PUB_LOG"
     assert payload.item.confidence == 95.0
     assert "PN-123" in payload.item.notes
+
+
+def test_provider_payload_from_award_evidence_labels_confirmed_awardee():
+    award = SimpleNamespace(
+        recipient_name="Acme Defense LLC",
+        recipient_cage="1ABC2",
+        recipient_uei="UEI123",
+        source_system="USAspending",
+        nsn="4110-01-534-2682",
+        fsc="4110",
+        psc_code="4110",
+        award_id="AWD-123",
+        piid="PIID-456",
+        award_date="2025-01-01",
+        award_amount=12500,
+        match_confidence="high",
+        match_reasons=["part_number_match:PN-123", "catalog_manufacturer_match:acme defense"],
+    )
+
+    payload = provider_payload_from_award_evidence(award, item_name="REFRIGERATION UNIT")
+
+    assert payload is not None
+    assert payload.company_name == "Acme Defense LLC"
+    assert payload.cage == "1ABC2"
+    assert payload.item is not None
+    assert payload.item.relationship_type == "Confirmed Awardee"
+    assert payload.item.source == "USAspending"
+    assert payload.item.confidence == 95.0
+    assert "Award ID: AWD-123" in (payload.item.notes or "")
 
 
 def test_catalog_reference_role_keeps_weak_reference_distinct():
@@ -203,6 +255,40 @@ def test_vendor_recommendations_merge_catalog_provider_award_and_price(monkeypat
     assert "Price History Supplier" in candidate["roles"]
     assert any(item["type"] == "catalog_reference" for item in candidate["evidence"])
     assert any(item["type"] == "award_history" for item in candidate["evidence"])
+
+
+def test_alternate_graph_includes_named_related_nsns():
+    graph = _alternate_graph(
+        normalize_nsn("6515016462617"),
+        references=[],
+        interchangeability=[
+            SimpleNamespace(
+                related_nsn="6550-01-485-6112",
+                related_compact_nsn="6550014856112",
+                relationship_type="related_item_concept_nsn",
+                notes="TEST KIT,THEOPHYLLINE DETERMINAT",
+                source_name="PUB_LOG_V_H6_RELATED",
+                confidence=0.72,
+            )
+        ],
+        evidence=[],
+        providers=[],
+        vendor_recommendations=[],
+        related_masters={
+            "6550014856112": {
+                "nsn": "6550-01-485-6112",
+                "compact_nsn": "6550014856112",
+                "item_name": "TEST KIT,THEOPHYLLINE DETERMINAT",
+                "fsc": "6550",
+            }
+        },
+    )
+
+    assert graph["actual_related_nsn_count"] == 1
+    assert graph["concept_only_count"] == 0
+    assert graph["related_nodes"][0]["related_value"] == "6550-01-485-6112"
+    assert graph["related_nodes"][0]["related_item_name"] == "TEST KIT,THEOPHYLLINE DETERMINAT"
+    assert graph["related_nodes"][0]["related_fsc"] == "6550"
 
 
 def test_usaspending_context_expands_with_catalog_references():
@@ -340,12 +426,78 @@ def test_refresh_nsn_intelligence_stores_snapshot(monkeypatch):
             "next_actions": ["Import or refresh PUB LOG catalog data for this NSN."],
         },
     )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_catalog",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 1, "updated": 0},
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_award_evidence",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 2, "updated": 1},
+    )
 
-    result = refresh_nsn_intelligence(FakeDB(), "4110015342682", run_usaspending=True)
+    result = refresh_nsn_intelligence(FakeDB(), "4110015342682", run_usaspending=True, seed_providers=True)
 
     assert result["status"] == "ok"
     assert result["snapshot_id"] == 42
     assert result["nsn"] == "4110-01-534-2682"
     assert result["summary"]["usaspending"]["awards_found"] == 0
+    assert result["summary"]["provider_seed"]["inserted"] == 1
+    assert result["summary"]["award_provider_seed"]["inserted"] == 2
+    assert result["confidence"]["award_providers_inserted"] == 2
     assert snapshots[0].compact_nsn == "4110015342682"
     assert snapshots[0].source_scope == "refresh"
+
+
+def test_refresh_nsn_intelligence_handles_usaspending_timeout(monkeypatch):
+    snapshots = []
+
+    class FakeDB:
+        def add(self, item):
+            snapshots.append(item)
+
+        def commit(self):
+            snapshots[-1].id = 77
+
+        def refresh(self, item):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.search_usaspending_for_nsn",
+        lambda db, nsn, limit=50: (_ for _ in ()).throw(__import__("requests").exceptions.ConnectTimeout("timed out")),
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.get_nsn_catalog_summary",
+        lambda db, nsn: {
+            "target": {"nsn": "4110-01-534-2682", "compact_nsn": "4110015342682"},
+            "identity": {"status": "not_in_local_catalog"},
+            "references": [],
+            "interchangeability": [],
+            "vendor_recommendations": [],
+            "providers": [],
+            "award_history": {"count": 0},
+            "pricing": {"count": 0},
+            "confidence": {"identity": "low"},
+            "next_actions": ["Import or refresh PUB LOG catalog data for this NSN."],
+        },
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_catalog",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 1, "updated": 0},
+    )
+    monkeypatch.setattr(
+        "app.services.nsn_catalog.refresh.seed_providers_from_nsn_award_evidence",
+        lambda db, nsn, organization_id=None, limit=50: {"status": "ok", "inserted": 0, "updated": 0},
+    )
+
+    result = __import__("app.services.nsn_catalog.refresh", fromlist=["refresh_nsn_intelligence"]).refresh_nsn_intelligence(
+        FakeDB(),
+        "4110015342682",
+        run_usaspending=True,
+        seed_providers=True,
+    )
+
+    assert result["status"] == "partial_success"
+    assert result["snapshot_id"] == 77
+    assert result["summary"]["usaspending"] is None
+    assert "ConnectTimeout" in result["summary"]["usaspending_error"]
+    assert result["errors"]

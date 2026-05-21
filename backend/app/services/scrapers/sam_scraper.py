@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -8,8 +9,12 @@ import requests
 
 from app.core.config import settings
 from app.schemas.opportunity import RawOpportunity
+from app.utils.set_asides import normalize_set_aside
 
 logger = logging.getLogger(__name__)
+TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
+SAM_MAX_ATTEMPTS = 3
+SAM_RETRY_BACKOFF_SECONDS = 1.5
 
 
 class SamScraperError(Exception):
@@ -57,6 +62,19 @@ def _extract_agency(opp: dict[str, Any]) -> str | None:
     return _safe(opp.get("fullParentPathName") or opp.get("department") or opp.get("agency"))
 
 
+def _extract_set_aside(opp: dict[str, Any]) -> str | None:
+    for key in (
+        "typeOfSetAsideDescription",
+        "typeOfSetAside",
+        "setAsideType",
+        "setAside",
+    ):
+        value = _safe(opp.get(key))
+        if value:
+            return normalize_set_aside(value)
+    return None
+
+
 def _normalize_opp(opp: dict[str, Any]) -> RawOpportunity:
     source_id = _safe(opp.get("noticeId") or opp.get("id") or opp.get("opportunityId"))
     solicitation_number = _safe(
@@ -72,6 +90,7 @@ def _normalize_opp(opp: dict[str, Any]) -> RawOpportunity:
         agency=_extract_agency(opp),
         posted_at=opp.get("postedDate") or opp.get("postedOn") or opp.get("publishDate"),
         due_at=opp.get("responseDeadLine") or opp.get("responseDate") or opp.get("archiveDate"),
+        set_aside_type=_extract_set_aside(opp),
         naics_code=_extract_naics(opp),
         fsc_code=_safe(opp.get("classificationCode") or opp.get("pscCode")),
         description=_extract_description(opp),
@@ -138,6 +157,48 @@ def _redact_query_params(query_params: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _request_sam_with_retries(base_url: str, *, query_params: dict[str, Any], headers: dict[str, str]):
+    last_response = None
+    last_exc: Exception | None = None
+    for attempt in range(1, SAM_MAX_ATTEMPTS + 1):
+        response = None
+        try:
+            response = requests.get(base_url, params=query_params, headers=headers, timeout=30)
+            last_response = response
+            response.raise_for_status()
+            return response
+        except requests.HTTPError as exc:
+            last_exc = exc
+            status_code = getattr(response, "status_code", None)
+            if status_code not in TRANSIENT_STATUS_CODES or attempt >= SAM_MAX_ATTEMPTS:
+                break
+            logger.warning(
+                "Transient SAM HTTP %s on attempt %s/%s for params=%s",
+                status_code,
+                attempt,
+                SAM_MAX_ATTEMPTS,
+                _redact_query_params(query_params),
+            )
+            time.sleep(SAM_RETRY_BACKOFF_SECONDS * attempt)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= SAM_MAX_ATTEMPTS:
+                break
+            logger.warning(
+                "Transient SAM request error on attempt %s/%s for params=%s: %s",
+                attempt,
+                SAM_MAX_ATTEMPTS,
+                _redact_query_params(query_params),
+                exc.__class__.__name__,
+            )
+            time.sleep(SAM_RETRY_BACKOFF_SECONDS * attempt)
+    if last_exc:
+        raise last_exc
+    if last_response is not None:
+        return last_response
+    raise SamScraperError(f"SAM request could not be started. params={_redact_query_params(query_params)}")
+
+
 def fetch_sam_opportunities(params: Optional[Dict] = None) -> List[RawOpportunity]:
     params = params or {}
     api_key = params.get("api_key") or getattr(settings, "SAM_API_KEY", None)
@@ -153,17 +214,24 @@ def fetch_sam_opportunities(params: Optional[Dict] = None) -> List[RawOpportunit
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
 
+    response = None
     try:
-        response = requests.get(base_url, params=query_params, headers=headers, timeout=30)
-        response.raise_for_status()
+        response = _request_sam_with_retries(base_url, query_params=query_params, headers=headers)
     except requests.HTTPError as exc:
+        response = getattr(exc, "response", None) or response
         detail = None
         try:
             detail = response.text[:1000]
         except Exception:
             detail = None
+        status_code = getattr(response, "status_code", "error")
+        if status_code in TRANSIENT_STATUS_CODES:
+            raise SamScraperError(
+                f"SAM request failed after retries with transient HTTP {status_code}. "
+                f"params={_redact_query_params(query_params)}. response={detail}"
+            ) from exc
         raise SamScraperError(
-            f"SAM request failed with HTTP {getattr(response, 'status_code', 'error')}. "
+            f"SAM request failed with HTTP {status_code}. "
             f"params={_redact_query_params(query_params)}. response={detail}"
         ) from exc
     except Exception as exc:

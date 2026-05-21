@@ -1,11 +1,24 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.dibbs_adapter import pull_dibbs_by_fsc
+from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
 from app.services.opportunity_store import upsert_opportunity
 
-router = APIRouter(prefix="/api/dibbs", tags=["dibbs"])
+router = APIRouter(
+    prefix="/api/dibbs",
+    tags=["dibbs"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 @router.post("/preview")
 def preview(payload: dict):
@@ -36,9 +49,22 @@ def pull(payload: dict, db: Session = Depends(get_db)):
     items, diag = pull_dibbs_by_fsc(fsc=fsc, limit=limit, debug=False)
 
     n = 0
+    opportunity_ids: list[int] = []
     for it in items:
-        upsert_opportunity(db, it)
+        opp = upsert_opportunity(db, it)
+        if getattr(opp, "id", None):
+            opportunity_ids.append(opp.id)
         n += 1
     db.commit()
+    opportunity_ids = [opp_id for opp_id in opportunity_ids if opp_id]
 
-    return {"inserted_or_updated": n, "diagnostic": diag}
+    enrichment = None
+    if _as_bool(payload.get("auto_enrich_parts"), True) and opportunity_ids:
+        enrichment = enrich_dibbs_opportunities_after_ingest(
+            db,
+            opportunity_ids,
+            queue_nsn_build=_as_bool(payload.get("queue_nsn_build"), False),
+            max_items=len(opportunity_ids),
+        )
+
+    return {"inserted_or_updated": n, "diagnostic": diag, "part_finder_enrichment": enrichment}

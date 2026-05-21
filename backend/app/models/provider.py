@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -24,6 +25,10 @@ class Provider(Base):
     phone: Mapped[str | None] = mapped_column(String(80), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="active", server_default="active", index=True)
+    canonical_name: Mapped[str | None] = mapped_column(String(300), index=True, nullable=True)
+    identity_source: Mapped[str | None] = mapped_column(String(100), index=True, nullable=True)
+    identity_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aliases: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

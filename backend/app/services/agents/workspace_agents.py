@@ -15,22 +15,97 @@ from app.models.opportunity import Opportunity
 from app.models.opportunity_file import OpportunityFile
 from app.models.vendor import VendorLead, VendorQuote
 from app.models.workspace import WorkspaceTask
+from app.repositories.company import CompanyRepository
+from app.services.nsn_catalog.publog_reference_service import search_publog_reference
 from app.services.provider_settings_service import get_effective_openai_api_key, get_effective_openai_model
+from app.services.pricing_intelligence import summarize_price_history
 from app.services.recommendation_engine import build_workspace_recommendation, upsert_recommendation_analysis
 from app.services.research.usaspending_research_service import search_usaspending_for_opportunity
+from app.services.sam_capability_match import build_capability_match
+from app.services.solicitation_memory import build_solicitation_memory
 from app.services.workspace_service import build_research_profile, create_artifact, ensure_parsed, extract_solicitation_poc
 from app.utils.solicitation_status import derive_solicitation_status
+from app.utils.utc import utcnow_iso
 
+
+AGENT_REGISTRY: dict[str, dict[str, Any]] = {
+    "solicitation_analyst": {
+        "label": "Solicitation Analyst",
+        "description": "Reads the solicitation, summarizes what is being bought, and highlights risks, gaps, and next steps.",
+        "phase": "phase_1",
+        "legacy_keys": ["opportunity_analyst"],
+        "focus": "opportunity analysis",
+    },
+    "compliance_reviewer": {
+        "label": "Compliance Reviewer",
+        "description": "Reviews the loaded notice and documents, extracts requirements, and flags missing submission details.",
+        "phase": "phase_1",
+        "legacy_keys": ["compliance_document"],
+        "focus": "document review",
+    },
+    "market_researcher": {
+        "label": "Market Researcher",
+        "description": "Looks at vendor leads, USAspending history, and market context to support bid decisions.",
+        "phase": "phase_1",
+        "legacy_keys": ["vendor_research"],
+        "focus": "market intelligence",
+    },
+    "capability_matcher": {
+        "label": "Capability Matcher",
+        "description": "Compares the opportunity against your company profile, target codes, and capability signals.",
+        "phase": "phase_1",
+        "legacy_keys": [],
+        "focus": "capability fit",
+    },
+    "outreach_coordinator": {
+        "label": "Outreach Coordinator",
+        "description": "Prepares vendor outreach grounded in the solicitation and the strongest quote targets.",
+        "phase": "phase_2",
+        "legacy_keys": ["email_outreach"],
+        "focus": "vendor outreach",
+    },
+    "proposal_coordinator": {
+        "label": "Proposal Coordinator",
+        "description": "Turns tasks, quotes, and artifacts into a practical execution plan for submission.",
+        "phase": "phase_3",
+        "legacy_keys": ["proposal_workspace"],
+        "focus": "execution planning",
+    },
+}
 
 PHASE_AGENT_MAP: dict[str, list[str]] = {
-    "phase_1": ["opportunity_analyst", "compliance_document", "vendor_research"],
-    "phase_2": ["email_outreach"],
-    "phase_3": ["proposal_workspace"],
+    "phase_1": ["solicitation_analyst", "compliance_reviewer", "market_researcher", "capability_matcher"],
+    "phase_2": ["outreach_coordinator"],
+    "phase_3": ["proposal_coordinator"],
 }
+
+AGENT_ALIAS_MAP: dict[str, str] = {}
+for canonical_key, meta in AGENT_REGISTRY.items():
+    AGENT_ALIAS_MAP[canonical_key] = canonical_key
+    for legacy_key in meta.get("legacy_keys") or []:
+        AGENT_ALIAS_MAP[str(legacy_key)] = canonical_key
 
 
 def _safe_text(value: Any) -> str:
     return "" if value is None else str(value).strip()
+
+
+def resolve_workspace_agent_key(agent_key: str) -> str:
+    key = _safe_text(agent_key).lower()
+    resolved = AGENT_ALIAS_MAP.get(key)
+    if not resolved:
+        raise ValueError(f"Unsupported workspace agent: {agent_key}")
+    return resolved
+
+
+def get_workspace_agent_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        key: {
+            **value,
+            "key": key,
+        }
+        for key, value in AGENT_REGISTRY.items()
+    }
 
 
 def _artifact_payload(artifact) -> dict[str, Any]:
@@ -90,7 +165,7 @@ def _extract_text_requirements(text: str) -> tuple[list[str], list[str]]:
     requirements: list[str] = []
     vendor_asks: list[str] = []
     checks = [
-        ("SMALL BUSINESS SET-ASIDE", "Small business set-aside language is present.", None),
+        ("SMALL BUSINESS SET-ASIDE", "Confirm eligibility for the small business set-aside before shaping the response.", None),
         ("CERT.FOR NAT. DEF.", "National defense certification language is present.", "Confirm any certifications or representations required to quote."),
         ("PLEASE FURNISH QUOTATIONS", "Quote submission instructions are present in the solicitation.", "Confirm the correct quote submission channel and response format."),
         ("ISSUING OFFICE", "The issuing office is referenced in the solicitation.", "Confirm the exact issuing office or email/fax destination for the quote."),
@@ -343,8 +418,99 @@ def _build_extracted_facts_from_pdf(compliance_fields: dict[str, Any]) -> list[d
     return [fact for fact in facts if fact["value"]]
 
 
+def _build_requirement_matrix(
+    *,
+    required_actions: list[str],
+    review_flags: list[str],
+    missing_information: list[str],
+    vendor_request_items: list[str],
+    source_file: str | None,
+) -> list[dict[str, Any]]:
+    matrix: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_row(category: str, requirement: str, status: str, next_action: str, evidence: str | None = None):
+        clean_requirement = _normalize_label(requirement)
+        clean_next_action = _normalize_label(next_action)
+        if not clean_requirement:
+            return
+        key = (category, clean_requirement.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        matrix.append(
+            {
+                "category": category,
+                "requirement": clean_requirement,
+                "status": status,
+                "evidence": _normalize_label(evidence),
+                "next_action": clean_next_action,
+            }
+        )
+
+    for item in required_actions:
+        add_row(
+            "Submission",
+            item,
+            "action_needed",
+            item,
+            source_file or "Primary solicitation document",
+        )
+    for item in review_flags:
+        add_row(
+            "Review",
+            item,
+            "needs_review",
+            item,
+            source_file or "Primary solicitation document",
+        )
+    for item in missing_information:
+        add_row(
+            "Missing",
+            item,
+            "missing",
+            f"Confirm: {item}",
+            source_file or "Current document set",
+        )
+    for item in vendor_request_items:
+        add_row(
+            "Vendor Input",
+            item,
+            "pending_vendor",
+            item,
+            "Vendor quote package",
+        )
+    return matrix
+
+
+def _vendor_history_snapshot(quotes: list[VendorQuote]) -> dict[str, Any]:
+    rows = [
+        {
+            "company_name": lead_name,
+            "cage": _safe_text(getattr(quote, "cage", None)),
+            "status": _safe_text(getattr(quote, "status", None)),
+            "unit_price": float(getattr(quote, "unit_price", None)) if getattr(quote, "unit_price", None) is not None else None,
+            "follow_up_count": int(getattr(quote, "follow_up_count", 0) or 0),
+            "notes": _safe_text(getattr(quote, "notes", None)),
+        }
+        for quote in quotes
+        for lead_name in [_safe_text(getattr(quote, "company_name", None))]
+    ]
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        key = (row.get("status") or "UNKNOWN").upper()
+        status_counts[key] = status_counts.get(key, 0) + 1
+    return {
+        "status_counts": status_counts,
+        "priced_quote_count": sum(1 for row in rows if row.get("unit_price") is not None),
+        "follow_up_total": sum(int(row.get("follow_up_count") or 0) for row in rows),
+        "quotes": rows[:8],
+    }
+
+
 def _build_pdf_required_actions(compliance_fields: dict[str, Any], combined_preview: str) -> list[str]:
     actions: list[str] = []
+    source_file_type = _normalize_label(compliance_fields.get("source_file_type")).upper()
     quantity = _normalize_label(compliance_fields.get("quantity"))
     unit_of_issue = _normalize_label(compliance_fields.get("unit_of_issue"))
     return_by = _normalize_label(compliance_fields.get("return_by"))
@@ -378,6 +544,8 @@ def _build_pdf_required_actions(compliance_fields: dict[str, Any], combined_prev
         actions.append("Review and satisfy the national defense certification language included in the RFQ.")
     if compliance_fields.get("fda_regulated_hint"):
         actions.append("Confirm any FDA-related product compliance or regulatory support required for the item.")
+    if source_file_type == "SAM_NOTICE" and not actions:
+        actions.append("Review the SAM notice and confirm whether a PWS, amendment, or attachment package still needs to be requested or downloaded.")
 
     deduped: list[str] = []
     for item in actions:
@@ -389,6 +557,7 @@ def _build_pdf_required_actions(compliance_fields: dict[str, Any], combined_prev
 
 def _build_pdf_review_flags(compliance_fields: dict[str, Any], combined_preview: str) -> list[str]:
     review_flags: list[str] = []
+    source_file_type = _normalize_label(compliance_fields.get("source_file_type")).upper()
     upper = combined_preview.upper()
     if not compliance_fields.get("return_by"):
         review_flags.append("The response deadline could not be confirmed from the extracted document text.")
@@ -400,6 +569,8 @@ def _build_pdf_review_flags(compliance_fields: dict[str, Any], combined_preview:
         review_flags.append("FOB language appears in the RFQ, but the exact FOB term could not be isolated from the extracted text.")
     if not compliance_fields.get("solicitation_contact_name") and not compliance_fields.get("solicitation_contact_email"):
         review_flags.append("Buyer contact details are incomplete in the extracted document output and should be confirmed.")
+    if source_file_type == "SAM_NOTICE":
+        review_flags.append("The current workspace is based on the SAM notice text, so attachments, PWS files, and amendment details may still be missing.")
 
     deduped: list[str] = []
     for item in review_flags:
@@ -411,18 +582,28 @@ def _build_pdf_review_flags(compliance_fields: dict[str, Any], combined_preview:
 
 def _build_pdf_missing_information(compliance_fields: dict[str, Any], combined_preview: str) -> list[str]:
     missing: list[str] = []
-    if not compliance_fields.get("nsn"):
+    source_file_type = _normalize_label(compliance_fields.get("source_file_type")).upper()
+    solicitation_number = _normalize_label(compliance_fields.get("solicitation_number"))
+    if not compliance_fields.get("nsn") and source_file_type != "SAM_NOTICE":
         missing.append("NSN was not extracted from the available source text.")
     if not compliance_fields.get("nomenclature"):
-        missing.append("Item nomenclature or description needs confirmation from the source package.")
+        if source_file_type == "SAM_NOTICE":
+            missing.append("The service scope or performance description still needs confirmation from the notice package or any follow-on attachments.")
+        else:
+            missing.append("Item nomenclature or description needs confirmation from the source package.")
     if not compliance_fields.get("quantity"):
-        missing.append("Requested quantity is not clearly extracted yet.")
+        if source_file_type == "SAM_NOTICE":
+            missing.append("Deliverable quantities, staffing levels, or service frequencies are not clearly stated yet in the loaded notice text.")
+        else:
+            missing.append("Requested quantity is not clearly extracted yet.")
     if not compliance_fields.get("return_by"):
         missing.append("Return-by date or due date needs confirmation from the solicitation.")
     if "PLEASE FURNISH QUOTATIONS TO THE ISSUING OFFICE" in combined_preview.upper() and "@" not in combined_preview and "FAX" not in combined_preview.upper():
         missing.append("Submission destination is referenced, but the exact office/email/fax should be confirmed from the document.")
     if not compliance_fields.get("source_file"):
         missing.append("No downloaded solicitation file is available for document-grounded review.")
+    if source_file_type == "SAM_NOTICE" and solicitation_number:
+        missing.append(f"The workspace currently relies on the SAM notice for {solicitation_number}; no standalone attachment, PWS, or amendment file has been confirmed yet.")
     deduped: list[str] = []
     for item in missing:
         if item not in deduped:
@@ -470,12 +651,13 @@ def _load_submission_context(db: Session, opp: Opportunity) -> tuple[BidSubmissi
 def _openai_json_enrich(
     *,
     db: Session,
+    user_id: int | None = None,
     system_prompt: str,
     user_context: dict[str, Any],
     fallback_output: dict[str, Any],
     model_name: str | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
-    api_key = get_effective_openai_api_key(db) or getattr(settings, "OPENAI_API_KEY", None)
+    api_key = get_effective_openai_api_key(db, user_id=user_id) or getattr(settings, "OPENAI_API_KEY", None)
     if not api_key:
         return fallback_output, "deterministic_fallback", _fallback_meta("missing_openai_key", "Add a valid OpenAI API key in Settings.")
 
@@ -490,7 +672,7 @@ def _openai_json_enrich(
         f"Context:\n{json.dumps(user_context, indent=2, default=_json_default)}\n\n"
         f"Fallback JSON shape:\n{json.dumps(fallback_output, indent=2, default=_json_default)}"
     )
-    model = model_name or get_effective_openai_model(db) or getattr(settings, "OPENAI_PROPOSAL_MODEL", "gpt-4o-mini")
+    model = model_name or get_effective_openai_model(db, user_id=user_id) or getattr(settings, "OPENAI_PROPOSAL_MODEL", "gpt-4o-mini")
 
     try:
         client = OpenAI(
@@ -527,11 +709,18 @@ def _openai_json_enrich(
         return fallback_output, "deterministic_fallback", _fallback_meta("openai_unknown_error", str(exc))
 
 
-def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
+def _run_opportunity_analyst(db: Session, opp: Opportunity, *, user_id: int | None = None) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp)
     profile = build_research_profile(opp, parsed)
     submission, planned_quote = _load_submission_context(db, opp)
-    recommendation_snapshot = build_workspace_recommendation(db, opp, parsed=parsed, submission=submission)
+    solicitation_memory = build_solicitation_memory(db, opp)
+    recommendation_snapshot = build_workspace_recommendation(
+        db,
+        opp,
+        parsed=parsed,
+        submission=submission,
+        solicitation_memory=solicitation_memory,
+    )
     due_status = derive_solicitation_status(opp.due_at)
     risks = []
     if not profile.get("nsn"):
@@ -543,7 +732,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
 
     fallback_output = {
         "phase": "phase_1",
-        "agent_key": "opportunity_analyst",
+        "agent_key": "solicitation_analyst",
         "summary": {
             "title": profile.get("title"),
             "source": profile.get("source"),
@@ -564,6 +753,11 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
         "blockers": recommendation_snapshot.get("blockers"),
         "bid_posture": recommendation_snapshot.get("bid_posture") or ("research_only" if due_status == "CLOSED" else "evaluate_to_bid"),
         "research_profile": profile,
+        "solicitation_memory": solicitation_memory,
+        "history_signals": solicitation_memory.get("history_signals") or [],
+        "outcome_patterns": solicitation_memory.get("outcome_patterns") or [],
+        "response_patterns": solicitation_memory.get("response_patterns") or [],
+        "agency_patterns": solicitation_memory.get("agency_patterns") or [],
         "workspace_signals": recommendation_snapshot.get("workspace_signals"),
         "planned_vendor": {
             "company_name": getattr(submission, "planned_vendor_name", None) or getattr(planned_quote, "company_name", None),
@@ -578,7 +772,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
         ],
         "recommended_next_actions": recommendation_snapshot.get("next_actions") or profile.get("recommended_actions", []),
         "recommendation_snapshot": recommendation_snapshot,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     fallback_output["gaps"] = [item for item in fallback_output["gaps"] if item]
     context = {
@@ -586,6 +780,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
         "research_profile": profile,
         "parsed_json": parsed,
         "recommendation_snapshot": recommendation_snapshot,
+        "solicitation_memory": solicitation_memory,
         "submission": {
             "status": getattr(submission, "status", None),
             "planned_vendor_name": getattr(submission, "planned_vendor_name", None),
@@ -595,6 +790,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
     }
     output, model_name, provider_meta = _openai_json_enrich(
         db=db,
+        user_id=user_id,
         system_prompt=(
             "You are an opportunity analyst for a government contracting workspace. "
             "Produce a concise, evidence-based analysis with clear risks, gaps, bid posture, and next actions."
@@ -619,7 +815,12 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
     output["executive_assessment"] = output.get("executive_assessment") or recommendation_snapshot.get("summary")
     output["risks"] = list(dict.fromkeys((output.get("risks") or []) + list(recommendation_snapshot.get("blockers") or [])))
     output["gaps"] = list(dict.fromkeys((output.get("gaps") or []) + list(recommendation_snapshot.get("blockers") or [])))[:8]
-    output["generated_at"] = output.get("generated_at") or datetime.utcnow().isoformat()
+    output["solicitation_memory"] = output.get("solicitation_memory") or solicitation_memory
+    output["history_signals"] = output.get("history_signals") or solicitation_memory.get("history_signals") or []
+    output["outcome_patterns"] = output.get("outcome_patterns") or solicitation_memory.get("outcome_patterns") or []
+    output["response_patterns"] = output.get("response_patterns") or solicitation_memory.get("response_patterns") or []
+    output["agency_patterns"] = output.get("agency_patterns") or solicitation_memory.get("agency_patterns") or []
+    output["generated_at"] = output.get("generated_at") or utcnow_iso()
     output["model_name"] = model_name
     output.update(provider_meta)
     upsert_recommendation_analysis(db, opp.id, recommendation_snapshot, ai_summary=output.get("executive_assessment"))
@@ -634,7 +835,7 @@ def _run_opportunity_analyst(db: Session, opp: Opportunity) -> dict[str, Any]:
     return {"output": output, "artifact": _artifact_payload(artifact), "model_name": model_name, **provider_meta}
 
 
-def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
+def _run_compliance_document_agent(db: Session, opp: Opportunity, *, user_id: int | None = None) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp)
     files = (
         db.query(OpportunityFile)
@@ -683,10 +884,17 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, A
     missing_information = _build_pdf_missing_information(compliance_fields, combined_preview)
     review_flags = _build_pdf_review_flags(compliance_fields, combined_preview)
     vendor_request_items = _build_vendor_request_items_from_pdf(compliance_fields, combined_preview)
+    requirement_matrix = _build_requirement_matrix(
+        required_actions=required_actions or text_requirements,
+        review_flags=review_flags,
+        missing_information=missing_information,
+        vendor_request_items=vendor_request_items + text_vendor_asks,
+        source_file=source_file,
+    )
 
     fallback_output = {
         "phase": "phase_1",
-        "agent_key": "compliance_document",
+        "agent_key": "compliance_reviewer",
         "document_count": len(files),
         "document_insights": document_insights,
         "source_basis": "pdf_document_extraction",
@@ -707,10 +915,11 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, A
         "missing_information": missing_information,
         "review_flags": review_flags,
         "vendor_request_items": vendor_request_items + text_vendor_asks,
+        "requirement_matrix": requirement_matrix,
         "risks": [
             "Document extraction may be incomplete for scanned or image-based PDFs." if files else "No files have been downloaded for compliance review yet."
         ] + review_flags,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     fallback_output["submission_requirements"] = list(dict.fromkeys([item for item in fallback_output["submission_requirements"] if item]))
     fallback_output["required_actions"] = list(dict.fromkeys([item for item in fallback_output["required_actions"] if item]))
@@ -730,6 +939,7 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, A
     }
     output, model_name, provider_meta = _openai_json_enrich(
         db=db,
+        user_id=user_id,
         system_prompt=(
             "You are a compliance and document review analyst for government solicitations. "
             "Use only the provided PDF-derived document text and document insights. "
@@ -739,7 +949,8 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, A
         user_context=context,
         fallback_output=fallback_output,
     )
-    output["generated_at"] = output.get("generated_at") or datetime.utcnow().isoformat()
+    output["generated_at"] = output.get("generated_at") or utcnow_iso()
+    output["requirement_matrix"] = output.get("requirement_matrix") or requirement_matrix
     output["model_name"] = model_name
     output.update(provider_meta)
     artifact = create_artifact(
@@ -753,6 +964,7 @@ def _run_compliance_document_agent(db: Session, opp: Opportunity) -> dict[str, A
 
 
 def _run_vendor_research_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
+    parsed = ensure_parsed(db, opp)
     research = search_usaspending_for_opportunity(opp, db=db)
     leads = (
         db.query(VendorLead)
@@ -760,6 +972,31 @@ def _run_vendor_research_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
         .order_by(VendorLead.confidence.desc())
         .all()
     )
+    quotes = (
+        db.query(VendorQuote)
+        .filter(VendorQuote.opportunity_id == opp.id)
+        .order_by(VendorQuote.updated_at.desc(), VendorQuote.id.desc())
+        .all()
+    )
+    price_history = summarize_price_history(db, opp.id)
+    publog_rows: list[dict[str, Any]] = []
+    nsn = _safe_text(parsed.get("nsn"))
+    if nsn:
+        try:
+            publog_rows = (
+                search_publog_reference(
+                    db,
+                    dataset="references",
+                    mode="manufacturer_candidates",
+                    nsn=nsn,
+                    limit=10,
+                ).get("rows")
+                or []
+            )
+        except Exception:
+            db.rollback()
+            publog_rows = []
+
     top_leads = [
         {
             "id": lead.id,
@@ -772,14 +1009,83 @@ def _run_vendor_research_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
         }
         for lead in leads[:10]
     ]
+    vendor_history = _vendor_history_snapshot(quotes)
+    likely_vendors = (research.get("likely_vendors") or [])[:8]
+    award_history_summary = {
+        "awards_found": int(research.get("awards_found") or 0),
+        "history_match_label": research.get("history_match_label"),
+        "history_match_source": research.get("history_match_source"),
+        "top_vendors": [
+            {
+                "vendor": item.get("vendor"),
+                "cage": item.get("cage"),
+                "award_count": item.get("award_count"),
+                "total_award_amount": item.get("total_award_amount"),
+                "score": item.get("score"),
+                "why_matched": item.get("why_matched") or item.get("match_reasons") or [],
+            }
+            for item in likely_vendors[:5]
+        ],
+    }
+    supplier_evidence = {
+        "publog_candidate_count": len(publog_rows),
+        "sam_matched_candidate_count": sum(1 for row in publog_rows if row.get("sam_match")),
+        "manufacturer_candidates": [
+            {
+                "company_name": row.get("display_company_name") or row.get("sam_company_name") or row.get("company_name"),
+                "cage": row.get("cage"),
+                "part_number": row.get("part_number"),
+                "reference_type_label": row.get("reference_type_label"),
+                "sam_match": bool(row.get("sam_match")),
+            }
+            for row in publog_rows[:6]
+        ],
+    }
+    market_findings: list[str] = []
+    if award_history_summary["awards_found"]:
+        market_findings.append(
+            f"USAspending returned {award_history_summary['awards_found']} historical award record{'s' if award_history_summary['awards_found'] != 1 else ''}."
+        )
+    if supplier_evidence["publog_candidate_count"]:
+        market_findings.append(
+            f"PUB LOG produced {supplier_evidence['publog_candidate_count']} manufacturer candidate{'s' if supplier_evidence['publog_candidate_count'] != 1 else ''}."
+        )
+    if vendor_history["priced_quote_count"]:
+        market_findings.append(
+            f"Current workspace already has {vendor_history['priced_quote_count']} priced quote{'s' if vendor_history['priced_quote_count'] != 1 else ''}."
+        )
+    if price_history.get("count"):
+        market_findings.append(
+            f"Historical pricing includes {price_history.get('count')} extracted record{'s' if price_history.get('count') != 1 else ''}."
+        )
+    recommended_targets = []
+    for item in likely_vendors[:5]:
+        vendor = _safe_text(item.get("vendor"))
+        if not vendor:
+            continue
+        descriptor = []
+        if item.get("cage"):
+            descriptor.append(f"CAGE {item['cage']}")
+        if item.get("award_count"):
+            descriptor.append(f"{item['award_count']} award{'s' if item['award_count'] != 1 else ''}")
+        if item.get("score") is not None:
+            descriptor.append(f"score {item['score']}")
+        recommended_targets.append(f"{vendor}{' | ' + ' | '.join(descriptor) if descriptor else ''}")
+
     output = {
         "phase": "phase_1",
-        "agent_key": "vendor_research",
+        "agent_key": "market_researcher",
         "top_workspace_leads": top_leads,
-        "likely_vendors": (research.get("likely_vendors") or [])[:8],
+        "likely_vendors": likely_vendors,
         "research_profile": research.get("research_profile") or {},
+        "award_history_summary": award_history_summary,
+        "supplier_evidence": supplier_evidence,
+        "workspace_vendor_history": vendor_history,
+        "historical_pricing": price_history,
+        "market_findings": market_findings,
+        "recommended_targets": recommended_targets,
         "query_debug": research.get("query_debug") or [],
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     artifact = create_artifact(
         db,
@@ -791,7 +1097,29 @@ def _run_vendor_research_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
     return {"output": output, "artifact": _artifact_payload(artifact)}
 
 
-def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
+def _run_capability_matcher_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
+    company_profile = CompanyRepository(db).get_first_profile()
+    capability_match = build_capability_match(opp, company_profile)
+    output = {
+        "phase": "phase_1",
+        "agent_key": "capability_matcher",
+        "summary": capability_match.get("summary"),
+        "signals": capability_match.get("signals") or [],
+        "gaps": capability_match.get("gaps") or [],
+        "matched_fields": capability_match.get("matched_fields") or {},
+        "generated_at": utcnow_iso(),
+    }
+    artifact = create_artifact(
+        db,
+        opp.id,
+        "CAPABILITY_MATCH",
+        f"Capability Match - {opp.solicitation_number or opp.id}",
+        content_json=output,
+    )
+    return {"output": output, "artifact": _artifact_payload(artifact)}
+
+
+def _run_email_outreach_agent(db: Session, opp: Opportunity, *, user_id: int | None = None) -> dict[str, Any]:
     parsed = ensure_parsed(db, opp)
     submission, planned_quote = _load_submission_context(db, opp)
     leads = (
@@ -876,7 +1204,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
     recommended_target = target_vendors[0] if target_vendors else None
     fallback_output = {
         "phase": "phase_2",
-        "agent_key": "email_outreach",
+        "agent_key": "outreach_coordinator",
         "target_vendors": target_vendors,
         "nsn": parsed.get("nsn"),
         "solicitation_number": opp.solicitation_number,
@@ -911,7 +1239,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
             "document_signals": document_signals,
         },
         "solicitation_poc": poc,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     context = {
         "opportunity": _agent_input_payload(opp),
@@ -928,6 +1256,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
     }
     output, model_name, provider_meta = _openai_json_enrich(
         db=db,
+        user_id=user_id,
         system_prompt=(
             "You are a vendor outreach specialist for government contracting. "
             "Create a practical outreach recommendation with a professional quote-request subject, body, target vendor suggestion, follow-up plan, and explicit requested quote items. "
@@ -936,7 +1265,7 @@ def _run_email_outreach_agent(db: Session, opp: Opportunity) -> dict[str, Any]:
         user_context=context,
         fallback_output=fallback_output,
     )
-    output["generated_at"] = output.get("generated_at") or datetime.utcnow().isoformat()
+    output["generated_at"] = output.get("generated_at") or utcnow_iso()
     output["model_name"] = model_name
     output.update(provider_meta)
     artifact = create_artifact(
@@ -960,7 +1289,7 @@ def _run_proposal_workspace_agent(db: Session, opp: Opportunity) -> dict[str, An
     open_tasks = [task for task in tasks if _safe_text(task.status).upper() != "DONE"]
     execution_plan = {
         "phase": "phase_3",
-        "agent_key": "proposal_workspace",
+        "agent_key": "proposal_coordinator",
         "open_task_count": len(open_tasks),
         "open_tasks": [
             {
@@ -988,7 +1317,7 @@ def _run_proposal_workspace_agent(db: Session, opp: Opportunity) -> dict[str, An
             "award_amount": float(submission.award_amount) if submission and submission.award_amount is not None else None,
             "winning_vendor_name": getattr(submission, "winning_vendor_name", None),
         },
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utcnow_iso(),
     }
     artifact = create_artifact(
         db,
@@ -1000,27 +1329,29 @@ def _run_proposal_workspace_agent(db: Session, opp: Opportunity) -> dict[str, An
     return {"output": execution_plan, "artifact": _artifact_payload(artifact)}
 
 
-def run_workspace_agent(agent_key: str, opp: Opportunity, db: Session) -> dict[str, Any]:
-    key = _safe_text(agent_key).lower()
-    if key == "opportunity_analyst":
-        return _run_opportunity_analyst(db, opp)
-    if key == "compliance_document":
-        return _run_compliance_document_agent(db, opp)
-    if key == "vendor_research":
+def run_workspace_agent(agent_key: str, opp: Opportunity, db: Session, *, user_id: int | None = None) -> dict[str, Any]:
+    key = resolve_workspace_agent_key(agent_key)
+    if key == "solicitation_analyst":
+        return _run_opportunity_analyst(db, opp, user_id=user_id)
+    if key == "compliance_reviewer":
+        return _run_compliance_document_agent(db, opp, user_id=user_id)
+    if key == "market_researcher":
         return _run_vendor_research_agent(db, opp)
-    if key == "email_outreach":
-        return _run_email_outreach_agent(db, opp)
-    if key == "proposal_workspace":
+    if key == "capability_matcher":
+        return _run_capability_matcher_agent(db, opp)
+    if key == "outreach_coordinator":
+        return _run_email_outreach_agent(db, opp, user_id=user_id)
+    if key == "proposal_coordinator":
         return _run_proposal_workspace_agent(db, opp)
     raise ValueError(f"Unsupported workspace agent: {agent_key}")
 
 
 def workspace_agent_type(agent_key: str) -> AgentType:
-    key = _safe_text(agent_key).lower()
-    if key in {"opportunity_analyst", "compliance_document"}:
+    key = resolve_workspace_agent_key(agent_key)
+    if key in {"solicitation_analyst", "compliance_reviewer", "capability_matcher"}:
         return AgentType.OPPORTUNITY_ANALYZER
-    if key in {"vendor_research", "email_outreach"}:
+    if key in {"market_researcher", "outreach_coordinator"}:
         return AgentType.VENDOR_DISCOVERY
-    if key == "proposal_workspace":
+    if key == "proposal_coordinator":
         return AgentType.PROPOSAL
     raise ValueError(f"Unsupported workspace agent: {agent_key}")

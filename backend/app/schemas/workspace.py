@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ArtifactOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     opportunity_id: int
     artifact_type: str
@@ -14,10 +16,6 @@ class ArtifactOut(BaseModel):
     content_json: Optional[dict[str, Any]] = None
     file_path: Optional[str] = None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 class TaskCreate(BaseModel):
     task_type: str = "FOLLOW_UP"
@@ -33,6 +31,8 @@ class TaskUpdate(BaseModel):
 
 
 class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     opportunity_id: int
     task_type: str
@@ -40,10 +40,6 @@ class TaskOut(BaseModel):
     due_at: Optional[datetime] = None
     notes: Optional[str] = None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 class GenerateIn(BaseModel):
     opportunity_id: int

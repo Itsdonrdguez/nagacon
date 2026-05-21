@@ -4,9 +4,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.deps import get_current_organization, get_current_user
 from app.services.vendors.lead_cleanup import suppress_non_dibbs_leads_for_opportunity
 
-router = APIRouter(prefix="/api/vendors", tags=["vendors"])
+router = APIRouter(
+    prefix="/api/vendors",
+    tags=["vendors"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 @router.post("/opportunities/{opportunity_id}/suppress-non-dibbs")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from functools import lru_cache
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.repositories.providers import ProviderRepository
@@ -15,9 +17,11 @@ from app.models.opportunity_file import OpportunityFile
 from app.models.provider import Provider, ProviderItem
 from app.models.vendor import VendorLead
 from app.schemas.provider import ProviderCreate, ProviderItemCreate, ProviderPdfExtractResult
+from app.services.dibbs.pdf_bulk_export import LATEST_MANIFEST_REF
 from app.services.document_parser import parse_opportunity_file
-from app.services.provider_settings_service import get_effective_sam_api_key
+from app.services.provider_settings_service import get_effective_sam_api_key, get_sam_api_key_candidates
 from app.services.rfq_parser import parse_dibbs_sources
+from app.services.storage import file_exists, local_temp_path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
 EXPORT_ROOT = BACKEND_ROOT / "exports" / "dibbs_pdfs"
@@ -32,6 +36,15 @@ BLOCKED_CAGE_TOKENS = {
     "NAME",
     "PHONE",
     "TABLE",
+}
+BLOCKED_COMPANY_TOKENS = {
+    "SOLICITATIONS",
+    "SOLICITATION",
+    "POLICY STATEMENTS",
+    "POLICY STATEMENTS FEEDBACK",
+    "FEEDBACK",
+    "APPROVED SOURCE DATA",
+    "TECHNICAL DOCUMENTS",
 }
 
 
@@ -67,6 +80,10 @@ def _normalize_nsn(value: str | None) -> str | None:
     if len(digits) == 13:
         return f"{digits[:4]}-{digits[4:6]}-{digits[6:9]}-{digits[9:]}"
     return None
+
+
+def _compact_nsn(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")
 
 
 def _nsn_from_filename(path: Path) -> str | None:
@@ -161,9 +178,10 @@ def enrich_provider_websites_from_sam(
     db: Session,
     *,
     organization_id: int | None = None,
+    user_id: int | None = None,
     limit: int = 250,
 ) -> dict[str, Any]:
-    api_key = get_effective_sam_api_key(db)
+    api_key = get_effective_sam_api_key(db, user_id=user_id)
     if not api_key:
         return {"checked": 0, "updated": 0, "missing_api_key": True, "errors": ["SAM API key is not configured."]}
 
@@ -240,6 +258,22 @@ def _normalize_website(value: str | None) -> str | None:
     return text
 
 
+def _normalize_company_name(value: str | None, *, cage: str | None = None) -> str | None:
+    text = _clean(value, 240)
+    if not text:
+        return None
+    compact = re.sub(r"\s+", " ", text).strip().upper()
+    if compact in BLOCKED_COMPANY_TOKENS:
+        return None
+    if cage and compact == f"CAGE {cage}".upper():
+        return None
+    if re.fullmatch(r"(SOLICITATION|SOLICITATIONS)(\s+[A-Z0-9#-]+)?", compact):
+        return None
+    if len(compact) <= 3:
+        return None
+    return text
+
+
 @lru_cache(maxsize=512)
 def _lookup_sam_entity(cage: str, api_key: str) -> dict[str, str | None]:
     if not cage or not api_key:
@@ -253,7 +287,11 @@ def _lookup_sam_entity(cage: str, api_key: str) -> dict[str, str | None]:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        return {"error": f"{exc.__class__.__name__}: {str(exc)[:300]}"}
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        return {
+            "error": f"{exc.__class__.__name__}: {str(exc)[:300]}",
+            "error_status": str(status_code) if status_code is not None else None,
+        }
 
     name = _first_string(payload, {"legalBusinessName", "entityName", "businessName"})
     website = _first_string(payload, {"entityURL", "entityUrl", "website", "websiteUrl", "websiteURL", "businessURL"})
@@ -261,6 +299,25 @@ def _lookup_sam_entity(cage: str, api_key: str) -> dict[str, str | None]:
         "company_name": _clean(name, 240),
         "website": _normalize_website(website),
     }
+
+
+def _lookup_sam_entity_with_fallback(cage: str, api_keys: list[tuple[str, str]]) -> tuple[dict[str, str | None], str | None]:
+    last_error: dict[str, str | None] | None = None
+    last_source: str | None = None
+    for source, api_key in api_keys:
+        row = _lookup_sam_entity(cage, api_key)
+        if not row.get("error"):
+            row["api_key_source"] = source
+            return row, source
+        last_error = row
+        last_source = source
+        if str(row.get("error_status") or "") not in {"401", "403"}:
+            row["api_key_source"] = source
+            return row, source
+    if last_error is None:
+        return {}, None
+    last_error["api_key_source"] = last_source
+    return last_error, last_source
 
 
 def _approved_source_rows(parsed: dict[str, Any]) -> list[dict[str, Any]]:
@@ -339,6 +396,16 @@ def _part_number_from_notes(notes: str | None) -> str | None:
     return _clean(match.group(1), 80) if match else None
 
 
+def _sanitize_part_number(part_number: str | None, *, nsn: str | None = None) -> str | None:
+    clean = _clean(part_number, 80)
+    if not clean:
+        return None
+    compact = _compact_nsn(clean)
+    if len(compact) == 13 and nsn and compact == _compact_nsn(nsn):
+        return None
+    return clean
+
+
 def _upsert_vendor_lead_from_provider(
     db: Session,
     *,
@@ -354,7 +421,7 @@ def _upsert_vendor_lead_from_provider(
 ) -> tuple[bool, bool]:
     cage = _normalize_cage(cage)
     company_name = _clean(company_name, 200)
-    part_number = _clean(part_number, 80)
+    part_number = _sanitize_part_number(part_number, nsn=nsn)
     if not cage and not company_name:
         return False, False
 
@@ -387,6 +454,22 @@ def _upsert_vendor_lead_from_provider(
     query = query.filter(VendorLead.cage == cage) if cage else query.filter(VendorLead.cage.is_(None))
     query = query.filter(VendorLead.part_number == part_number) if part_number else query.filter(VendorLead.part_number.is_(None))
     existing = query.first()
+
+    if not existing:
+        fallback_query = db.query(VendorLead).filter(VendorLead.opportunity_id == opp.id)
+        if cage:
+            fallback_query = fallback_query.filter(VendorLead.cage == cage)
+        elif company_name:
+            fallback_query = fallback_query.filter(VendorLead.company_name == company_name)
+        else:
+            fallback_query = fallback_query.filter(VendorLead.cage.is_(None))
+        if nsn:
+            fallback_query = fallback_query.filter(or_(VendorLead.nsn == nsn, VendorLead.nsn.is_(None)))
+        existing = (
+            fallback_query
+            .order_by(VendorLead.part_number.is_(None), VendorLead.confidence.desc().nullslast(), VendorLead.id.desc())
+            .first()
+        )
 
     if existing:
         touched = False
@@ -441,42 +524,105 @@ def extract_providers_from_dibbs_pdfs(
     db: Session,
     *,
     organization_id: int | None = None,
+    user_id: int | None = None,
     root: Path | str = EXPORT_ROOT,
     enrich_with_sam: bool = True,
     limit: int | None = None,
 ) -> ProviderPdfExtractResult:
     result = ProviderPdfExtractResult()
     base = Path(root)
-    if not base.exists():
+
+    repo = ProviderRepository(db, organization_id=organization_id)
+    sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id) if enrich_with_sam else []
+    seen_cage_item: set[tuple[str, str | None, str]] = set()
+    if base.exists():
+        pdf_paths = sorted(base.rglob("*.pdf"))
+        if limit:
+            pdf_paths = pdf_paths[: max(limit, 0)]
+        for path in pdf_paths:
+            _extract_provider_rows_from_pdf(
+                db,
+                repo=repo,
+                sam_api_keys=sam_api_keys,
+                result=result,
+                seen_cage_item=seen_cage_item,
+                reference=str(path),
+                display_name=path.name,
+            )
+        return result
+
+    if not file_exists(LATEST_MANIFEST_REF):
         result.errors.append(f"PDF export folder does not exist: {base}")
         return result
 
-    repo = ProviderRepository(db, organization_id=organization_id)
-    sam_api_key = get_effective_sam_api_key(db) if enrich_with_sam else None
-    pdf_paths = sorted(base.rglob("*.pdf"))
-    if limit:
-        pdf_paths = pdf_paths[: max(limit, 0)]
+    try:
+        with local_temp_path(LATEST_MANIFEST_REF, suffix=".json") as manifest_meta_path:
+            manifest_meta = json.loads(manifest_meta_path.read_text(encoding="utf-8"))
+        manifest_ref = manifest_meta.get("manifest_jsonl")
+        if not manifest_ref or not file_exists(manifest_ref):
+            result.errors.append("The latest DIBBS PDF manifest was not found in shared storage.")
+            return result
+        with local_temp_path(manifest_ref, suffix=".jsonl") as manifest_path:
+            count = 0
+            for line in manifest_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("status") != "downloaded" or not row.get("file_path"):
+                    continue
+                _extract_provider_rows_from_pdf(
+                    db,
+                    repo=repo,
+                    sam_api_keys=sam_api_keys,
+                    result=result,
+                    seen_cage_item=seen_cage_item,
+                    reference=row["file_path"],
+                    display_name=Path(str(row["file_path"])).name,
+                    nsn_hint=_normalize_nsn(row.get("nsn")),
+                    fsc_hint=_clean(row.get("fsc")) or _fsc_from_path(Path(str(row["file_path"])), _normalize_nsn(row.get("nsn"))),
+                    nomenclature_hint=_clean(row.get("nomenclature"), 300),
+                )
+                count += 1
+                if limit and count >= max(limit, 0):
+                    break
+    except Exception as exc:
+        result.errors.append(f"Could not read shared DIBBS PDF manifest: {exc}")
 
-    seen_cage_item: set[tuple[str, str | None, str]] = set()
-    for path in pdf_paths:
-        result.scanned_files += 1
-        if not _is_valid_pdf(path):
+    return result
+
+
+def _extract_provider_rows_from_pdf(
+    db: Session,
+    *,
+    repo: ProviderRepository,
+    sam_api_keys: list[tuple[str, str]],
+    result: ProviderPdfExtractResult,
+    seen_cage_item: set[tuple[str, str | None, str]],
+    reference: str,
+    display_name: str,
+    nsn_hint: str | None = None,
+    fsc_hint: str | None = None,
+    nomenclature_hint: str | None = None,
+) -> None:
+    result.scanned_files += 1
+    with local_temp_path(reference, suffix=Path(display_name).suffix or ".pdf") as path:
+        if not path.exists() or not _is_valid_pdf(path):
             result.invalid_pdfs += 1
             result.skipped += 1
-            continue
+            return
 
         result.valid_pdfs += 1
         parsed_doc = parse_opportunity_file(str(path))
         text = parsed_doc.get("text") or ""
         parsed = parse_dibbs_sources(text)
-        nsn = parsed.get("nsn") or _nsn_from_filename(path)
-        fsc = _fsc_from_path(path, nsn)
-        nomenclature = _nomenclature_for_provider(parsed, path)
+        nsn = parsed.get("nsn") or nsn_hint or _nsn_from_filename(path)
+        fsc = fsc_hint or _fsc_from_path(path, nsn)
+        nomenclature = _nomenclature_for_provider(parsed, path) or nomenclature_hint
         rows = _approved_source_rows(parsed) + _manufacturer_rows_from_text(text)
 
         if not rows:
             result.skipped += 1
-            continue
+            return
 
         for row in rows:
             cage = row["cage"]
@@ -487,14 +633,15 @@ def extract_providers_from_dibbs_pdfs(
                 continue
             seen_cage_item.add(key)
 
-            company_name = row.get("company_name")
+            company_name = _normalize_company_name(row.get("company_name"), cage=cage)
             sam_website = None
-            if sam_api_key:
-                sam_row = _lookup_sam_entity(cage, sam_api_key)
+            if sam_api_keys:
+                sam_row, sam_source = _lookup_sam_entity_with_fallback(cage, sam_api_keys)
                 if sam_row.get("error"):
-                    result.errors.append(f"{path.name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
+                    source_label = f" ({sam_source} key)" if sam_source else ""
+                    result.errors.append(f"{display_name} / CAGE {cage}: SAM lookup failed{source_label} - {sam_row['error']}")
                     sam_row = {}
-                sam_name = sam_row.get("company_name")
+                sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
                 sam_website = sam_row.get("website")
                 if sam_name:
                     company_name = sam_name
@@ -506,12 +653,12 @@ def extract_providers_from_dibbs_pdfs(
             notes = []
             if row.get("part_number"):
                 notes.append(f"Part number: {row['part_number']}")
-            notes.append(f"Extracted from {path.name}")
+            notes.append(f"Extracted from {display_name}")
 
             payload = ProviderCreate(
                 company_name=company_name,
                 cage=cage,
-                website=sam_website if sam_api_key else None,
+                website=sam_website if sam_api_keys else None,
                 notes="; ".join(notes),
                 item=ProviderItemCreate(
                     nsn=nsn,
@@ -519,7 +666,7 @@ def extract_providers_from_dibbs_pdfs(
                     nomenclature=nomenclature,
                     relationship_type=row["relationship_type"],
                     source="DIBBS Solicitation PDF",
-                    source_url=str(path),
+                    source_url=reference,
                     confidence=95 if row["relationship_type"] == "Approved Source" else 65,
                     notes="; ".join(notes),
                 ),
@@ -533,9 +680,7 @@ def extract_providers_from_dibbs_pdfs(
                     result.inserted += 1
             except Exception as exc:
                 db.rollback()
-                result.errors.append(f"{path.name} / CAGE {cage}: {exc}")
-
-    return result
+                result.errors.append(f"{display_name} / CAGE {cage}: {exc}")
 
 
 def seed_vendor_leads_from_providers(
@@ -544,6 +689,7 @@ def seed_vendor_leads_from_providers(
     *,
     parsed: dict[str, Any] | None = None,
     organization_id: int | None = None,
+    user_id: int | None = None,
 ) -> dict[str, int]:
     parsed = parsed or getattr(opp, "parsed_json", None) or {}
     nsn = _normalize_nsn(parsed.get("nsn") if isinstance(parsed, dict) else None) or _nsn_from_opportunity(opp)
@@ -568,9 +714,8 @@ def seed_vendor_leads_from_providers(
     if not filters:
         return {"created": 0, "updated": 0, "matched": 0}
 
-    from sqlalchemy import or_
-
-    sam_api_key = get_effective_sam_api_key(db)
+    sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
+    sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id)
     rows = query.filter(or_(*filters)).order_by(ProviderItem.confidence.desc().nullslast(), Provider.company_name.asc()).all()
     created = 0
     updated = 0
@@ -578,8 +723,8 @@ def seed_vendor_leads_from_providers(
     seen: set[tuple[str | None, str | None]] = set()
     for provider, item in rows:
         cage = _normalize_cage(provider.cage)
-        if cage and sam_api_key:
-            sam_row = _lookup_sam_entity(cage, sam_api_key)
+        if cage and sam_api_key and sam_api_keys:
+            sam_row, _ = _lookup_sam_entity_with_fallback(cage, sam_api_keys)
             sam_name = _clean(sam_row.get("company_name"), 240)
             sam_website = _normalize_website(sam_row.get("website"))
             if sam_name and provider.company_name != sam_name:
@@ -588,7 +733,7 @@ def seed_vendor_leads_from_providers(
             if sam_website and not provider.website:
                 provider.website = sam_website
                 db.add(provider)
-        part_number = _part_number_from_notes(item.notes)
+        part_number = _sanitize_part_number(_part_number_from_notes(item.notes), nsn=nsn or item.nsn)
         key = (cage, part_number)
         if key in seen:
             continue
@@ -637,6 +782,7 @@ def extract_providers_from_opportunity_pdfs(
     *,
     enrich_with_sam: bool = True,
     organization_id: int | None = None,
+    user_id: int | None = None,
 ) -> ProviderPdfExtractResult:
     result = ProviderPdfExtractResult()
     files = (
@@ -652,86 +798,89 @@ def extract_providers_from_opportunity_pdfs(
         return result
 
     repo = ProviderRepository(db, organization_id=organization_id)
-    sam_api_key = get_effective_sam_api_key(db) if enrich_with_sam else None
+    sam_api_keys = get_sam_api_key_candidates(db, user_id=user_id) if enrich_with_sam else []
     seen_cage_item: set[tuple[str, str | None, str]] = set()
 
     for file_record in files:
-        path = Path(file_record.file_path or "")
-        if path.suffix.lower() != ".pdf":
+        reference = file_record.file_path or ""
+        filename = file_record.filename or Path(reference).name
+        if Path(filename).suffix.lower() != ".pdf":
             continue
         result.scanned_files += 1
-        if not path.exists() or not _is_valid_pdf(path):
-            result.invalid_pdfs += 1
-            result.skipped += 1
-            continue
-
-        result.valid_pdfs += 1
-        text = file_record.extracted_text or (parse_opportunity_file(str(path)).get("text") or "")
-        parsed = parse_dibbs_sources(text, file_record.source_url)
-        nsn = parsed.get("nsn") or _nsn_from_filename(path) or _nsn_from_opportunity(opp)
-        fsc = _fsc_from_path(path, nsn) or getattr(opp, "fsc", None)
-        nomenclature = _nomenclature_for_provider(parsed, path, opp)
-        rows = _approved_source_rows(parsed) + _manufacturer_rows_from_text(text)
-
-        if not rows:
-            result.skipped += 1
-            continue
-
-        for row in rows:
-            cage = row["cage"]
-            result.cages_found += 1
-            key = (cage, nsn, row["relationship_type"])
-            if key in seen_cage_item:
+        with local_temp_path(reference, suffix=Path(filename).suffix) as path:
+            if not path.exists() or not _is_valid_pdf(path):
+                result.invalid_pdfs += 1
                 result.skipped += 1
                 continue
-            seen_cage_item.add(key)
 
-            company_name = row.get("company_name")
-            sam_website = None
-            if sam_api_key:
-                sam_row = _lookup_sam_entity(cage, sam_api_key)
-                if sam_row.get("error"):
-                    result.errors.append(f"{file_record.filename or path.name} / CAGE {cage}: SAM lookup failed - {sam_row['error']}")
-                    sam_row = {}
-                sam_name = sam_row.get("company_name")
-                sam_website = sam_row.get("website")
-                if sam_name:
-                    company_name = sam_name
-                    result.sam_enriched += 1
-                elif not company_name:
-                    result.sam_misses += 1
-            company_name = company_name or f"CAGE {cage}"
-            notes = []
-            if row.get("part_number"):
-                notes.append(f"Part number: {row['part_number']}")
-            notes.append(f"Extracted from {file_record.filename or path.name}")
-            source = "DIBBS Opportunity PDF"
-            payload = ProviderCreate(
-                company_name=company_name,
-                cage=cage,
-                website=sam_website if sam_api_key else None,
-                notes="; ".join(notes),
-                item=ProviderItemCreate(
-                    nsn=nsn,
-                    fsc=fsc,
-                    nomenclature=nomenclature,
-                    relationship_type=row["relationship_type"],
-                    source=source,
-                    source_url=file_record.source_url or str(path),
-                    confidence=95 if row["relationship_type"] == "Approved Source" else 85,
+            result.valid_pdfs += 1
+            text = file_record.extracted_text or (parse_opportunity_file(str(path)).get("text") or "")
+            parsed = parse_dibbs_sources(text, file_record.source_url)
+            nsn = parsed.get("nsn") or _nsn_from_filename(path) or _nsn_from_opportunity(opp)
+            fsc = _fsc_from_path(path, nsn) or getattr(opp, "fsc", None)
+            nomenclature = _nomenclature_for_provider(parsed, path, opp)
+            rows = _approved_source_rows(parsed) + _manufacturer_rows_from_text(text)
+
+            if not rows:
+                result.skipped += 1
+                continue
+
+            for row in rows:
+                cage = row["cage"]
+                result.cages_found += 1
+                key = (cage, nsn, row["relationship_type"])
+                if key in seen_cage_item:
+                    result.skipped += 1
+                    continue
+                seen_cage_item.add(key)
+
+                company_name = _normalize_company_name(row.get("company_name"), cage=cage)
+                sam_website = None
+                if sam_api_keys:
+                    sam_row, sam_source = _lookup_sam_entity_with_fallback(cage, sam_api_keys)
+                    if sam_row.get("error"):
+                        source_label = f" ({sam_source} key)" if sam_source else ""
+                        result.errors.append(f"{filename or path.name} / CAGE {cage}: SAM lookup failed{source_label} - {sam_row['error']}")
+                        sam_row = {}
+                    sam_name = _normalize_company_name(sam_row.get("company_name"), cage=cage)
+                    sam_website = sam_row.get("website")
+                    if sam_name:
+                        company_name = sam_name
+                        result.sam_enriched += 1
+                    elif not company_name:
+                        result.sam_misses += 1
+                company_name = company_name or f"CAGE {cage}"
+                notes = []
+                if row.get("part_number"):
+                    notes.append(f"Part number: {row['part_number']}")
+                notes.append(f"Extracted from {filename or path.name}")
+                source = "DIBBS Opportunity PDF"
+                payload = ProviderCreate(
+                    company_name=company_name,
+                    cage=cage,
+                    website=sam_website if sam_api_keys else None,
                     notes="; ".join(notes),
-                ),
-            )
-            existing = repo._find_provider(company_name=payload.company_name, cage=payload.cage, uei=payload.uei)
-            try:
-                repo.create(payload)
-                if existing:
-                    result.updated += 1
-                else:
-                    result.inserted += 1
-            except Exception as exc:
-                db.rollback()
-                result.errors.append(f"{file_record.filename or path.name} / CAGE {cage}: {exc}")
+                    item=ProviderItemCreate(
+                        nsn=nsn,
+                        fsc=fsc,
+                        nomenclature=nomenclature,
+                        relationship_type=row["relationship_type"],
+                        source=source,
+                        source_url=file_record.source_url or str(path),
+                        confidence=95 if row["relationship_type"] == "Approved Source" else 85,
+                        notes="; ".join(notes),
+                    ),
+                )
+                existing = repo._find_provider(company_name=payload.company_name, cage=payload.cage, uei=payload.uei)
+                try:
+                    repo.create(payload)
+                    if existing:
+                        result.updated += 1
+                    else:
+                        result.inserted += 1
+                except Exception as exc:
+                    db.rollback()
+                    result.errors.append(f"{filename or path.name} / CAGE {cage}: {exc}")
 
     provider_seed = seed_vendor_leads_from_providers(db, opp, organization_id=organization_id)
     result.vendor_leads_created = provider_seed.get("created", 0)

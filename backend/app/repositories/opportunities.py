@@ -9,6 +9,9 @@ from sqlalchemy.orm import Session
 from app.models.opportunity import Opportunity
 from app.schemas.opportunity import OpportunityCreate, OpportunityUpdate
 from app.utils.exceptions import DuplicateRecordError
+from app.utils.opportunity_lifecycle import ARCHIVE_CUTOFF_DAYS
+from app.utils.set_asides import normalize_set_aside, set_aside_display_label
+from app.utils.utc import utcnow
 
 
 class OpportunityRepository:
@@ -96,14 +99,26 @@ class OpportunityRepository:
         set_aside_type: str | None = None,
         due_window: str | None = None,
         nsn: str | None = None,
+        agency: str | None = None,
+        state: str | None = None,
+        naics_codes: list[str] | None = None,
+        fsc_codes: list[str] | None = None,
     ):
+        def _clean_codes(values: list[str] | None) -> list[str]:
+            return [str(value or "").strip() for value in (values or []) if str(value or "").strip()]
+
         if source:
             query = query.filter(Opportunity.source == source)
 
-        if set_aside_type == "none":
+        set_aside_value = normalize_set_aside(set_aside_type)
+        if set_aside_value == "none":
             query = query.filter(or_(Opportunity.set_aside.is_(None), Opportunity.set_aside == ""))
-        elif set_aside_type:
-            query = query.filter(Opportunity.set_aside == set_aside_type)
+        elif set_aside_value:
+            tokens = self.SET_ASIDE_FILTERS.get(set_aside_value)
+            if tokens:
+                query = query.filter(or_(*[Opportunity.set_aside.ilike(f"%{token}%") for token in tokens]))
+            else:
+                query = query.filter(Opportunity.set_aside.ilike(f"%{set_aside_value}%"))
 
         if q:
             pattern = f"%{q.strip()}%"
@@ -114,6 +129,9 @@ class OpportunityRepository:
                     Opportunity.solicitation_number.ilike(pattern),
                     Opportunity.naics.ilike(pattern),
                     Opportunity.fsc.ilike(pattern),
+                    Opportunity.set_aside.ilike(pattern),
+                    Opportunity.place_of_performance.ilike(pattern),
+                    Opportunity.raw_text.ilike(pattern),
                 )
             )
 
@@ -135,10 +153,25 @@ class OpportunityRepository:
             else:
                 query = query.filter(Opportunity.solicitation_number.ilike(f"%{nsn.strip()}%"))
 
+        if agency:
+            query = query.filter(Opportunity.agency.ilike(f"%{agency.strip()}%"))
+
+        if state:
+            query = query.filter(Opportunity.place_of_performance.ilike(f"%{state.strip()}%"))
+
+        cleaned_naics = _clean_codes(naics_codes)
+        if cleaned_naics:
+            query = query.filter(Opportunity.naics.in_(cleaned_naics))
+
+        cleaned_fsc = _clean_codes(fsc_codes)
+        if cleaned_fsc:
+            query = query.filter(Opportunity.fsc.in_(cleaned_fsc))
+
         if due_window:
             from datetime import datetime, timedelta
 
-            now = datetime.utcnow()
+            now = utcnow()
+            archive_cutoff = now - timedelta(days=ARCHIVE_CUTOFF_DAYS)
             if due_window == "7d":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at >= now, Opportunity.due_at <= now + timedelta(days=7))
             elif due_window == "30d":
@@ -147,8 +180,71 @@ class OpportunityRepository:
                 query = query.filter(or_(Opportunity.due_at.is_(None), Opportunity.due_at >= now))
             elif due_window == "closed":
                 query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
+            elif due_window == "recently_closed":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now, Opportunity.due_at >= archive_cutoff)
+            elif due_window == "archived":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < archive_cutoff)
+            elif due_window == "intelligence":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at < now)
+            elif due_window == "award_followup":
+                query = query.filter(Opportunity.due_at.is_not(None), Opportunity.due_at <= now - timedelta(days=90))
 
         return query
+
+    def filter_options(self) -> dict:
+        query = self._scoped_query()
+        set_asides = [
+            row[0]
+            for row in query.with_entities(Opportunity.set_aside)
+            .filter(Opportunity.set_aside.is_not(None), Opportunity.set_aside != "")
+            .distinct()
+            .order_by(Opportunity.set_aside.asc())
+            .limit(200)
+            .all()
+        ]
+        exact_labels = []
+        seen_exact = set()
+        for item in set_asides:
+            value = str(item or "").strip()
+            if not value or value in seen_exact:
+                continue
+            seen_exact.add(value)
+            exact_labels.append({"value": value, "label": set_aside_display_label(value) or value})
+        sources = [
+            row[0]
+            for row in self._scoped_query()
+            .with_entities(Opportunity.source)
+            .filter(Opportunity.source.is_not(None), Opportunity.source != "")
+            .distinct()
+            .order_by(Opportunity.source.asc())
+            .all()
+        ]
+        return {
+            "sources": sources,
+            "set_asides": set_asides,
+            "set_aside_categories": [
+                {"value": "small_business", "label": "Small Business"},
+                {"value": "8a", "label": "8(a)"},
+                {"value": "sdvosb", "label": "SDVOSB"},
+                {"value": "wosb", "label": "WOSB"},
+                {"value": "edwosb", "label": "EDWOSB"},
+                {"value": "hubzone", "label": "HUBZone"},
+                {"value": "veteran", "label": "Veteran-Owned"},
+                {"value": "unrestricted", "label": "Full and Open"},
+                {"value": "none", "label": "No Set-Aside"},
+            ],
+            "set_aside_exact_labels": exact_labels,
+            "status_filters": [
+                {"value": "open", "label": "Active"},
+                {"value": "7d", "label": "Closing Soon"},
+                {"value": "30d", "label": "Due in 30 Days"},
+                {"value": "closed", "label": "Closed / Intelligence"},
+                {"value": "recently_closed", "label": "Recently Closed"},
+                {"value": "archived", "label": "Archived"},
+                {"value": "award_followup", "label": "Award Follow-Up Due"},
+                {"value": "all", "label": "All Records"},
+            ],
+        }
 
     def list(
         self,
@@ -159,6 +255,10 @@ class OpportunityRepository:
         set_aside_type: str | None = None,
         due_window: str | None = None,
         nsn: str | None = None,
+        agency: str | None = None,
+        state: str | None = None,
+        naics_codes: list[str] | None = None,
+        fsc_codes: list[str] | None = None,
     ) -> list[Opportunity]:
         query = self._apply_filters(
             self._scoped_query(),
@@ -167,6 +267,10 @@ class OpportunityRepository:
             set_aside_type=set_aside_type,
             due_window=due_window,
             nsn=nsn,
+            agency=agency,
+            state=state,
+            naics_codes=naics_codes,
+            fsc_codes=fsc_codes,
         )
         items = query.order_by(Opportunity.id.desc()).offset(offset).limit(limit).all()
         return self._backfill_dibbs_dates(items)
@@ -181,6 +285,10 @@ class OpportunityRepository:
         set_aside_type: str | None = None,
         due_window: str | None = None,
         nsn: str | None = None,
+        agency: str | None = None,
+        state: str | None = None,
+        naics_codes: list[str] | None = None,
+        fsc_codes: list[str] | None = None,
         sort_by: str | None = None,
         sort_order: str = "asc",
     ) -> tuple[list[Opportunity], int]:
@@ -191,11 +299,15 @@ class OpportunityRepository:
             set_aside_type=set_aside_type,
             due_window=due_window,
             nsn=nsn,
+            agency=agency,
+            state=state,
+            naics_codes=naics_codes,
+            fsc_codes=fsc_codes,
         )
         total = base_query.count()
         open_first = case(
             (Opportunity.due_at.is_(None), 1),
-            (Opportunity.due_at < datetime.utcnow(), 2),
+            (Opportunity.due_at < utcnow(), 2),
             else_=0,
         )
         sort_map = {
@@ -303,3 +415,20 @@ class OpportunityRepository:
             self.db.rollback()
             key = opp.source_opportunity_id or opp.solicitation_number or opp.title
             raise DuplicateRecordError(f"Duplicate opportunity detected for {opp.source}/{key}")
+    SET_ASIDE_FILTERS = {
+        "SMALL_BUSINESS": ["small business", "small_business", "total small", "sbsa"],
+        "EIGHT_A": ["8(a)", "8a", "eight_a"],
+        "8a": ["8(a)", "8a", "eight_a"],
+        "sdvosb": ["sdvosb", "service-disabled"],
+        "SDVOSB": ["sdvosb", "service-disabled", "service_disabled"],
+        "wosb": ["wosb", "women-owned", "woman-owned"],
+        "WOSB": ["wosb", "women-owned", "woman-owned"],
+        "edwosb": ["edwosb", "economically disadvantaged women"],
+        "EDWOSB": ["edwosb", "economically disadvantaged women"],
+        "hubzone": ["hubzone", "hub zone"],
+        "HUBZONE": ["hubzone", "hub zone"],
+        "veteran": ["veteran-owned", "veteran_owned", "vosb"],
+        "VOSB": ["veteran-owned", "veteran_owned", "vosb"],
+        "unrestricted": ["unrestricted", "full and open", "not set aside"],
+        "UNRESTRICTED": ["unrestricted", "full and open", "not set aside"],
+    }

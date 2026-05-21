@@ -1,34 +1,129 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from pathlib import Path
+import re
 from typing import Iterator
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+
+from app.core.config import settings
 
 DIBBS_RFQ_FSC_URL = "https://www.dibbs.bsm.dla.mil/Rfq/RfqFsc.aspx"
 DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
+ARTIFACT_ROOT = Path("audit_reports") / "dibbs_debug"
+_DIBBS_DEBUG_ENABLED: ContextVar[bool] = ContextVar("dibbs_debug_enabled", default=False)
+
+
+def dibbs_debug_enabled(explicit: bool | None = None) -> bool:
+    if explicit is not None:
+        return explicit
+    return _DIBBS_DEBUG_ENABLED.get() or bool(getattr(settings, "DIBBS_DEBUG", False))
 
 
 @contextmanager
-def dibbs_page(headless: bool = True) -> Iterator[tuple[Browser, BrowserContext, Page]]:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            extra_http_headers=DEFAULT_HEADERS,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        try:
-            yield browser, context, page
-        finally:
-            context.close()
-            browser.close()
+def dibbs_debug_scope(enabled: bool | None = None) -> Iterator[bool]:
+    active = dibbs_debug_enabled(enabled)
+    token = _DIBBS_DEBUG_ENABLED.set(active)
+    try:
+        yield active
+    finally:
+        _DIBBS_DEBUG_ENABLED.reset(token)
+
+
+def dibbs_log(stage: str, **details) -> None:
+    if not dibbs_debug_enabled():
+        return
+    timestamp = datetime.now(timezone.utc).isoformat()
+    suffix = ""
+    if details:
+        ordered = " ".join(f"{key}={details[key]!r}" for key in sorted(details))
+        suffix = f" {ordered}"
+    print(f"[DIBBS][{timestamp}] {stage}{suffix}")
+
+
+def _sanitize_stage_label(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return cleaned[:80] or "stage"
+
+
+def capture_dibbs_page_state(page: Page, stage: str, **details) -> dict[str, str]:
+    if not dibbs_debug_enabled():
+        return {}
+    ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    prefix = f"{stamp}_{_sanitize_stage_label(stage)}"
+    html_path = ARTIFACT_ROOT / f"{prefix}.html"
+    png_path = ARTIFACT_ROOT / f"{prefix}.png"
+    metadata_path = ARTIFACT_ROOT / f"{prefix}.txt"
+
+    html = page.content()
+    html_path.write_text(html, encoding="utf-8")
+    page.screenshot(path=str(png_path), full_page=True)
+    metadata = [f"stage={stage}", f"url={page.url}"]
+    metadata.extend(f"{key}={details[key]!r}" for key in sorted(details))
+    metadata_path.write_text("\n".join(metadata) + "\n", encoding="utf-8")
+    dibbs_log(
+        "artifact.saved",
+        stage=stage,
+        html_path=str(html_path),
+        png_path=str(png_path),
+        metadata_path=str(metadata_path),
+    )
+    return {
+        "html_path": str(html_path),
+        "png_path": str(png_path),
+        "metadata_path": str(metadata_path),
+    }
+
+
+@contextmanager
+def dibbs_page(headless: bool = True, debug: bool | None = None) -> Iterator[tuple[Browser, BrowserContext, Page]]:
+    with dibbs_debug_scope(debug) as debug_enabled:
+        dibbs_log("browser.launch.begin", headless=headless)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            dibbs_log("browser.launch.ok", headless=headless)
+            context = browser.new_context(
+                extra_http_headers=DEFAULT_HEADERS,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+            )
+            dibbs_log("browser.context.ok")
+            page = context.new_page()
+            if debug_enabled:
+                page.on(
+                    "request",
+                    lambda request: dibbs_log(
+                        "network.request",
+                        method=request.method,
+                        resource_type=request.resource_type,
+                        url=request.url,
+                    ),
+                )
+                page.on(
+                    "response",
+                    lambda response: dibbs_log(
+                        "network.response",
+                        status=response.status,
+                        url=response.url,
+                    ),
+                )
+            dibbs_log("browser.page.ok")
+            try:
+                yield browser, context, page
+            finally:
+                dibbs_log("browser.close.begin")
+                context.close()
+                browser.close()
+                dibbs_log("browser.close.ok")
 
 
 def _first(page: Page, selectors: list[str]):
@@ -40,6 +135,27 @@ def _first(page: Page, selectors: list[str]):
         except Exception:
             continue
     return None
+
+
+def _is_dod_warning_page(page: Page) -> bool:
+    url = (page.url or "").lower()
+    if "dodwarning.aspx" in url:
+        return True
+
+    selectors = [
+        "#butAgree",
+        "form[action*='dodwarning.aspx' i]",
+        "input[name*='butAgree' i]",
+        "input[id*='butAgree' i]",
+    ]
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _select_fsc_option(page: Page, fsc: str) -> bool:
@@ -71,33 +187,55 @@ def _select_fsc_option(page: Page, fsc: str) -> bool:
     return False
 
 
-def _click_ok_if_present(page: Page) -> None:
+def _click_ok_if_present(page: Page) -> bool:
+    if not _is_dod_warning_page(page):
+        dibbs_log("warning.ok.skip", reason="not_warning_page", url=page.url)
+        return False
+
     selectors = [
-        "text=OK",
+        "#butAgree",
+        "input[type='submit'][value*='I Agree' i]",
+        "input[type='submit'][value*='Agree' i]",
         "input[value='OK']",
+        "input[type='submit'][value='OK' i]",
+        "button:has-text('I Agree')",
+        "button:has-text('Agree')",
         "button:has-text('OK')",
+        "a:has-text('I Agree')",
+        "a:has-text('Agree')",
         "a:has-text('OK')",
     ]
     for selector in selectors:
         try:
             loc = page.locator(selector)
             if loc.count() > 0:
+                dibbs_log("warning.ok.click", selector=selector, url=page.url)
                 loc.first.click()
                 page.wait_for_timeout(1200)
-                page.wait_for_load_state("networkidle")
-                return
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1200)
+                dibbs_log("warning.ok.done", selector=selector, url=page.url)
+                return True
         except Exception:
             continue
+    dibbs_log("warning.ok.missing", url=page.url)
+    return False
 
 
 def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> None:
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
+            dibbs_log("goto.begin", attempt=attempt + 1, attempts=attempts, url=url)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            dibbs_log("goto.ok", attempt=attempt + 1, url=page.url)
             return
         except Exception as exc:
             last_error = exc
+            dibbs_log("goto.error", attempt=attempt + 1, attempts=attempts, error=str(exc), url=url)
             if attempt >= attempts - 1:
                 break
             try:
@@ -111,7 +249,10 @@ def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> None:
 def open_dibbs_rfq_list(page: Page, fsc: str | None = None, debug: bool = False) -> None:
     _goto_with_retry(page, DIBBS_RFQ_FSC_URL)
     page.wait_for_timeout(1500)
-    page.wait_for_load_state("networkidle")
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=3000)
+    except Exception:
+        pass
 
     _click_ok_if_present(page)
     _click_ok_if_present(page)
@@ -161,7 +302,10 @@ def open_dibbs_rfq_list(page: Page, fsc: str | None = None, debug: bool = False)
         try:
             btn.click()
             page.wait_for_timeout(2500)
-            page.wait_for_load_state("networkidle")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
             _click_ok_if_present(page)
         except Exception:
             pass
@@ -178,7 +322,10 @@ def page_html(url: str, headless: bool = True) -> str:
     with dibbs_page(headless=headless) as (_, _, page):
         _goto_with_retry(page, url)
         page.wait_for_timeout(1200)
-        page.wait_for_load_state("networkidle")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=3000)
+        except Exception:
+            pass
         _click_ok_if_present(page)
         _click_ok_if_present(page)
         return page.content()

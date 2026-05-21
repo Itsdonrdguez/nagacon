@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class VendorLeadOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     opportunity_id: int
     source_type: str
@@ -26,10 +28,6 @@ class VendorLeadOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
-
 class VendorLeadUpsertRequest(BaseModel):
     opportunity_id: int = Field(..., ge=1)
     lead_id: int | None = None
@@ -38,6 +36,8 @@ class VendorLeadUpsertRequest(BaseModel):
 
 
 class VendorQuoteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     opportunity_id: int
     cage: str
@@ -49,22 +49,32 @@ class VendorQuoteOut(BaseModel):
     status: str
     unit_price: float | None = None
     lead_time_days: int | None = None
+    requested_at: datetime | None = None
+    last_follow_up_at: datetime | None = None
+    next_follow_up_at: datetime | None = None
+    follow_up_count: int = 0
+    follow_up_status: str | None = None
+    follow_up_label: str | None = None
+    follow_up_due: bool = False
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
-
 class SeedRequest(BaseModel):
     opportunity_id: int = Field(..., ge=1)
+
+
+class FollowUpRequest(BaseModel):
+    opportunity_id: int = Field(..., ge=1)
+    notes: str | None = None
 
 
 class UpsertRequest(BaseModel):
     opportunity_id: int = Field(..., ge=1)
     cage: str = Field(..., min_length=3, max_length=10)
     part_number: str | None = None
+    approved: bool | None = None
+    approval_notes: str | None = None
 
     company_name: str | None = None
     contact_name: str | None = None

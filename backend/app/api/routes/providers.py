@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_organization, get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.repositories.providers import ProviderRepository
 from app.models.opportunity import Opportunity
 from app.schemas.provider import (
@@ -15,6 +15,7 @@ from app.schemas.provider import (
     ProviderRowOut,
     ProviderUpdate,
 )
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.providers.pdf_cage_extractor import (
     backfill_dibbs_provider_item_nomenclature,
     enrich_provider_websites_from_sam,
@@ -22,6 +23,8 @@ from app.services.providers.pdf_cage_extractor import (
     extract_providers_from_opportunity_pdfs,
 )
 from app.services.providers.contact_discovery import discover_provider_contacts
+from app.services.providers.identity_resolver import resolve_provider_identities
+from app.services.search_jobs import start_search_job
 
 router = APIRouter(prefix="/api/providers", tags=["providers"])
 
@@ -57,6 +60,18 @@ def list_providers(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.get("/{provider_id}")
+def get_provider_detail(
+    provider_id: int,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    detail = _repo(db, current_org).get_detail(provider_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return detail
 
 
 @router.post("", response_model=ProviderOut)
@@ -105,10 +120,12 @@ def extract_from_dibbs_pdfs(
     limit: int | None = None,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     return extract_providers_from_dibbs_pdfs(
         db,
         organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
         enrich_with_sam=enrich_with_sam,
         limit=limit,
     )
@@ -130,12 +147,40 @@ def enrich_sam_websites(
     limit: int = 250,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
-    return enrich_provider_websites_from_sam(
+    org_id = getattr(current_org, "id", None)
+    user_id = getattr(current_user, "id", None)
+    run = start_import_run(
         db,
-        organization_id=getattr(current_org, "id", None),
-        limit=limit,
+        source="PROVIDER_SAM_WEBSITE_ENRICHMENT",
+        run_kind="provider_sam_website_enrichment",
+        request_payload={"limit": limit},
+        organization_id=org_id,
+        user_id=user_id,
     )
+    try:
+        result = enrich_provider_websites_from_sam(
+            db,
+            organization_id=org_id,
+            user_id=user_id,
+            limit=limit,
+        )
+        complete_import_run(
+            db,
+            run,
+            status="completed" if not (result.get("errors") or []) else "partial_success",
+            result_payload=result,
+            row_count=int(result.get("provider_count") or 0),
+            inserted_count=int(result.get("created") or 0),
+            updated_count=int(result.get("updated") or 0),
+            skipped_count=int(result.get("skipped") or 0),
+            error_message=" | ".join(str(item) for item in (result.get("errors") or [])[:5]) or None,
+        )
+        return result
+    except Exception as exc:
+        complete_import_run(db, run, status="failed", error_message=str(exc))
+        raise
 
 
 @router.post("/discover-contacts")
@@ -151,12 +196,44 @@ def discover_contacts(
     )
 
 
+@router.post("/resolve-identities")
+def resolve_identities(
+    limit: int = 250,
+    db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
+):
+    return resolve_provider_identities(
+        db,
+        organization_id=getattr(current_org, "id", None),
+        limit=limit,
+    )
+
+
+@router.post("/backfill/job")
+def start_provider_backfill_job(
+    limit: int = 250,
+    enrich_websites: bool = True,
+    current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
+):
+    return start_search_job(
+        "provider_backfill",
+        {
+            "organization_id": getattr(current_org, "id", None),
+            "user_id": getattr(current_user, "id", None),
+            "limit": max(min(limit, 1000), 1),
+            "enrich_websites": enrich_websites,
+        },
+    )
+
+
 @router.post("/extract/opportunity/{opportunity_id}", response_model=ProviderPdfExtractResult)
 def extract_from_opportunity_pdfs(
     opportunity_id: int,
     enrich_with_sam: bool = True,
     db: Session = Depends(get_db),
     current_org=Depends(get_current_organization),
+    current_user=Depends(get_current_user),
 ):
     org_id = getattr(current_org, "id", None)
     query = db.query(Opportunity).filter(Opportunity.id == opportunity_id)
@@ -170,4 +247,5 @@ def extract_from_opportunity_pdfs(
         opp,
         enrich_with_sam=enrich_with_sam,
         organization_id=org_id,
+        user_id=getattr(current_user, "id", None),
     )

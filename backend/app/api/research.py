@@ -4,14 +4,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import requests
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.models.opportunity import Opportunity
 from app.services.research.usaspending_research_service import (
     search_usaspending_for_opportunity,
     seed_usaspending_vendors_into_leads,
 )
 
-router = APIRouter(prefix="/api/research/usaspending", tags=["research"])
+router = APIRouter(
+    prefix="/api/research/usaspending",
+    tags=["research"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 @router.post("/opportunities/{opportunity_id}")

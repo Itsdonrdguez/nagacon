@@ -4,8 +4,34 @@
   flex-direction: column;
 }
 
+.tabs-mobile-select {
+  display: none;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-bottom: 0.85rem;
+}
+
+.tabs-mobile-select-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #475569;
+}
+
+.tabs-mobile-select select {
+  width: 100%;
+  min-height: 44px;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #0f172a;
+  font: inherit;
+}
+
 .tabs-nav {
   display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
   border-bottom: 1px solid #e5e7eb;
   margin-bottom: 1.5rem;
 }
@@ -22,6 +48,7 @@
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  border-radius: 8px 8px 0 0;
 }
 
 .tab-button:hover {
@@ -39,4 +66,26 @@
 
 .tab-content {
   flex: 1;
+}
+
+@media (max-width: 720px) {
+  .tabs-mobile-select {
+    display: flex;
+  }
+
+  .tabs-nav {
+    border-bottom: none;
+    margin-bottom: 1rem;
+  }
+
+  .tab-button {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    flex: 1 1 calc(50% - 0.25rem);
+    justify-content: center;
+  }
+
+  .tab-button.active {
+    border-color: #2563eb;
+  }
 }

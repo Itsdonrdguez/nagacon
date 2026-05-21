@@ -3,6 +3,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.deps import get_current_organization, get_current_user, get_db
 from app.main import app
 
@@ -41,6 +42,27 @@ def client(dummy_db: DummyDB) -> Iterator[TestClient]:
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_current_user
+    app.dependency_overrides[get_current_organization] = override_current_organization
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def unauth_client(dummy_db: DummyDB, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    def override_get_db():
+        yield dummy_db
+
+    def override_current_organization():
+        return type("CurrentOrg", (), {
+            "id": 1,
+            "name": "Default Organization",
+            "slug": "default",
+            "is_default": True,
+        })()
+
+    monkeypatch.setattr(settings, "DEV_AUTH_FALLBACK_ENABLED", False, raising=False)
+    app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_organization] = override_current_organization
     with TestClient(app) as test_client:
         yield test_client

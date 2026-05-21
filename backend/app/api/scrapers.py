@@ -5,9 +5,14 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.orm import Session
 
+from app.core.deps import get_current_organization, get_current_user
 from app.core.db import get_db
 from app.schemas.opportunity import RawOpportunity
+from app.services.dibbs.fetch_guard import guarded_fetch_dibbs_opportunities
+from app.services.ingest_enrichment import enrich_dibbs_opportunities_after_ingest
+from app.services.opportunity_ingest import find_existing_opportunity
 from app.services.opportunity_ingest import upsert_raw_opportunity
+from app.services.import_run_service import complete_import_run, start_import_run
 from app.services.provider_settings_service import get_effective_sam_api_key
 from app.services.scrapers.dibbs_scraper import fetch_dibbs_opportunities
 from app.services.scrapers.sam_scraper import SamScraperError, fetch_sam_opportunities
@@ -17,7 +22,11 @@ from app.services.scrapers.state_local_scraper import (
     fetch_maryland_opportunities,
 )
 
-router = APIRouter(prefix="/api/scrapers", tags=["scrapers"])
+router = APIRouter(
+    prefix="/api/scrapers",
+    tags=["scrapers"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 def _parse_code_list(value: str | None) -> list[str]:
@@ -147,71 +156,136 @@ def _dedupe_raw_opportunities(raw_opps: list[RawOpportunity]) -> list[RawOpportu
     return unique
 
 
-def _ingest_many(db: Session, raw_opps: list[RawOpportunity]) -> dict[str, Any]:
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ingest_many(
+    db: Session,
+    raw_opps: list[RawOpportunity],
+    *,
+    auto_enrich_dibbs: bool = False,
+    queue_nsn_build: bool = False,
+    organization_id: int | None = None,
+) -> dict[str, Any]:
     inserted = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
+    dibbs_opportunity_ids: list[int] = []
 
     for raw in raw_opps:
         try:
-            result = upsert_raw_opportunity(db, raw, force_refresh=True)
+            result = upsert_raw_opportunity(db, raw, force_refresh=True, organization_id=organization_id)
             if result == "inserted":
                 inserted += 1
             elif result == "updated":
                 updated += 1
             else:
                 skipped += 1
+            if str(raw.source or "").upper() == "DIBBS":
+                opp = find_existing_opportunity(db, raw)
+                if opp and getattr(opp, "id", None):
+                    dibbs_opportunity_ids.append(opp.id)
         except Exception as exc:
             db.rollback()
             errors.append(str(exc))
 
-    return {
+    out = {
         "inserted": inserted,
         "updated": updated,
         "skipped": skipped,
         "errors": errors,
     }
+    if auto_enrich_dibbs and dibbs_opportunity_ids:
+        out["part_finder_enrichment"] = enrich_dibbs_opportunities_after_ingest(
+            db,
+            dibbs_opportunity_ids,
+            organization_id=organization_id,
+            queue_nsn_build=queue_nsn_build,
+            max_items=len(dibbs_opportunity_ids),
+        )
+    return out
 
 
 @router.post("/sam/run")
 def run_sam_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+    current_org=Depends(get_current_organization),
 ):
+    run = start_import_run(
+        db,
+        source="SAM",
+        run_kind="scraper",
+        request_payload=dict(payload or {}),
+        organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
+    )
     try:
         payload = dict(payload or {})
-        api_key = get_effective_sam_api_key(db)
+        api_key = get_effective_sam_api_key(db, user_id=getattr(current_user, "id", None))
         if api_key:
             payload["api_key"] = api_key
         raw_opps = fetch_sam_opportunities(payload)
-        out = _ingest_many(db, raw_opps)
+        out = _ingest_many(db, raw_opps, organization_id=getattr(current_org, "id", None))
         if (payload or {}).get("debug"):
             out["diagnostics"] = {
                 "request": payload or {},
                 "rows_parsed": len(raw_opps),
                 "source": "sam.gov",
             }
+        complete_import_run(
+            db,
+            run,
+            status="completed",
+            result_payload=out,
+            row_count=len(raw_opps),
+            inserted_count=int(out.get("inserted") or 0),
+            updated_count=int(out.get("updated") or 0),
+            skipped_count=int(out.get("skipped") or 0),
+        )
         return out
     except SamScraperError as exc:
-        return {
+        out = {
             "inserted": 0,
             "updated": 0,
             "skipped": 0,
             "errors": [str(exc)],
             "diagnostics": {"request": payload or {}, "rows_parsed": 0, "source": "sam.gov"},
         }
+        complete_import_run(db, run, status="failed", result_payload=out, error_message=str(exc), row_count=0)
+        return out
 
 
 @router.post("/dibbs/run")
 def run_dibbs_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
 ):
     payload = dict(payload or {})
+    run = start_import_run(
+        db,
+        source="DIBBS",
+        run_kind="scraper",
+        request_payload=payload,
+        organization_id=getattr(current_org, "id", None),
+    )
     max_pages = int(payload.get("max_pages") or 4)
     raw_opps = fetch_dibbs_opportunities(params=payload, max_pages=max_pages)
-    out = _ingest_many(db, raw_opps)
+    out = _ingest_many(
+        db,
+        raw_opps,
+        auto_enrich_dibbs=_as_bool(payload.get("auto_enrich_parts"), True),
+        queue_nsn_build=_as_bool(payload.get("queue_nsn_build"), False),
+        organization_id=getattr(current_org, "id", None),
+    )
     if payload.get("debug"):
         out["diagnostics"] = {
             "request_fsc": payload.get("fsc") or payload.get("fsc_code"),
@@ -220,6 +294,16 @@ def run_dibbs_scraper(
             "rows_parsed": len(raw_opps),
             "mode": "adapter",
         }
+    complete_import_run(
+        db,
+        run,
+        status="completed",
+        result_payload=out,
+        row_count=len(raw_opps),
+        inserted_count=int(out.get("inserted") or 0),
+        updated_count=int(out.get("updated") or 0),
+        skipped_count=int(out.get("skipped") or 0),
+    )
     return out
 
 
@@ -227,38 +311,52 @@ def run_dibbs_scraper(
 def run_eva_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
 ):
     payload = dict(payload or {})
+    run = start_import_run(db, source="STATE_LOCAL_EVA", run_kind="scraper", request_payload=payload, organization_id=getattr(current_org, "id", None))
     max_pages = int(payload.pop("max_pages", 2))
-    return _ingest_many(db, fetch_eva_opportunities(params=payload, max_pages=max_pages))
+    out = _ingest_many(db, fetch_eva_opportunities(params=payload, max_pages=max_pages), organization_id=getattr(current_org, "id", None))
+    complete_import_run(db, run, status="completed", result_payload=out, inserted_count=int(out.get("inserted") or 0), updated_count=int(out.get("updated") or 0), skipped_count=int(out.get("skipped") or 0))
+    return out
 
 
 @router.post("/state-local/maryland/run")
 def run_maryland_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
 ):
     payload = dict(payload or {})
+    run = start_import_run(db, source="STATE_LOCAL_MARYLAND", run_kind="scraper", request_payload=payload, organization_id=getattr(current_org, "id", None))
     max_pages = int(payload.pop("max_pages", 2))
-    return _ingest_many(db, fetch_maryland_opportunities(params=payload, max_pages=max_pages))
+    out = _ingest_many(db, fetch_maryland_opportunities(params=payload, max_pages=max_pages), organization_id=getattr(current_org, "id", None))
+    complete_import_run(db, run, status="completed", result_payload=out, inserted_count=int(out.get("inserted") or 0), updated_count=int(out.get("updated") or 0), skipped_count=int(out.get("skipped") or 0))
+    return out
 
 
 @router.post("/state-local/dc/run")
 def run_dc_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
 ):
     payload = dict(payload or {})
+    run = start_import_run(db, source="STATE_LOCAL_DC", run_kind="scraper", request_payload=payload, organization_id=getattr(current_org, "id", None))
     max_pages = int(payload.pop("max_pages", 2))
-    return _ingest_many(db, fetch_dc_opportunities(params=payload, max_pages=max_pages))
+    out = _ingest_many(db, fetch_dc_opportunities(params=payload, max_pages=max_pages), organization_id=getattr(current_org, "id", None))
+    complete_import_run(db, run, status="completed", result_payload=out, inserted_count=int(out.get("inserted") or 0), updated_count=int(out.get("updated") or 0), skipped_count=int(out.get("skipped") or 0))
+    return out
 
 
 @router.post("/state-local/all/run")
 def run_all_state_local(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_org=Depends(get_current_organization),
 ):
     payload = dict(payload or {})
+    run = start_import_run(db, source="STATE_LOCAL_ALL", run_kind="scraper", request_payload=payload, organization_id=getattr(current_org, "id", None))
 
     eva_params = dict(payload)
     md_params = dict(payload)
@@ -266,24 +364,34 @@ def run_all_state_local(
 
     result = {}
     try:
-        result["eva"] = _ingest_many(db, fetch_eva_opportunities(params=eva_params, max_pages=int(eva_params.pop("max_pages", 2))))
+        result["eva"] = _ingest_many(db, fetch_eva_opportunities(params=eva_params, max_pages=int(eva_params.pop("max_pages", 2))), organization_id=getattr(current_org, "id", None))
     except Exception as exc:
         result["eva"] = {"inserted": 0, "updated": 0, "skipped": 0, "errors": [str(exc)]}
     try:
-        result["maryland"] = _ingest_many(db, fetch_maryland_opportunities(params=md_params, max_pages=int(md_params.pop("max_pages", 2))))
+        result["maryland"] = _ingest_many(db, fetch_maryland_opportunities(params=md_params, max_pages=int(md_params.pop("max_pages", 2))), organization_id=getattr(current_org, "id", None))
     except Exception as exc:
         result["maryland"] = {"inserted": 0, "updated": 0, "skipped": 0, "errors": [str(exc)]}
     try:
-        result["dc"] = _ingest_many(db, fetch_dc_opportunities(params=dc_params, max_pages=int(dc_params.pop("max_pages", 2))))
+        result["dc"] = _ingest_many(db, fetch_dc_opportunities(params=dc_params, max_pages=int(dc_params.pop("max_pages", 2))), organization_id=getattr(current_org, "id", None))
     except Exception as exc:
         result["dc"] = {"inserted": 0, "updated": 0, "skipped": 0, "errors": [str(exc)]}
 
+    aggregate = {
+        "inserted": sum(int((result.get(key) or {}).get("inserted") or 0) for key in ["eva", "maryland", "dc"]),
+        "updated": sum(int((result.get(key) or {}).get("updated") or 0) for key in ["eva", "maryland", "dc"]),
+        "skipped": sum(int((result.get(key) or {}).get("skipped") or 0) for key in ["eva", "maryland", "dc"]),
+        "errors": [err for key in ["eva", "maryland", "dc"] for err in ((result.get(key) or {}).get("errors") or [])],
+    }
+    complete_import_run(db, run, status="completed" if not aggregate["errors"] else "partial_success", result_payload=result, inserted_count=aggregate["inserted"], updated_count=aggregate["updated"], skipped_count=aggregate["skipped"])
     return result
 
 
 def run_multi_source_search(
     payload: dict,
     db: Session,
+    *,
+    user_id: int | None = None,
+    organization_id: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
@@ -301,7 +409,7 @@ def run_multi_source_search(
         "organizationName": (payload.get("sam_agency") or payload.get("organizationName") or "").strip() or None,
         "organizationCode": (payload.get("sam_agency_code") or payload.get("organizationCode") or "").strip() or None,
     }
-    sam_api_key = get_effective_sam_api_key(db)
+    sam_api_key = get_effective_sam_api_key(db, user_id=user_id)
 
     sources = payload.get("sources") or ["SAM", "DIBBS"]
     sources = [str(source).upper() for source in sources]
@@ -374,7 +482,7 @@ def run_multi_source_search(
                 )
                 sam_raw.extend(sam_code_raw)
             sam_raw = _dedupe_raw_opportunities(sam_raw)
-            sam_result = _ingest_many(db, sam_raw)
+            sam_result = _ingest_many(db, sam_raw, organization_id=organization_id)
             sam_result["diagnostics"] = {
                 "used_codes": sam_codes,
                 "per_code_limit": limit,
@@ -433,7 +541,7 @@ def run_multi_source_search(
                         "all_results": use_all_results,
                     }
                     try:
-                        dibbs_code_raw = fetch_dibbs_opportunities(
+                        dibbs_code_raw = guarded_fetch_dibbs_opportunities(
                             params=dibbs_payload, max_pages=max_pages
                         )
                     except Exception as exc:
@@ -463,7 +571,13 @@ def run_multi_source_search(
                 dibbs_raw = _dedupe_raw_opportunities(dibbs_raw)
 
                 if dibbs_raw:
-                    dibbs_result = _ingest_many(db, dibbs_raw)
+                    dibbs_result = _ingest_many(
+                        db,
+                        dibbs_raw,
+                        auto_enrich_dibbs=_as_bool(payload.get("auto_enrich_parts"), True),
+                        queue_nsn_build=_as_bool(payload.get("queue_nsn_build"), False),
+                        organization_id=organization_id,
+                    )
                     dibbs_result["diagnostics"] = {
                         "used_codes": dibbs_fsc_codes,
                         "per_code_limit": limit,
@@ -552,5 +666,30 @@ def run_multi_source_search(
 def run_multi_source_scraper(
     payload: dict = Body(default={}),
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+    current_org=Depends(get_current_organization),
 ):
-    return run_multi_source_search(payload, db)
+    run = start_import_run(
+        db,
+        source="MULTI_SOURCE",
+        run_kind="scraper",
+        request_payload=dict(payload or {}),
+        organization_id=getattr(current_org, "id", None),
+        user_id=getattr(current_user, "id", None),
+    )
+    out = run_multi_source_search(
+        payload,
+        db,
+        user_id=getattr(current_user, "id", None),
+        organization_id=getattr(current_org, "id", None),
+    )
+    complete_import_run(
+        db,
+        run,
+        status="completed" if not (out.get("errors") or []) else "partial_success",
+        result_payload=out,
+        inserted_count=int(out.get("inserted") or 0),
+        updated_count=int(out.get("updated") or 0),
+        skipped_count=int(out.get("skipped") or 0),
+    )
+    return out

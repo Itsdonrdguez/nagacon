@@ -3,12 +3,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.schemas.agent import OrchestrationRequest
 from app.services.agents.orchestration import orchestrate_agents
 from app.services.agents.proposal_agent import generate_proposal_draft
 
-router = APIRouter(prefix="/api/agents", tags=["agents"])
+router = APIRouter(
+    prefix="/api/agents",
+    tags=["agents"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 @router.post("/opportunities/{opportunity_id}/proposal-draft")

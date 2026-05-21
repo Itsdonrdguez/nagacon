@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from app.api import files as files_api
 from app.services import opportunity_ingest
+from app.services import opportunity_intake_pipeline
 from app.schemas.opportunity import RawOpportunity
 
 
@@ -142,6 +143,61 @@ def test_parse_file_returns_parsed_payload(client):
     assert payload["filename"] == "sample.txt"
 
 
+def test_parse_opportunity_file_rejects_oversized_document(monkeypatch):
+    from app.services import document_parser
+
+    file_path = _make_local_temp_file("oversized.txt", "A" * 32)
+    monkeypatch.setattr(
+        document_parser,
+        "validate_file_size_bytes",
+        lambda size: (False, "file exceeds maximum size of 8 bytes"),
+    )
+
+    parsed = document_parser.parse_opportunity_file(str(file_path))
+
+    assert parsed["parser"] == "none"
+    assert "maximum size" in parsed["error"]
+
+
+def test_save_downloaded_file_records_security_metadata(monkeypatch):
+    from app.services import pdf_service
+
+    created = []
+
+    class FakeDB:
+        def add(self, item):
+            created.append(item)
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(pdf_service, "_matching_file_records", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pdf_service, "store_bytes", lambda path, data, content_type=None: "C:/tmp/spec.pdf")
+    monkeypatch.setattr(pdf_service, "validate_file_size_bytes", lambda size: (True, None))
+
+    opp = SimpleNamespace(id=3, organization_id=1)
+    count, filename = pdf_service._save_downloaded_file(
+        FakeDB(),
+        opp,
+        TEST_TEMP_DIR,
+        "spec.pdf",
+        "https://example.test/spec.pdf",
+        b"%PDF-1.4 test",
+        "DIBBS_ATTACHMENT",
+    )
+
+    assert count == 1
+    assert filename == "spec.pdf"
+    assert created[0].parsed_metadata["_security"]["status"] == "not_scanned"
+
+
+def test_allowed_download_content_type_rejects_html_without_file_extension():
+    from app.services.document_security import is_allowed_download_content_type
+
+    assert is_allowed_download_content_type("text/html", "notice") is False
+    assert is_allowed_download_content_type("application/pdf", "notice") is True
+
+
 def test_list_files_includes_parse_status_flags(client):
     file_record = SimpleNamespace(
         id=21,
@@ -188,6 +244,24 @@ def test_list_files_includes_parse_status_flags(client):
     payload = response.json()
     assert payload[0]["has_extracted_text"] is True
     assert payload[0]["has_parsed_metadata"] is True
+
+
+def test_opportunity_intake_rollback_skips_non_active_transaction():
+    calls = []
+
+    class FakeTransaction:
+        is_active = False
+
+    class FakeDB:
+        def get_transaction(self):
+            return FakeTransaction()
+
+        def rollback(self):
+            calls.append("rollback")
+
+    opportunity_intake_pipeline._rollback_if_active(FakeDB())
+
+    assert calls == []
 
 
 def test_get_file_insights_returns_preview_and_metadata(client):

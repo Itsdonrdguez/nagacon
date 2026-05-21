@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import {
@@ -50,10 +51,64 @@ function SectionList({ items, empty }) {
   )
 }
 
+function buildReadinessModel(data, publogStatus) {
+  const confidence = data?.confidence || {}
+  const missing = []
+  const nextSteps = []
+
+  if (!confidence.has_catalog_record) {
+    missing.push('Catalog identity')
+    nextSteps.push('Build intelligence')
+  }
+  if (!confidence.has_reference_records) {
+    missing.push('Catalog references')
+    nextSteps.push(publogStatus === 'ready' ? 'Refresh catalog package' : 'Wait for catalog package')
+  }
+  if (!confidence.has_vendor_recommendations) {
+    missing.push('Vendor candidates')
+    nextSteps.push('Seed providers')
+  }
+  if (!confidence.has_pricing_signals) {
+    missing.push('Pricing signals')
+    nextSteps.push('Refresh awards and pricing')
+  }
+
+  const uniqueNextSteps = Array.from(new Set(nextSteps))
+  if (missing.length === 0) {
+    return {
+      tone: 'success',
+      status: 'READY TO WORK',
+      summary: 'Catalog identity, vendor candidates, and pricing signals are all present.',
+      missing,
+      nextSteps: ['Review vendor candidates', 'Open provider records'],
+    }
+  }
+  if (missing.length <= 2) {
+    return {
+      tone: 'warning',
+      status: 'PARTIAL',
+      summary: 'Some useful intelligence is here, but the record still has gaps.',
+      missing,
+      nextSteps: uniqueNextSteps,
+    }
+  }
+  return {
+    tone: 'error',
+    status: 'NOT READY',
+    summary: 'This NSN still needs more intelligence before it becomes a confident sourcing record.',
+    missing,
+    nextSteps: uniqueNextSteps,
+  }
+}
+
 export default function NSNIntelligence() {
   const queryClient = useQueryClient()
-  const [input, setInput] = useState(DEFAULT_NSN)
-  const [submittedNsn, setSubmittedNsn] = useState(DEFAULT_NSN)
+  const [searchParams] = useSearchParams()
+  const initialNsn = normalizeSearch(searchParams.get('nsn')) || DEFAULT_NSN
+  const [input, setInput] = useState(initialNsn)
+  const [submittedNsn, setSubmittedNsn] = useState(initialNsn)
+  const [buildJobId, setBuildJobId] = useState(null)
+  const [autoImportedNsns, setAutoImportedNsns] = useState({})
 
   const cleanNsn = normalizeSearch(submittedNsn)
   const nsnQuery = useQuery({
@@ -61,6 +116,27 @@ export default function NSNIntelligence() {
     enabled: cleanNsn.length === 13,
     queryFn: async () => {
       const res = await api.get(`/api/nsn/${cleanNsn}`)
+      return res.data
+    },
+  })
+  const publogStatusQuery = useQuery({
+    queryKey: ['publog-status'],
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const res = await api.get('/api/nsn/publog/status')
+      return res.data
+    },
+  })
+  const buildJobQuery = useQuery({
+    queryKey: ['search-job', buildJobId],
+    enabled: Boolean(buildJobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'success' || status === 'failed' ? false : 1500
+    },
+    queryFn: async () => {
+      const res = await api.get(`/api/search-jobs/${buildJobId}`)
       return res.data
     },
   })
@@ -95,7 +171,7 @@ export default function NSNIntelligence() {
 
   const buildMutation = useMutation({
     mutationFn: async () => {
-      const res = await api.post(`/api/nsn/${cleanNsn}/build`, null, {
+      const res = await api.post(`/api/nsn/${cleanNsn}/build-job`, null, {
         params: {
           run_usaspending: true,
           seed_providers: true,
@@ -104,9 +180,8 @@ export default function NSNIntelligence() {
       })
       return res.data
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['nsn-intelligence', cleanNsn] })
-      queryClient.invalidateQueries({ queryKey: ['providers'] })
+    onSuccess: (job) => {
+      setBuildJobId(job.id)
     },
   })
 
@@ -133,14 +208,71 @@ export default function NSNIntelligence() {
   const pricing = data?.pricing || {}
   const snapshot = data?.snapshot || null
   const snapshotUsaspending = snapshot?.usaspending || null
+  const sourceFreshness = data?.source_freshness || {}
+  const cageProfiles = data?.cage_profiles || []
+  const alternateGraph = data?.alternate_graph || {}
+  const buildJob = buildJobQuery.data
+  const buildJobDone = buildJob?.status === 'success'
+  const buildJobFailed = buildJob?.status === 'failed'
   const awardSignalCount = Number(awards.count || 0) + Number(nsnAwardEvidence.count || 0)
+  const todayContext = useMemo(() => {
+    if (searchParams.get('source') !== 'today') return null
+    return {
+      mode: searchParams.get('mode') || 'lookup',
+      title: searchParams.get('title') || '',
+      solicitation: searchParams.get('sol') || '',
+      nsn: normalizeSearch(searchParams.get('nsn')),
+    }
+  }, [searchParams])
+
+  useEffect(() => {
+    if (!buildJobDone) return
+    queryClient.invalidateQueries({ queryKey: ['nsn-intelligence', cleanNsn] })
+    queryClient.invalidateQueries({ queryKey: ['providers'] })
+  }, [buildJobDone, cleanNsn, queryClient])
+
+  useEffect(() => {
+    if (cleanNsn.length !== 13 || !data || importPublogMutation.isPending || autoImportedNsns[cleanNsn]) return
+    if (publogStatusQuery.data?.status !== 'ready') return
+
+    const needsCatalogHelp = !data?.confidence?.has_catalog_record || !data?.confidence?.has_reference_records
+    if (!needsCatalogHelp) return
+
+    setAutoImportedNsns((current) => ({ ...current, [cleanNsn]: true }))
+    importPublogMutation.mutate()
+  }, [
+    autoImportedNsns,
+    cleanNsn,
+    data,
+    importPublogMutation,
+    publogStatusQuery.data?.status,
+  ])
+
+  useEffect(() => {
+    const prefilledNsn = normalizeSearch(searchParams.get('nsn'))
+    if (!prefilledNsn || prefilledNsn === submittedNsn) return
+    setInput(prefilledNsn)
+    setSubmittedNsn(prefilledNsn)
+  }, [searchParams, submittedNsn])
 
   const summaryStats = useMemo(() => ([
     { label: 'Vendor Candidates', value: numberLabel(recommendations.length), subtitle: data?.confidence?.has_vendor_recommendations ? 'Ranked by evidence' : 'Needs more evidence' },
-    { label: 'Catalog References', value: numberLabel(references.length), subtitle: data?.confidence?.has_reference_records ? 'CAGE and part links' : 'Import PUB LOG' },
+    {
+      label: 'Catalog References',
+      value: numberLabel(references.length),
+      subtitle: data?.confidence?.has_reference_records
+        ? 'CAGE and part links'
+        : publogStatusQuery.data?.status === 'ready'
+          ? 'Checking the catalog package'
+          : 'Catalog package not ready yet',
+    },
     { label: 'Awards', value: numberLabel(awardSignalCount), subtitle: snapshotUsaspending ? `${numberLabel(snapshotUsaspending.awards_found)} refresh hits` : awardSignalCount ? 'Persisted evidence' : 'Run refresh' },
     { label: 'Unit Price Avg', value: pricing.unit_average ? money(pricing.unit_average) : 'Not available', subtitle: pricing.count ? `${numberLabel(pricing.count)} price facts` : 'No pricing yet' },
-  ]), [recommendations.length, references.length, awardSignalCount, pricing.unit_average, pricing.count, data?.confidence, snapshotUsaspending])
+  ]), [recommendations.length, references.length, awardSignalCount, pricing.unit_average, pricing.count, data?.confidence, snapshotUsaspending, publogStatusQuery.data?.status])
+  const readiness = useMemo(
+    () => buildReadinessModel(data, publogStatusQuery.data?.status),
+    [data, publogStatusQuery.data?.status],
+  )
 
   const handleSearch = (event) => {
     event.preventDefault()
@@ -159,6 +291,81 @@ export default function NSNIntelligence() {
         </div>
       </div>
 
+      {todayContext ? (
+        <Card title="Picked Up From Today" className="research-warning-box">
+          <div className="row-title">
+            {todayContext.mode === 'build' ? 'Recommended next step: Build intelligence' : 'Recommended next step: Review this NSN'}
+          </div>
+          <div className="row-subtitle">
+            {[todayContext.solicitation, todayContext.title, todayContext.nsn ? `NSN ${todayContext.nsn}` : ''].filter(Boolean).join(' | ')}
+          </div>
+          <div className="panel-subtitle">
+            We carried the NSN over from Today so you can keep researching without starting over.
+          </div>
+        </Card>
+      ) : null}
+
+      {cleanNsn.length === 13 && data ? (
+        <Card title="Readiness Status" className={readiness.tone === 'error' ? 'research-warning-box' : ''}>
+          <div className="workspace-action-column">
+            <div className="company-form-actions">
+              <StatusPill status={readiness.status} />
+            </div>
+            <div className="row-title">{readiness.summary}</div>
+            <div className="row-subtitle">
+              Missing: {readiness.missing.length ? readiness.missing.join(' | ') : 'Nothing critical missing'}
+            </div>
+            <div className="simple-list">
+              {readiness.nextSteps.map((step, index) => (
+                <div className="simple-list-row" key={`next-step-${index}`}>
+                  <div className="row-title">{step}</div>
+                </div>
+              ))}
+            </div>
+            <div className="company-form-actions">
+              {readiness.nextSteps.includes('Build intelligence') ? (
+                <Button
+                  type="button"
+                  loading={buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
+                  disabled={cleanNsn.length !== 13 || buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
+                  onClick={() => buildMutation.mutate()}
+                >
+                  Build Intelligence
+                </Button>
+              ) : null}
+              {readiness.nextSteps.includes('Seed providers') ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  loading={seedMutation.isPending}
+                  disabled={!data || seedMutation.isPending}
+                  onClick={() => seedMutation.mutate()}
+                >
+                  Seed Providers
+                </Button>
+              ) : null}
+              {readiness.nextSteps.includes('Refresh awards and pricing') || readiness.nextSteps.includes('Refresh catalog package') ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  loading={refreshMutation.isPending || importPublogMutation.isPending}
+                  disabled={!data || refreshMutation.isPending || importPublogMutation.isPending}
+                  onClick={() => {
+                    if (!data?.confidence?.has_reference_records && publogStatusQuery.data?.status === 'ready') {
+                      importPublogMutation.mutate()
+                      return
+                    }
+                    refreshMutation.mutate({ seedProviders: false })
+                  }}
+                >
+                  Refresh Signals
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        </Card>
+      ) : null}
+
       <Card title="Lookup">
         <form className="nsn-search-form" onSubmit={handleSearch}>
           <Input
@@ -171,20 +378,11 @@ export default function NSNIntelligence() {
             <Button type="submit" disabled={normalizeSearch(input).length !== 13}>Lookup</Button>
             <Button
               type="button"
-              loading={buildMutation.isPending}
-              disabled={cleanNsn.length !== 13 || buildMutation.isPending}
+              loading={buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
+              disabled={cleanNsn.length !== 13 || buildMutation.isPending || (buildJob && !buildJobDone && !buildJobFailed)}
               onClick={() => buildMutation.mutate()}
             >
               Build Intelligence
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              loading={importPublogMutation.isPending}
-              disabled={!data || importPublogMutation.isPending}
-              onClick={() => importPublogMutation.mutate()}
-            >
-              Import PUB LOG
             </Button>
             <Button
               type="button"
@@ -206,6 +404,24 @@ export default function NSNIntelligence() {
             </Button>
           </div>
         </form>
+        <div className="simple-list">
+          <div className="simple-list-row">
+            <div className="row-title">Lookup</div>
+            <div className="row-subtitle">Loads the current NSN record, references, vendors, pricing, and any saved evidence already in the system.</div>
+          </div>
+          <div className="simple-list-row">
+            <div className="row-title">Build Intelligence</div>
+            <div className="row-subtitle">Runs the fuller pipeline for this NSN: catalog package refresh, awards research, and provider seeding.</div>
+          </div>
+          <div className="simple-list-row">
+            <div className="row-title">Refresh</div>
+            <div className="row-subtitle">Updates awards and pricing signals without running the full provider-building workflow.</div>
+          </div>
+          <div className="simple-list-row">
+            <div className="row-title">Seed Providers</div>
+            <div className="row-subtitle">Creates or updates provider candidates from the evidence already tied to this NSN.</div>
+          </div>
+        </div>
         {normalizeSearch(input).length > 0 && normalizeSearch(input).length !== 13 ? (
           <div className="form-hint error">Enter a 13 digit NSN.</div>
         ) : null}
@@ -247,10 +463,19 @@ export default function NSNIntelligence() {
             ))}
           </div>
 
-          {(buildMutation.data || importPublogMutation.data || refreshMutation.data || seedMutation.data) ? (
+          {(buildJob || buildMutation.data || importPublogMutation.data || refreshMutation.data || seedMutation.data) ? (
             <Card title="Last Action">
               <div className="nsn-action-result">
-                {buildMutation.data ? (
+                {buildJob ? (
+                  <div>
+                    <div className="row-title">Intelligence build job</div>
+                    <div className="row-subtitle">
+                      {buildJob.status} | {numberLabel(buildJob.progress?.percent)}% | {buildJob.progress?.current_label || 'Queued'}
+                      {buildJob.error ? ` | ${buildJob.error}` : ''}
+                    </div>
+                  </div>
+                ) : null}
+                {buildMutation.data && !buildJob ? (
                   <div>
                     <div className="row-title">Intelligence build</div>
                     <div className="row-subtitle">
@@ -260,7 +485,7 @@ export default function NSNIntelligence() {
                 ) : null}
                 {importPublogMutation.data ? (
                   <div>
-                    <div className="row-title">PUB LOG import</div>
+                    <div className="row-title">Catalog package refresh</div>
                     <div className="row-subtitle">
                       Identity rows {numberLabel(importPublogMutation.data.identity_rows)} | Part rows {numberLabel(importPublogMutation.data.part_rows)}
                     </div>
@@ -279,6 +504,14 @@ export default function NSNIntelligence() {
                     <div className="row-title">Provider seeding</div>
                     <div className="row-subtitle">
                       Inserted {numberLabel(seedMutation.data.inserted)} | Updated {numberLabel(seedMutation.data.updated)} | Skipped {numberLabel(seedMutation.data.skipped)}
+                    </div>
+                  </div>
+                ) : null}
+                {refreshMutation.data?.summary?.award_provider_seed ? (
+                  <div>
+                    <div className="row-title">Awardee provider seeding</div>
+                    <div className="row-subtitle">
+                      Inserted {numberLabel(refreshMutation.data.summary.award_provider_seed.inserted)} | Updated {numberLabel(refreshMutation.data.summary.award_provider_seed.updated)} | Checked {numberLabel(refreshMutation.data.summary.award_provider_seed.award_rows_checked)}
                     </div>
                   </div>
                 ) : null}
@@ -319,6 +552,44 @@ export default function NSNIntelligence() {
           </Card>
 
           <div className="nsn-two-column">
+            <Card title="Alternate Part Graph">
+              {(alternateGraph.part_numbers?.length || alternateGraph.related_nodes?.length || alternateGraph.cages?.length) ? (
+                <div className="simple-list">
+                  <div className="simple-list-row">
+                    <div className="row-title">Connected Part Numbers</div>
+                    <div className="row-subtitle">{numberLabel(alternateGraph.part_numbers?.length || 0)} linked part numbers</div>
+                  </div>
+                  {alternateGraph.actual_related_nsn_count ? (
+                    <div className="simple-list-row">
+                      <div className="row-title">Connected NSNs</div>
+                      <div className="row-subtitle">{numberLabel(alternateGraph.actual_related_nsn_count)} resolved related NSN candidates</div>
+                    </div>
+                  ) : null}
+                  {(alternateGraph.part_numbers || []).slice(0, 6).map((row, index) => (
+                    <div className="simple-list-row" key={`${row.part_number}-${row.cage}-${index}`}>
+                      <div className="row-title">{row.part_number || 'Unknown part'}{row.company_name ? ` | ${row.company_name}` : ''}</div>
+                      <div className="row-subtitle">{row.cage || 'No CAGE'} | {row.relationship_type || 'reference'} | {row.source || 'PUB LOG'}</div>
+                    </div>
+                  ))}
+                  {(alternateGraph.related_nodes || []).slice(0, 6).map((row, index) => (
+                    <div className="simple-list-row" key={`${row.related_value}-${row.relationship_type}-${index}`}>
+                      <div className="row-title">
+                        {row.related_value || 'Related item'}
+                        {row.related_item_name ? ` | ${row.related_item_name}` : ''}
+                      </div>
+                      <div className="row-subtitle">
+                        {row.relationship_type || 'related'}
+                        {row.related_fsc ? ` | FSC ${row.related_fsc}` : ''}
+                        {row.notes ? ` | ${row.notes}` : ''}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState title="No alternate graph yet" subtitle="Expand PUB LOG coverage to surface more part links and related item concepts." />
+              )}
+            </Card>
+
             <Card title="Catalog References">
               {references.length ? (
                 <Table>
@@ -327,6 +598,7 @@ export default function NSNIntelligence() {
                       <TableHead>CAGE</TableHead>
                       <TableHead>Company</TableHead>
                       <TableHead>Part</TableHead>
+                      <TableHead>Role</TableHead>
                       <TableHead>Source</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -336,18 +608,77 @@ export default function NSNIntelligence() {
                         <TableCell>{row.cage || 'Unknown'}</TableCell>
                         <TableCell>{row.company_name || 'Unknown'}</TableCell>
                         <TableCell>{row.part_number || 'Unknown'}</TableCell>
+                        <TableCell>{row.relationship_type || row.reference_type || 'Reference'}</TableCell>
                         <TableCell>{row.source_name || 'Catalog'}</TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
                 </Table>
               ) : (
-                <EmptyState title="No catalog references" subtitle="Import PUB LOG reference data to populate CAGE and part-number relationships." />
+                <EmptyState
+                  title="No catalog references"
+                  subtitle={
+                    publogStatusQuery.data?.status === 'ready'
+                      ? 'We checked the catalog package, but this item still does not have reference links yet.'
+                      : 'The catalog package is not ready yet, so reference links have not been loaded.'
+                  }
+                />
               )}
             </Card>
 
             <Card title="Next Actions">
               <SectionList items={data.next_actions || []} empty="No next actions." />
+            </Card>
+          </div>
+
+          <div className="nsn-two-column">
+            <Card title="Characteristics">
+              {(data.evidence || []).filter((row) => row.claim_type === 'characteristic').length ? (
+                <div className="simple-list">
+                  {(data.evidence || []).filter((row) => row.claim_type === 'characteristic').slice(0, 8).map((row, index) => (
+                    <div className="simple-list-row" key={`${row.claim_value}-${index}`}>
+                      <div className="row-title">{row.claim_value || 'Characteristic'}</div>
+                      <div className="row-subtitle">{row.evidence_text || row.source_name || 'PUB LOG characteristic'}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="row-subtitle">No characteristics loaded yet for this NSN.</div>
+              )}
+            </Card>
+
+            <Card title="Source Freshness">
+              <div className="simple-list">
+                <div className="simple-list-row">
+                  <div className="row-title">PUB LOG</div>
+                  <div className="row-subtitle">{sourceFreshness.publog_source_version || 'Not loaded'} | {sourceFreshness.catalog_updated_at || 'No catalog timestamp'}</div>
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">Latest Snapshot</div>
+                  <div className="row-subtitle">{sourceFreshness.latest_snapshot_generated_at || 'No snapshot yet'}</div>
+                </div>
+                <div className="simple-list-row">
+                  <div className="row-title">Source Labels</div>
+                  <div className="row-subtitle">Catalog official | Awards API | Providers organization scoped</div>
+                </div>
+              </div>
+            </Card>
+
+            <Card title="CAGE Profiles">
+              {cageProfiles.length ? (
+                <div className="simple-list">
+                  {cageProfiles.slice(0, 8).map((profile) => (
+                    <div className="simple-list-row" key={profile.cage}>
+                      <div className="row-title">{profile.cage} | {profile.company_name || profile.official_profile?.company || 'Unknown company'}</div>
+                      <div className="row-subtitle">
+                        {(profile.part_numbers || []).slice(0, 3).join(', ') || 'No part numbers'} | {profile.official_profile?.city || 'No city'} {profile.official_profile?.state || ''}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="row-subtitle">Run Build Intelligence to enrich CAGE profile evidence.</div>
+              )}
             </Card>
           </div>
 

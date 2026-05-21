@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import Page
 
 from app.services.dibbs.structured_detail_parser import parse_dibbs_detail_structured
+from app.services.dibbs.structured_detail_parser import extract_dibbs_set_aside_type_from_html
 from app.services.dibbs.session import dibbs_page, open_dibbs_rfq_list
 
 DIBBS_BASE_URL = "https://www.dibbs.bsm.dla.mil"
@@ -154,6 +155,8 @@ def _fetch_detail_fields(page: Page, detail_url: str) -> dict[str, Any]:
 
     if structured.get("nomenclature") and not detail.get("nomenclature"):
         detail["nomenclature"] = structured.get("nomenclature")
+    if structured.get("set_aside_type") and not detail.get("set_aside_type"):
+        detail["set_aside_type"] = structured.get("set_aside_type")
 
     pdfs = re.findall(
         r"https://dibbs2\.bsm\.dla\.mil/Downloads/RFQ/[^\s\"']+\.PDF",
@@ -162,6 +165,8 @@ def _fetch_detail_fields(page: Page, detail_url: str) -> dict[str, Any]:
     )
     if pdfs:
         detail["pdf_links"] = list(dict.fromkeys(pdfs))
+    if not detail.get("set_aside_type"):
+        detail["set_aside_type"] = extract_dibbs_set_aside_type_from_html(html)
 
     return detail
 
@@ -246,7 +251,7 @@ def pull_dibbs_by_fsc(
                     "detail_url": full_url,
                     "posted_at": issue_date,
                     "due_at": return_by_date,
-                    "set_aside_type": None,
+                    "set_aside_type": detail.get("set_aside_type"),
                     "fsc_code": fsc_value,
                     "place_of_performance": None,
                     "description": description,

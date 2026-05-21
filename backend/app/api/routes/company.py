@@ -5,7 +5,7 @@ from typing import List
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_user, get_db
 from app.repositories.company import CompanyRepository
 from app.schemas.company import (
     CompanyProfileCreate,
@@ -55,12 +55,22 @@ def get_profile_ingest_plan(db: Session = Depends(get_db)):
 
 
 @router.post("/ingest-run")
-def run_profile_ingest(payload: dict = Body(default={}), db: Session = Depends(get_db)):
+def run_profile_ingest(
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
     profile = CompanyRepository(db).get_first_profile()
     if not profile:
         raise HTTPException(status_code=404, detail="Company profile not found")
     quick = bool((payload or {}).get("quick", False))
-    return run_company_profile_ingest(db, profile, quick=quick, update_last_run=not quick)
+    return run_company_profile_ingest(
+        db,
+        profile,
+        quick=quick,
+        update_last_run=not quick,
+        user_id=getattr(current_user, "id", None),
+    )
 
 
 @router.post("/past-performance", response_model=PastPerformanceOut)

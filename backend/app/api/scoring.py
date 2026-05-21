@@ -1,10 +1,14 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_db
+from app.core.deps import get_current_organization, get_current_user, get_db
 from app.services.scoring_engine import run_scoring
 
-router = APIRouter(prefix="/api/scoring", tags=["scoring"])
+router = APIRouter(
+    prefix="/api/scoring",
+    tags=["scoring"],
+    dependencies=[Depends(get_current_user), Depends(get_current_organization)],
+)
 
 
 @router.post("/run")

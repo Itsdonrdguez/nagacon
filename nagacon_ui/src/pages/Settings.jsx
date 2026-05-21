@@ -6,6 +6,9 @@ import { Card, Button, EmptyState, Input, LoadingState, StatusPill } from '../co
 export default function Settings() {
   const queryClient = useQueryClient()
   const [externalApiKeysCsv, setExternalApiKeysCsv] = useState('')
+  const [pdfDownloadPath, setPdfDownloadPath] = useState('')
+  const [masterCatalogExportPath, setMasterCatalogExportPath] = useState('')
+  const [autoWorkspacePrepEnabled, setAutoWorkspacePrepEnabled] = useState(true)
   const [providerForm, setProviderForm] = useState({
     sam_api_key: '',
     openai_api_key: '',
@@ -35,15 +38,18 @@ export default function Settings() {
 
   useEffect(() => {
     if (integrationSettingsQuery.data) {
-      setExternalApiKeysCsv(integrationSettingsQuery.data.external_api_keys_csv || '')
+      setExternalApiKeysCsv('')
+      setPdfDownloadPath(integrationSettingsQuery.data.pdf_download_path || '')
+      setMasterCatalogExportPath(integrationSettingsQuery.data.master_catalog_export_path || '')
+      setAutoWorkspacePrepEnabled(integrationSettingsQuery.data.auto_workspace_prep_enabled !== false)
     }
   }, [integrationSettingsQuery.data])
 
   useEffect(() => {
     if (providerSettingsQuery.data) {
       setProviderForm({
-        sam_api_key: providerSettingsQuery.data.sam_api_key || '',
-        openai_api_key: providerSettingsQuery.data.openai_api_key || '',
+        sam_api_key: '',
+        openai_api_key: '',
         openai_model: providerSettingsQuery.data.openai_model || 'gpt-4o-mini',
         smtp_host: providerSettingsQuery.data.smtp_host || '',
         smtp_port: providerSettingsQuery.data.smtp_port || '',
@@ -71,6 +77,36 @@ export default function Settings() {
     onSuccess: (data) => {
       queryClient.setQueryData(['provider-settings'], data)
       queryClient.invalidateQueries({ queryKey: ['provider-settings'] })
+    },
+  })
+
+  const exportNowMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/settings/integrations/master-catalog/export-now')
+      return res.data
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['integration-settings'] })
+      queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
+      queryClient.setQueryData(['integration-settings'], (current) => ({
+        ...(current || {}),
+        ...data,
+      }))
+    },
+  })
+
+  const workspacePrepNowMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/api/settings/integrations/workspace-prep/run-now')
+      return res.data
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['integration-settings'] })
+      queryClient.invalidateQueries({ queryKey: ['work-queue-today'] })
+      queryClient.setQueryData(['integration-settings'], (current) => ({
+        ...(current || {}),
+        ...data,
+      }))
     },
   })
 
@@ -116,12 +152,18 @@ export default function Settings() {
         </Card>
       ) : null}
 
-      <Card title="Provider Settings">
+      <Card title="Personal Provider Settings">
         <div className="company-form">
+          <div className="panel-subtitle">
+            These credentials are intended to belong to the signed-in user, so each operator can use their own OpenAI, SAM, and outbound email configuration.
+          </div>
           <div className="settings-status-grid">
             <div className="settings-summary-box">
               <div className="row-title">SAM</div>
               <StatusPill status={providerSettingsQuery.data?.sam_configured ? 'Configured' : 'Missing'} />
+              <div className="row-subtitle">
+                Source: {providerSettingsQuery.data?.sam_api_key_source || 'missing'}
+              </div>
             </div>
             <div className="settings-summary-box">
               <div className="row-title">OpenAI</div>
@@ -138,13 +180,13 @@ export default function Settings() {
               label="SAM API Key"
               value={providerForm.sam_api_key}
               onChange={(event) => setProviderForm((current) => ({ ...current, sam_api_key: event.target.value }))}
-              placeholder="SAM-..."
+              placeholder={providerSettingsQuery.data?.sam_configured ? 'Configured. Enter a new key to replace it.' : 'SAM-...'}
             />
             <Input
               label="OpenAI API Key"
               value={providerForm.openai_api_key}
               onChange={(event) => setProviderForm((current) => ({ ...current, openai_api_key: event.target.value }))}
-              placeholder="sk-..."
+              placeholder={providerSettingsQuery.data?.openai_configured ? 'Configured. Enter a new key to replace it.' : 'sk-...'}
             />
             <Input
               label="OpenAI Model"
@@ -177,10 +219,23 @@ export default function Settings() {
               loading={saveProviderMutation.isPending}
               onClick={() => saveProviderMutation.mutate(providerForm)}
             >
-              Save Provider Settings
+              Save Personal Provider Settings
             </Button>
-            {saveProviderMutation.data ? <span className="form-success">Provider settings saved.</span> : null}
+            <Button
+              variant="secondary"
+              loading={saveProviderMutation.isPending}
+              onClick={() => saveProviderMutation.mutate({ ...providerForm, sam_api_key: '', clear_sam_api_key: true })}
+            >
+              Clear Saved SAM Key
+            </Button>
+            {saveProviderMutation.data ? <span className="form-success">Personal provider settings saved.</span> : null}
             {saveProviderMutation.error ? <span className="form-error">{saveProviderMutation.error.message || 'Failed to save provider settings.'}</span> : null}
+          </div>
+          <div className="panel-subtitle">
+            Secret values are hidden after saving. Leave a key blank to keep the current value.
+          </div>
+          <div className="panel-subtitle">
+            If SAM enrichment starts returning unauthorized errors, clearing the saved SAM key will make local mode fall back to the backend environment key when one is configured.
           </div>
           <div className="panel-subtitle">
             Recommended low-cost starting model for NagaCon agent tests: <code>gpt-4o-mini</code>
@@ -208,28 +263,140 @@ export default function Settings() {
               className="textarea-field"
               value={externalApiKeysCsv}
               onChange={(event) => setExternalApiKeysCsv(event.target.value)}
-              placeholder="key-one, key-two, key-three"
+              placeholder={integrationSettingsQuery.data?.configured ? 'Configured keys are hidden. Enter replacement keys to rotate them.' : 'key-one, key-two, key-three'}
             />
             <div className="panel-subtitle">
-              Use commas to separate multiple keys.
+              Use commas to separate multiple keys. Leave blank to keep existing keys.
             </div>
+          </div>
+          <div className="company-form-grid">
+            <Input
+              label="PDF Download Path"
+              value={pdfDownloadPath}
+              onChange={(event) => setPdfDownloadPath(event.target.value)}
+              placeholder="C:\\NagaCon\\pdfs"
+            />
+            <Input
+              label="Master Catalog Export Path"
+              value={masterCatalogExportPath}
+              onChange={(event) => setMasterCatalogExportPath(event.target.value)}
+              placeholder="C:\\NagaCon\\exports\\master_catalog.csv"
+            />
+          </div>
+          <label className="inline-checkbox">
+            <input
+              type="checkbox"
+              checked={autoWorkspacePrepEnabled}
+              onChange={(event) => setAutoWorkspacePrepEnabled(event.target.checked)}
+            />
+            Automatically prepare opportunity workspaces when core artifacts are still missing.
+          </label>
+          <div className="panel-subtitle">
+            Set a local folder where opportunity PDFs and notice files should be downloaded. Leave blank to use the default local storage root.
+          </div>
+          <div className="panel-subtitle">
+            The master catalog export keeps an updatable flat file of FSC, NSN, vendor, and part number records using the best CAGE-enriched vendor names we have.
           </div>
           <div className="company-form-actions">
             <Button
               loading={saveIntegrationMutation.isPending}
-              onClick={() => saveIntegrationMutation.mutate({ external_api_keys_csv: externalApiKeysCsv })}
+              onClick={() => saveIntegrationMutation.mutate({
+                external_api_keys_csv: externalApiKeysCsv,
+                pdf_download_path: pdfDownloadPath,
+                master_catalog_export_path: masterCatalogExportPath,
+                auto_workspace_prep_enabled: autoWorkspacePrepEnabled,
+              })}
             >
-              Save External API Keys
+              Save Integration Settings
             </Button>
-            {saveIntegrationMutation.data ? <span className="form-success">External API keys saved.</span> : null}
+            <Button
+              variant="secondary"
+              loading={saveIntegrationMutation.isPending}
+              onClick={() => saveIntegrationMutation.mutate({ external_api_keys_csv: externalApiKeysCsv, pdf_download_path: '', clear_pdf_download_path: true })}
+            >
+              Clear PDF Download Path
+            </Button>
+            <Button
+              variant="secondary"
+              loading={saveIntegrationMutation.isPending}
+              onClick={() => saveIntegrationMutation.mutate({
+                external_api_keys_csv: externalApiKeysCsv,
+                master_catalog_export_path: '',
+                clear_master_catalog_export_path: true,
+              })}
+            >
+              Clear Catalog Export Path
+            </Button>
+            <Button
+              variant="secondary"
+              loading={exportNowMutation.isPending}
+              onClick={() => exportNowMutation.mutate()}
+            >
+              Export Now
+            </Button>
+            <Button
+              variant="secondary"
+              loading={workspacePrepNowMutation.isPending}
+              onClick={() => workspacePrepNowMutation.mutate()}
+            >
+              Run Workspace Prep Now
+            </Button>
+            {saveIntegrationMutation.data ? <span className="form-success">Integration settings saved.</span> : null}
             {saveIntegrationMutation.error ? <span className="form-error">{saveIntegrationMutation.error.message || 'Failed to save external API keys.'}</span> : null}
+            {exportNowMutation.data?.master_catalog_export_status?.written ? (
+              <span className="form-success">Master catalog export updated.</span>
+            ) : null}
+            {exportNowMutation.data?.master_catalog_export_status && !exportNowMutation.data?.master_catalog_export_status?.written ? (
+              <span className="form-error">
+                {exportNowMutation.data.master_catalog_export_status.reason === 'path_not_configured'
+                  ? 'Set a catalog export path before exporting.'
+                  : 'Master catalog export did not complete.'}
+              </span>
+            ) : null}
+            {exportNowMutation.error ? <span className="form-error">{exportNowMutation.error.message || 'Failed to export master catalog.'}</span> : null}
+            {workspacePrepNowMutation.data?.workspace_prep_status?.queued > 0 ? (
+              <span className="form-success">
+                Queued {workspacePrepNowMutation.data.workspace_prep_status.queued} workspace prep job{workspacePrepNowMutation.data.workspace_prep_status.queued === 1 ? '' : 's'}.
+              </span>
+            ) : null}
+            {workspacePrepNowMutation.data?.workspace_prep_status?.status === 'deferred_backpressure' ? (
+              <span className="form-error">Workspace prep is waiting for queue capacity.</span>
+            ) : null}
+            {workspacePrepNowMutation.error ? <span className="form-error">{workspacePrepNowMutation.error.message || 'Failed to queue workspace prep.'}</span> : null}
           </div>
           <div className="settings-summary-box">
             <div className="row-title">Current status</div>
             <div className="row-subtitle">
               {integrationSettingsQuery.data?.configured
-                ? `${(integrationSettingsQuery.data.external_api_keys || []).length} external API key(s) configured.`
+                ? `${integrationSettingsQuery.data.external_api_key_count || 0} external API key(s) configured.`
                 : 'No external API keys configured yet.'}
+            </div>
+            <div className="row-subtitle">
+              PDF download path: {integrationSettingsQuery.data?.pdf_download_path || 'Using default local storage root'}
+            </div>
+            <div className="row-subtitle">
+              Master catalog export: {integrationSettingsQuery.data?.master_catalog_export_path || 'Not configured'}
+            </div>
+            <div className="row-subtitle">
+              Workspace prep: {integrationSettingsQuery.data?.auto_workspace_prep_enabled === false ? 'Paused' : 'Automatic'}
+            </div>
+            <div className="row-subtitle">
+              Workspace prep status: {integrationSettingsQuery.data?.auto_workspace_prep_last_status || 'Unknown'}
+            </div>
+            <div className="row-subtitle">
+              Workspace prep last queued: {integrationSettingsQuery.data?.auto_workspace_prep_last_queued_count ?? 0}
+            </div>
+            <div className="row-subtitle">
+              Catalog status: {integrationSettingsQuery.data?.master_catalog_export_last_status || 'Unknown'}
+              {integrationSettingsQuery.data?.master_catalog_export_last_reason
+                ? ` | ${integrationSettingsQuery.data.master_catalog_export_last_reason}`
+                : ''}
+            </div>
+            <div className="row-subtitle">
+              Last catalog attempt: {integrationSettingsQuery.data?.master_catalog_export_last_attempted_at || 'Never'}
+            </div>
+            <div className="row-subtitle">
+              Last catalog write: {integrationSettingsQuery.data?.master_catalog_export_last_written_at || 'Never'} | Rows: {integrationSettingsQuery.data?.master_catalog_export_last_row_count || 0}
             </div>
           </div>
         </div>
